@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::runner::{run_command, RunOutcome};
-use crate::sha256::{sha256_file_hex, sha256_hex};
+use crate::sha256::sha256_hex;
 
 /// Locked SHA-256 digests of protected test, benchmark, and oracle files.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -80,6 +80,28 @@ fn looks_like_protected_file(rel: &str) -> bool {
         || name.starts_with("bench_")
 }
 
+/// Hashes a protected file with CRLF->LF normalization for UTF-8 text files so
+/// Windows `core.autocrlf` line-ending conversions on `git checkout` do not cause
+/// false Cheat Guard positives, while binary files are hashed verbatim.
+fn hash_protected_file(path: &Path) -> Result<String, std::io::Error> {
+    let bytes = fs::read(path)?;
+    if !bytes.contains(&0) && std::str::from_utf8(&bytes).is_ok() {
+        let mut norm = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\r' && i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                i += 1;
+                continue;
+            }
+            norm.push(bytes[i]);
+            i += 1;
+        }
+        Ok(sha256_hex(&norm))
+    } else {
+        Ok(sha256_hex(&bytes))
+    }
+}
+
 /// Builds immutable SHA-256 locks for explicitly requested files plus auto-discovered test/bench files.
 pub fn build_locks(
     root: &Path,
@@ -94,7 +116,7 @@ pub fn build_locks(
                 if looks_like_protected_file(&rel) {
                     let full = root.join(&rel);
                     if full.is_file() {
-                        let hash = sha256_file_hex(&full)
+                        let hash = hash_protected_file(&full)
                             .map_err(|e| format!("failed to hash protected file '{rel}': {e}"))?;
                         files.insert(rel, hash);
                     }
@@ -107,7 +129,7 @@ pub fn build_locks(
         let normalized = rel.trim_start_matches("./").to_string();
         let full = root.join(&normalized);
         if full.is_file() {
-            let hash = sha256_file_hex(&full)
+            let hash = hash_protected_file(&full)
                 .map_err(|e| format!("failed to hash locked file '{normalized}': {e}"))?;
             files.insert(normalized, hash);
         } else {
@@ -123,7 +145,7 @@ pub fn check_locks(root: &Path, locks: &FileLocks) -> Vec<TamperViolation> {
     let mut violations = Vec::new();
     for (rel, expected) in &locks.files {
         let full = root.join(rel);
-        match sha256_file_hex(&full) {
+        match hash_protected_file(&full) {
             Ok(actual) if actual == *expected => {}
             Ok(actual) => violations.push(TamperViolation {
                 path: rel.clone(),
