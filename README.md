@@ -4,7 +4,7 @@
 
 **Optimize Anything: profiling, equivalence gating, and interleaved A/B benchmarking for coding agents.**
 
-[Quick start](#quick-start) · [Upstream PRs](#upstream-prs) · [Showcases](#showcases) · [How oa works](#how-oa-works) · [GitHub Action](#github-action) · [MCP & CLI](#mcp--cli) · [FAQ](#faq)
+[Quick start](#quick-start) · [Showcases](#showcases) · [How oa works](#how-oa-works) · [GitHub Action](#github-action) · [MCP & CLI](#mcp--cli) · [FAQ](#faq)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/oa-hero-dark.svg">
@@ -108,29 +108,6 @@ oa profile --cmd "python3 bench.py" --top 10
 ```
 
 To reduce memory footprint instead of latency, pass `--metric rss` to `oa init`, `oa evaluate`, `oa verify`, or `oa compare` (supported on Linux, macOS, and Windows). Bundled walkthroughs live under [`examples/slow_log_parser`](examples/slow_log_parser) (`--metric wall`) and [`examples/ram_aggregator`](examples/ram_aggregator) (`--metric rss`).
-
-## Upstream PRs
-
-Every pull request below was profiled with `oa profile`, checked against the upstream test suite and byte-identical output SHA-256, and measured against the base branch with `oa compare --git <base> --pairs 15 --check-output` (`p = 0.0000` on every entry):
-
-| Repository | Language | Verified speedup | Summary | Pull Request |
-| --- | --- | --- | --- | --- |
-| `sharkdp/hexyl` | Rust | **6.63x** (`/dev/null`), **3.43x** piped (`77.6 → 22.6 ms`) | Direct buffered formatting and zero-alloc row writes | [hexyl#301](https://github.com/sharkdp/hexyl/pull/301) |
-| `networkx/networkx` | Python | **4.78x** (`934.3 → 198.0 ms`) | Fast topological sort and DAG ancestor/descendant traversal | [networkx#9054](https://github.com/networkx/networkx/pull/9054) |
-| `yhirose/cpp-httplib` | C++11 | **3.47x** (`372.9 → 107.4 ms`) | Single-pass URL/header encoding and zero-alloc scans | [cpp-httplib#2697](https://github.com/yhirose/cpp-httplib/pull/2697) |
-| `tqdm/tqdm` | Python | **2.98x** mixed (`382.7 → 128.7 ms`), **2.72x** `trange` (`-6.1%` RSS) | Direct `format_meter` fast path and ASCII/block `disp_len` | [tqdm#1941](https://github.com/tqdm/tqdm/pull/1941) |
-| `sanic-org/sanic` | Python | **2.27x** (`770.6 → 330.6 ms`, `-4.0%` RSS) | Faster header parsing, cookie handling, and content-type checks | [sanic#3221](https://github.com/sanic-org/sanic/pull/3221) |
-| `ajeetdsouza/zoxide` | Rust | **2.05x** E2E CLI (`104.7 → 51.1 ms`) | Lower-allocation query matching and database serialization | [zoxide#1379](https://github.com/ajeetdsouza/zoxide/pull/1379) |
-| `dandavison/delta` | Rust | **1.86x** E2E (`342.1 → 184.4 ms`) | Reduced per-line ANSI parsing and edit-alignment allocations | [delta#2368](https://github.com/dandavison/delta/pull/2368) |
-| `scrapy/scrapy` | Python | **1.83x** (`953.9 → 505.9 ms`) | Faster `Headers` normalization and HTTP header lookup paths | [scrapy#8541](https://github.com/scrapy/scrapy/pull/8541) |
-| `sharkdp/bat` | Rust | **1.80x** wrapped (`49.4 → 26.9 ms`), **1.32x** `--show-all` | Borrowed `Cow` line slices and tighter ANSI/wrapping loops | [bat#4154](https://github.com/sharkdp/bat/pull/4154) |
-| `XAMPPRocky/tokei` | Rust | **1.77x** E2E (`15.2 → 8.6 ms`, 710 files) | Tighter byte-slice scanning in comment/string state machines | [tokei#1401](https://github.com/XAMPPRocky/tokei/pull/1401) |
-| `gabime/spdlog` | C++11/20 | **1.55x** (`102.6 → 66.4 ms`) | Faster pattern formatting and cached timestamp rendering | [spdlog#3718](https://github.com/gabime/spdlog/pull/3718) |
-| `Delgan/loguru` | Python | **1.47x** (`238.4 → 162.7 ms`, `-2.9%` RSS) | Faster record formatting and colorizer directive parsing | [loguru#1557](https://github.com/Delgan/loguru/pull/1557) |
-| `Keats/tera` | Rust | **1.43x** (`119.0 → 84.1 ms`) | Faster HTML escaping and template renderer hot loops | [tera#1071](https://github.com/Keats/tera/pull/1071) |
-| `psf/black` | Python | **1.23x** E2E `format_str` (`1832.8 → 1476.6 ms`, `-5.1%` RSS) | Faster `lib2to3` tokenization, parsing, and line generation | [black#5754](https://github.com/psf/black/pull/5754) |
-| `lepture/mistune` | Python | **1.13x** (`580.9 → 520.7 ms`, `-4.8%` RSS) | Lower regex dispatch and block/inline state overhead | [mistune#572](https://github.com/lepture/mistune/pull/572) |
-| `Python-Markdown/markdown` | Python | **1.13x** (`352.4 → 307.6 ms`, `-5.5%` RSS) | Reduced regex scanning and inline processor allocations | [markdown#1730](https://github.com/Python-Markdown/markdown/pull/1730) |
 
 ## Showcases
 
