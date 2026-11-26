@@ -4,9 +4,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use crate::runner::command_exists;
-use crate::runner::{collect_host_info, HostInfo};
+use crate::runner::{collect_host_info, command_exists, HostInfo};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckItem {
@@ -202,10 +200,16 @@ pub fn run_doctor() -> DoctorReport {
     }
     #[cfg(windows)]
     {
+        let has_py = command_exists("python") || command_exists("python3");
         checks.push(CheckItem {
             name: "metric:rss".to_string(),
-            available: false,
-            detail: "Windows Peak RSS tracking is not implemented yet (see issue #3)".to_string(),
+            available: has_py,
+            detail: if has_py {
+                "Win32 K32GetProcessMemoryInfo / JobObject wrapper available (--metric rss enabled)"
+                    .to_string()
+            } else {
+                "install Python (python on PATH) to enable Windows --metric rss".to_string()
+            },
         });
     }
 

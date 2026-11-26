@@ -1,0 +1,1934 @@
+diff --git a/tera/src/parsing/ast.rs b/tera/src/parsing/ast.rs
+index 771d120..d4777fc 100644
+--- a/tera/src/parsing/ast.rs
++++ b/tera/src/parsing/ast.rs
+@@ -1,4 +1,4 @@
+-use std::collections::{BTreeMap, HashSet};
++use std::collections::BTreeMap;
+ use std::fmt;
+ use std::str::FromStr;
+ 
+@@ -766,20 +766,20 @@ impl ComponentDefinition {
+         body: Option<Value>,
+     ) -> Result<crate::Context, String> {
+         let mut context = crate::Context::new();
+-        let mut rest_map = crate::value::Map::new();
+-        let mut unknown_keys = HashSet::new();
++        let mut rest_map = self.rest_param_name.as_ref().map(|_| crate::value::Map::new());
++        let mut unknown_keys: Vec<String> = Vec::new();
+ 
+         // Process all provided keys - collect unknowns into rest or track for error
+         for key in provided_keys {
+             if !self.kwargs.contains_key(key) {
+-                if self.rest_param_name.is_some() {
++                if let Some(ref mut rm) = rest_map {
+                     if let Some(value) = get_value(key) {
+-                        rest_map.insert(Key::from(key.to_string()), value);
++                        rm.insert(Key::from(key.to_string()), value);
+                     } else {
+                         unreachable!("that shouldn't be possible to get a kwarg without a value")
+                     }
+-                } else {
+-                    unknown_keys.insert(key.to_string());
++                } else if !unknown_keys.iter().any(|k| k == key) {
++                    unknown_keys.push(key.to_string());
+                 }
+             }
+         }
+@@ -850,8 +850,8 @@ impl ComponentDefinition {
+         }
+ 
+         // Add rest param if defined
+-        if let Some(ref rest_name) = self.rest_param_name {
+-            context.insert_value(rest_name.clone(), Value::from(rest_map));
++        if let (Some(rest_name), Some(rm)) = (&self.rest_param_name, rest_map) {
++            context.insert_value(rest_name.clone(), Value::from(rm));
+         }
+ 
+         // Add body if provided
+diff --git a/tera/src/parsing/compiler.rs b/tera/src/parsing/compiler.rs
+index 0aacf92..a0edc14 100644
+--- a/tera/src/parsing/compiler.rs
++++ b/tera/src/parsing/compiler.rs
+@@ -295,7 +295,7 @@ impl Compiler {
+                 self.chunk.add(Instruction::AppendToList, None);
+                 if let Some(idx) = cond_skip_idx {
+                     let jump_back_target = self.chunk.len();
+-                    if let Some((Instruction::PopJumpIfFalse(t), _)) = self.chunk.get_mut(idx) {
++                    if let Some(Instruction::PopJumpIfFalse(t)) = self.chunk.get_mut(idx) {
+                         *t = jump_back_target;
+                     } else {
+                         unreachable!();
+@@ -303,7 +303,7 @@ impl Compiler {
+                 }
+                 self.chunk.add(Instruction::Jump(start_idx), None);
+                 let loop_end = self.chunk.len();
+-                if let Some((Instruction::Iterate(t), _)) = self.chunk.get_mut(start_idx) {
++                if let Some(Instruction::Iterate(t)) = self.chunk.get_mut(start_idx) {
+                     *t = loop_end;
+                 } else {
+                     unreachable!();
+@@ -404,8 +404,8 @@ impl Compiler {
+                         {
+                             for i in instr {
+                                 match self.chunk.get_mut(i) {
+-                                    Some((Instruction::JumpIfFalseOrPop(target), _))
+-                                    | Some((Instruction::JumpIfTrueOrPop(target), _)) => {
++                                    Some(Instruction::JumpIfFalseOrPop(target))
++                                    | Some(Instruction::JumpIfTrueOrPop(target)) => {
+                                         *target = end;
+                                     }
+                                     _ => {}
+@@ -455,8 +455,8 @@ impl Compiler {
+     fn end_branch(&mut self, idx: usize) {
+         match self.processing_bodies.pop() {
+             Some(ProcessingBody::Branch(instr)) => match self.chunk.get_mut(instr) {
+-                Some((Instruction::Jump(target), _))
+-                | Some((Instruction::PopJumpIfFalse(target), _)) => {
++                Some(Instruction::Jump(target))
++                | Some(Instruction::PopJumpIfFalse(target)) => {
+                     *target = idx;
+                 }
+                 _ => {}
+@@ -573,7 +573,7 @@ impl Compiler {
+                         }
+ 
+                         self.chunk.add(Instruction::PopLoop, None);
+-                        if let Some((Instruction::Iterate(jump_target), _)) =
++                        if let Some(Instruction::Iterate(jump_target)) =
+                             self.chunk.get_mut(start_idx)
+                         {
+                             *jump_target = loop_end;
+diff --git a/tera/src/parsing/instructions.rs b/tera/src/parsing/instructions.rs
+index 6b13565..3c95f57 100644
+--- a/tera/src/parsing/instructions.rs
++++ b/tera/src/parsing/instructions.rs
+@@ -134,10 +134,11 @@ pub(crate) enum Instruction {
+ 
+ #[derive(Clone, PartialEq, Default)]
+ pub(crate) struct Chunk {
+-    /// Instructions with their associated spans.
+-    /// Most instructions have 0 or 1 span, but fused instructions (LoadPath, WritePath)
+-    /// have multiple spans - one per path element for accurate error reporting.
+-    instructions: Vec<(Instruction, Vec<Span>)>,
++    /// Contiguous bytecode instructions kept separate from cold error-reporting spans
++    /// to halve VM dispatch stride and keep spans out of L1 data cache.
++    instructions: Vec<Instruction>,
++    /// Cold error-reporting spans indexed parallel to `instructions`.
++    spans: Vec<Vec<Span>>,
+     /// The template name so we can point to the right place for error messages
+     pub name: String,
+ }
+@@ -146,6 +147,7 @@ impl Chunk {
+     pub(crate) fn new(name: &str) -> Self {
+         Self {
+             instructions: Vec::with_capacity(256),
++            spans: Vec::with_capacity(256),
+             name: name.to_owned(),
+         }
+     }
+@@ -153,15 +155,17 @@ impl Chunk {
+     pub(crate) fn add(&mut self, instr: Instruction, span: Option<Span>) -> u32 {
+         let idx = self.instructions.len();
+         let spans = span.into_iter().collect();
+-        self.instructions.push((instr, spans));
++        self.instructions.push(instr);
++        self.spans.push(spans);
+         idx as u32
+     }
+ 
+-    pub(crate) fn get(&self, idx: usize) -> Option<&(Instruction, Vec<Span>)> {
+-        self.instructions.get(idx)
++    #[inline(always)]
++    pub(crate) fn instructions(&self) -> &[Instruction] {
++        &self.instructions
+     }
+ 
+-    pub(crate) fn get_mut(&mut self, idx: usize) -> Option<&mut (Instruction, Vec<Span>)> {
++    pub(crate) fn get_mut(&mut self, idx: usize) -> Option<&mut Instruction> {
+         self.instructions.get_mut(idx)
+     }
+ 
+@@ -170,24 +174,24 @@ impl Chunk {
+     }
+ 
+     pub(crate) fn is_calling_function(&self, fn_name: &str) -> bool {
+-        self.instructions.iter().any(|(i, _)| match i {
++        self.instructions.iter().any(|i| match i {
+             Instruction::CallFunction(s) => s == fn_name,
+             _ => false,
+         })
+     }
+ 
+     pub(crate) fn get_span(&self, idx: u32) -> Option<&Span> {
+-        self.instructions
++        self.spans
+             .get(idx as usize)
+-            .and_then(|(_, spans)| spans.first())
++            .and_then(|spans| spans.first())
+     }
+ 
+     /// Get a specific span from an instruction's span list.
+     /// Used by fused instructions (LoadPath, WritePath) where each path element has its own span.
+     pub(crate) fn get_span_at(&self, idx: u32, span_idx: usize) -> Option<&Span> {
+-        self.instructions
++        self.spans
+             .get(idx as usize)
+-            .and_then(|(_, spans)| spans.get(span_idx))
++            .and_then(|spans| spans.get(span_idx))
+     }
+ 
+     /// Expand a range of span indices into a single Span.
+@@ -212,7 +216,9 @@ impl Chunk {
+     /// so much on the stack in the VM when we can
+     pub(crate) fn optimize(&mut self) {
+         let mut old_instructions = std::mem::take(&mut self.instructions);
++        let mut old_spans = std::mem::take(&mut self.spans);
+         let mut optimized = Vec::with_capacity(old_instructions.len());
++        let mut optimized_spans = Vec::with_capacity(old_spans.len());
+         // Map from old instruction index to new instruction index
+         // +1 to handle jumps that target one-past-the-end (i.e., chunk.len())
+         let mut index_map: Vec<usize> = vec![0; old_instructions.len() + 1];
+@@ -222,7 +228,7 @@ impl Chunk {
+         // the WriteTop; if that WriteTop were folded into WritePath, the jump would
+         // execute the path load it was meant to skip.
+         let mut is_jump_target: Vec<bool> = vec![false; old_instructions.len()];
+-        for (instr, _) in &old_instructions {
++        for instr in &old_instructions {
+             if let Instruction::Jump(t)
+             | Instruction::PopJumpIfFalse(t)
+             | Instruction::JumpIfFalseOrPop(t)
+@@ -237,7 +243,7 @@ impl Chunk {
+         let mut i = 0;
+ 
+         // Placeholder for mem::replace - cheapest instruction
+-        let placeholder = (Instruction::WriteTop, Vec::new());
++        let placeholder = Instruction::WriteTop;
+ 
+         while i < old_instructions.len() {
+             // Record the mapping for this instruction
+@@ -248,13 +254,13 @@ impl Chunk {
+             if i + 1 < old_instructions.len()
+                 && !is_jump_target[i + 1]
+                 && matches!(
+-                    &old_instructions[i].0,
++                    &old_instructions[i],
+                     Instruction::RenderInlineComponent(_) | Instruction::RenderBodyComponent(_)
+                 )
+-                && matches!(&old_instructions[i + 1].0, Instruction::WriteTop)
++                && matches!(&old_instructions[i + 1], Instruction::WriteTop)
+             {
+-                let (instr, spans) =
+-                    std::mem::replace(&mut old_instructions[i], placeholder.clone());
++                let instr = std::mem::replace(&mut old_instructions[i], placeholder.clone());
++                let spans = std::mem::take(&mut old_spans[i]);
+                 let direct_instr = match instr {
+                     Instruction::RenderInlineComponent(name) => {
+                         Instruction::RenderInlineComponentToOutput(name)
+@@ -265,17 +271,18 @@ impl Chunk {
+                     _ => unreachable!(),
+                 };
+                 index_map[i + 1] = optimized.len();
+-                optimized.push((direct_instr, spans));
++                optimized.push(direct_instr);
++                optimized_spans.push(spans);
+                 i += 2;
+                 continue;
+             }
+ 
+             // Try to collect a path: LoadName followed by any number of LoadAttr except for the magic dump var
+-            if matches!(&old_instructions[i].0, Instruction::LoadName(n) if n.as_str() != MAGICAL_DUMP_VAR)
++            if matches!(&old_instructions[i], Instruction::LoadName(n) if n.as_str() != MAGICAL_DUMP_VAR)
+             {
+                 // Take ownership of the LoadName instruction
+-                let (instr, spans) =
+-                    std::mem::replace(&mut old_instructions[i], placeholder.clone());
++                let instr = std::mem::replace(&mut old_instructions[i], placeholder.clone());
++                let spans = std::mem::take(&mut old_spans[i]);
+                 let name = match instr {
+                     Instruction::LoadName(n) => n,
+                     _ => unreachable!(),
+@@ -290,12 +297,13 @@ impl Chunk {
+                     if is_jump_target[j] {
+                         break;
+                     }
+-                    if matches!(&old_instructions[j].0, Instruction::LoadAttr(_)) {
++                    if matches!(&old_instructions[j], Instruction::LoadAttr(_)) {
+                         // Map the consumed LoadAttr to the same position as the first instruction
+                         index_map[j] = optimized.len();
+                         // Take ownership of the LoadAttr instruction
+-                        let (attr_instr, attr_spans) =
++                        let attr_instr =
+                             std::mem::replace(&mut old_instructions[j], placeholder.clone());
++                        let attr_spans = std::mem::take(&mut old_spans[j]);
+                         let attr = match attr_instr {
+                             Instruction::LoadAttr(a) => a,
+                             _ => unreachable!(),
+@@ -313,23 +321,26 @@ impl Chunk {
+                 // fusing into WritePath would make the skipped path execute anyway.
+                 let has_write = j < old_instructions.len()
+                     && !is_jump_target[j]
+-                    && matches!(&old_instructions[j].0, Instruction::WriteTop);
++                    && matches!(&old_instructions[j], Instruction::WriteTop);
+ 
+                 if has_write {
+                     // Map the consumed WriteTop
+                     index_map[j] = optimized.len();
+                     // Fuse entire path + WriteTop into WritePath
+-                    optimized.push((Instruction::WritePath(path), collected_spans));
++                    optimized.push(Instruction::WritePath(path));
++                    optimized_spans.push(collected_spans);
+                     i = j + 1; // Skip past WriteTop
+                     continue;
+                 } else if path.len() > 1 {
+                     // Combine LoadName + LoadAttr* into LoadPath
+-                    optimized.push((Instruction::LoadPath(path), collected_spans));
++                    optimized.push(Instruction::LoadPath(path));
++                    optimized_spans.push(collected_spans);
+                     i = j;
+                     continue;
+                 }
+                 // Single LoadName with no attrs AND no WriteTop - reconstruct original
+-                optimized.push((Instruction::LoadName(path.pop().unwrap()), collected_spans));
++                optimized.push(Instruction::LoadName(path.pop().unwrap()));
++                optimized_spans.push(collected_spans);
+                 i += 1;
+                 continue;
+             }
+@@ -339,6 +350,7 @@ impl Chunk {
+                 &mut old_instructions[i],
+                 placeholder.clone(),
+             ));
++            optimized_spans.push(std::mem::take(&mut old_spans[i]));
+             i += 1;
+         }
+ 
+@@ -346,7 +358,7 @@ impl Chunk {
+         index_map[old_instructions.len()] = optimized.len();
+ 
+         // Now fix up all jump targets
+-        for (instr, _) in &mut optimized {
++        for instr in &mut optimized {
+             match instr {
+                 Instruction::Jump(target)
+                 | Instruction::PopJumpIfFalse(target)
+@@ -360,6 +372,7 @@ impl Chunk {
+         }
+ 
+         self.instructions = optimized;
++        self.spans = optimized_spans;
+     }
+ }
+ 
+@@ -367,7 +380,7 @@ impl fmt::Debug for Chunk {
+     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+         writeln!(f, "=== {} ===", self.name)?;
+ 
+-        for (offset, (instr, _)) in self.instructions.iter().enumerate() {
++        for (offset, instr) in self.instructions.iter().enumerate() {
+             writeln!(f, "{offset:>04} {instr:?}")?;
+         }
+ 
+diff --git a/tera/src/template.rs b/tera/src/template.rs
+index b38d309..765cc8f 100644
+--- a/tera/src/template.rs
++++ b/tera/src/template.rs
+@@ -7,6 +7,44 @@ use crate::parsing::{Chunk, Compiler};
+ use crate::tera::Tera;
+ use crate::utils::Span;
+ use std::collections::HashSet;
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++const MAX_ADAPTIVE_SIZE_HINT: usize = 4 * 1024 * 1024;
++
++/// Lock-free adaptive output buffer size hint so repeated renders avoid Vec reallocations.
++#[derive(Debug)]
++pub(crate) struct AdaptiveSizeHint(AtomicUsize);
++
++impl AdaptiveSizeHint {
++    fn new(initial: usize) -> Self {
++        Self(AtomicUsize::new(initial))
++    }
++
++    #[inline]
++    fn get(&self) -> usize {
++        self.0.load(Ordering::Relaxed)
++    }
++
++    #[inline]
++    fn observe(&self, rendered_len: usize) {
++        let clamped = rendered_len.min(MAX_ADAPTIVE_SIZE_HINT);
++        if clamped > self.0.load(Ordering::Relaxed) {
++            self.0.store(clamped, Ordering::Relaxed);
++        }
++    }
++}
++
++impl Clone for AdaptiveSizeHint {
++    fn clone(&self) -> Self {
++        Self(AtomicUsize::new(self.0.load(Ordering::Relaxed)))
++    }
++}
++
++impl PartialEq for AdaptiveSizeHint {
++    fn eq(&self, _other: &Self) -> bool {
++        true
++    }
++}
+ 
+ #[derive(Debug, PartialEq, Clone)]
+ pub struct Template {
+@@ -28,6 +66,8 @@ pub struct Template {
+     pub(crate) include_calls: HashMap<String, Vec<Span>>,
+     /// The number of bytes of raw content in its parents and itself
+     pub(crate) total_content_num_bytes: usize,
++    /// Adaptive output capacity observed across renders to prevent repeated Vec growth
++    pub(crate) observed_output_bytes: AdaptiveSizeHint,
+     /// The exact `{% extends %}` target in the source
+     pub(crate) extends: Option<String>,
+     /// The full list of parent templates names
+@@ -125,6 +165,7 @@ impl Template {
+             blocks,
+             block_name_spans,
+             total_content_num_bytes: source.len(),
++            observed_output_bytes: AdaptiveSizeHint::new((source.len() * 2).next_power_of_two()),
+             chunk,
+             extends,
+             parents: Vec::new(),
+@@ -141,7 +182,13 @@ impl Template {
+     }
+ 
+     pub(crate) fn size_hint(&self) -> usize {
+-        (self.total_content_num_bytes * 2).next_power_of_two()
++        let base = (self.total_content_num_bytes * 2).next_power_of_two();
++        base.max(self.observed_output_bytes.get())
++    }
++
++    #[inline]
++    pub(crate) fn record_rendered_len(&self, len: usize) {
++        self.observed_output_bytes.observe(len);
+     }
+ }
+ 
+diff --git a/tera/src/utils.rs b/tera/src/utils.rs
+index bec4471..6316ea0 100644
+--- a/tera/src/utils.rs
++++ b/tera/src/utils.rs
+@@ -106,6 +106,250 @@ impl Span {
+ /// ```
+ #[inline]
+ pub fn escape_html(input: &str, buf: &mut dyn std::io::Write) -> std::io::Result<()> {
++    escape_html_generic(input, buf)
++}
++
++#[cfg(all(not(feature = "fast_escape"), target_arch = "x86_64"))]
++#[target_feature(enable = "avx2")]
++unsafe fn escape_html_avx2<W: std::io::Write + ?Sized>(
++    bytes: &[u8],
++    buf: &mut W,
++) -> std::io::Result<()> {
++    use std::arch::x86_64::*;
++
++    let len = bytes.len();
++    let mut start = 0usize;
++    let mut i = 0usize;
++    let mut scratch = [0u8; 512];
++    let mut slen = 0usize;
++
++    macro_rules! push_bytes {
++        ($slice:expr) => {{
++            let s: &[u8] = $slice;
++            if s.len() > 64 {
++                if slen > 0 {
++                    buf.write_all(&scratch[..slen])?;
++                    slen = 0;
++                }
++                buf.write_all(s)?;
++            } else if slen + s.len() <= scratch.len() {
++                scratch[slen..slen + s.len()].copy_from_slice(s);
++                slen += s.len();
++            } else {
++                buf.write_all(&scratch[..slen])?;
++                scratch[..s.len()].copy_from_slice(s);
++                slen = s.len();
++            }
++        }};
++    }
++
++    let bit1 = _mm256_set1_epi8(1);
++    let bit2 = _mm256_set1_epi8(2);
++    let v_apos = _mm256_set1_epi8(b'\'' as i8);
++    let v_gt = _mm256_set1_epi8(b'>' as i8);
++    let v_quot = _mm256_set1_epi8(b'"' as i8);
++
++    while i + 32 <= len {
++        let chunk = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(i) as *const __m256i) };
++        let m1 = _mm256_cmpeq_epi8(_mm256_or_si256(chunk, bit1), v_apos);
++        let m2 = _mm256_cmpeq_epi8(_mm256_or_si256(chunk, bit2), v_gt);
++        let m3 = _mm256_cmpeq_epi8(chunk, v_quot);
++        let mut mask = _mm256_movemask_epi8(_mm256_or_si256(_mm256_or_si256(m1, m2), m3)) as u32;
++        while mask != 0 {
++            let tz = mask.trailing_zeros() as usize;
++            mask &= mask - 1;
++            let pos = i + tz;
++            let escaped: &[u8] = match unsafe { *bytes.get_unchecked(pos) } {
++                b'&' => b"&amp;",
++                b'<' => b"&lt;",
++                b'>' => b"&gt;",
++                b'"' => b"&quot;",
++                _ => b"&#39;",
++            };
++            if start < pos {
++                push_bytes!(&bytes[start..pos]);
++            }
++            push_bytes!(escaped);
++            start = pos + 1;
++        }
++        i += 32;
++    }
++
++    if i + 16 <= len {
++        let bit1_128 = _mm_set1_epi8(1);
++        let bit2_128 = _mm_set1_epi8(2);
++        let v_apos_128 = _mm_set1_epi8(b'\'' as i8);
++        let v_gt_128 = _mm_set1_epi8(b'>' as i8);
++        let v_quot_128 = _mm_set1_epi8(b'"' as i8);
++        let chunk = unsafe { _mm_loadu_si128(bytes.as_ptr().add(i) as *const __m128i) };
++        let m1 = _mm_cmpeq_epi8(_mm_or_si128(chunk, bit1_128), v_apos_128);
++        let m2 = _mm_cmpeq_epi8(_mm_or_si128(chunk, bit2_128), v_gt_128);
++        let m3 = _mm_cmpeq_epi8(chunk, v_quot_128);
++        let mut mask = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(m1, m2), m3)) as u32;
++        while mask != 0 {
++            let tz = mask.trailing_zeros() as usize;
++            mask &= mask - 1;
++            let pos = i + tz;
++            let escaped: &[u8] = match unsafe { *bytes.get_unchecked(pos) } {
++                b'&' => b"&amp;",
++                b'<' => b"&lt;",
++                b'>' => b"&gt;",
++                b'"' => b"&quot;",
++                _ => b"&#39;",
++            };
++            if start < pos {
++                push_bytes!(&bytes[start..pos]);
++            }
++            push_bytes!(escaped);
++            start = pos + 1;
++        }
++        i += 16;
++    }
++
++    while i < len {
++        let escaped: &[u8] = match bytes[i] {
++            b'&' => b"&amp;",
++            b'<' => b"&lt;",
++            b'>' => b"&gt;",
++            b'"' => b"&quot;",
++            b'\'' => b"&#39;",
++            _ => {
++                i += 1;
++                continue;
++            }
++        };
++        if start < i {
++            push_bytes!(&bytes[start..i]);
++        }
++        push_bytes!(escaped);
++        start = i + 1;
++        i += 1;
++    }
++
++    if slen == 0 {
++        if start < len {
++            buf.write_all(&bytes[start..])?;
++        }
++    } else {
++        if start < len {
++            push_bytes!(&bytes[start..]);
++        }
++        if slen > 0 {
++            buf.write_all(&scratch[..slen])?;
++        }
++    }
++    Ok(())
++}
++
++#[cfg(all(not(feature = "fast_escape"), target_arch = "x86_64"))]
++#[inline]
++fn escape_html_sse2<W: std::io::Write + ?Sized>(
++    bytes: &[u8],
++    buf: &mut W,
++) -> std::io::Result<()> {
++    use std::arch::x86_64::*;
++
++    let len = bytes.len();
++    let mut start = 0usize;
++    let mut i = 0usize;
++    // Small stack batch buffer eliminates per-entity dyn Write calls on dense HTML.
++    let mut scratch = [0u8; 512];
++    let mut slen = 0usize;
++
++    macro_rules! push_bytes {
++        ($slice:expr) => {{
++            let s: &[u8] = $slice;
++            if s.len() > 64 {
++                if slen > 0 {
++                    buf.write_all(&scratch[..slen])?;
++                    slen = 0;
++                }
++                buf.write_all(s)?;
++            } else if slen + s.len() <= scratch.len() {
++                scratch[slen..slen + s.len()].copy_from_slice(s);
++                slen += s.len();
++            } else {
++                buf.write_all(&scratch[..slen])?;
++                scratch[..s.len()].copy_from_slice(s);
++                slen = s.len();
++            }
++        }};
++    }
++
++    unsafe {
++        let bit1 = _mm_set1_epi8(1);
++        let bit2 = _mm_set1_epi8(2);
++        let v_apos = _mm_set1_epi8(b'\'' as i8); // matches '&' (0x26) and '\'' (0x27) after | 1
++        let v_gt = _mm_set1_epi8(b'>' as i8); // matches '<' (0x3c) and '>' (0x3e) after | 2
++        let v_quot = _mm_set1_epi8(b'"' as i8); // matches '"' (0x22)
++
++        while i + 16 <= len {
++            let chunk = _mm_loadu_si128(bytes.as_ptr().add(i) as *const __m128i);
++            let m1 = _mm_cmpeq_epi8(_mm_or_si128(chunk, bit1), v_apos);
++            let m2 = _mm_cmpeq_epi8(_mm_or_si128(chunk, bit2), v_gt);
++            let m3 = _mm_cmpeq_epi8(chunk, v_quot);
++            let mut mask = _mm_movemask_epi8(_mm_or_si128(_mm_or_si128(m1, m2), m3)) as u32;
++            while mask != 0 {
++                let tz = mask.trailing_zeros() as usize;
++                mask &= mask - 1;
++                let pos = i + tz;
++                let escaped: &[u8] = match *bytes.get_unchecked(pos) {
++                    b'&' => b"&amp;",
++                    b'<' => b"&lt;",
++                    b'>' => b"&gt;",
++                    b'"' => b"&quot;",
++                    _ => b"&#39;",
++                };
++                if start < pos {
++                    push_bytes!(&bytes[start..pos]);
++                }
++                push_bytes!(escaped);
++                start = pos + 1;
++            }
++            i += 16;
++        }
++    }
++
++    while i < len {
++        let escaped: &[u8] = match bytes[i] {
++            b'&' => b"&amp;",
++            b'<' => b"&lt;",
++            b'>' => b"&gt;",
++            b'"' => b"&quot;",
++            b'\'' => b"&#39;",
++            _ => {
++                i += 1;
++                continue;
++            }
++        };
++        if start < i {
++            push_bytes!(&bytes[start..i]);
++        }
++        push_bytes!(escaped);
++        start = i + 1;
++        i += 1;
++    }
++
++    if slen == 0 {
++        if start < len {
++            buf.write_all(&bytes[start..])?;
++        }
++    } else {
++        if start < len {
++            push_bytes!(&bytes[start..]);
++        }
++        if slen > 0 {
++            buf.write_all(&scratch[..slen])?;
++        }
++    }
++    Ok(())
++}
++
++#[inline]
++pub(crate) fn escape_html_generic<W: std::io::Write + ?Sized>(
++    input: &str,
++    buf: &mut W,
++) -> std::io::Result<()> {
+     #[cfg(feature = "fast_escape")]
+     {
+         use pulldown_cmark_escape::IoWriter;
+@@ -113,12 +357,42 @@ pub fn escape_html(input: &str, buf: &mut dyn std::io::Write) -> std::io::Result
+         Ok(())
+     }
+ 
+-    #[cfg(not(feature = "fast_escape"))]
++    #[cfg(all(not(feature = "fast_escape"), target_arch = "x86_64"))]
++    {
++        let bytes = input.as_bytes();
++        if bytes.len() >= 32 && std::arch::is_x86_feature_detected!("avx2") {
++            return unsafe { escape_html_avx2(bytes, buf) };
++        }
++        if bytes.len() >= 16 {
++            return escape_html_sse2(bytes, buf);
++        }
++        let mut start = 0;
++        for (i, &c) in bytes.iter().enumerate() {
++            let escaped: &[u8] = match c {
++                b'&' => b"&amp;",
++                b'<' => b"&lt;",
++                b'>' => b"&gt;",
++                b'"' => b"&quot;",
++                b'\'' => b"&#39;",
++                _ => continue,
++            };
++            if start < i {
++                buf.write_all(&bytes[start..i])?;
++            }
++            buf.write_all(escaped)?;
++            start = i + 1;
++        }
++        if start < bytes.len() {
++            buf.write_all(&bytes[start..])?;
++        }
++        Ok(())
++    }
++
++    #[cfg(all(not(feature = "fast_escape"), not(target_arch = "x86_64")))]
+     {
+-        // Write the unescaped runs in one go: `buf` is a `dyn Write`, so a call per byte is slow
+         let bytes = input.as_bytes();
+         let mut start = 0;
+-        for (i, c) in bytes.iter().enumerate() {
++        for (i, &c) in bytes.iter().enumerate() {
+             let escaped: &[u8] = match c {
+                 b'&' => b"&amp;",
+                 b'<' => b"&lt;",
+@@ -127,11 +401,16 @@ pub fn escape_html(input: &str, buf: &mut dyn std::io::Write) -> std::io::Result
+                 b'\'' => b"&#39;",
+                 _ => continue,
+             };
+-            buf.write_all(&bytes[start..i])?;
++            if start < i {
++                buf.write_all(&bytes[start..i])?;
++            }
+             buf.write_all(escaped)?;
+             start = i + 1;
+         }
+-        buf.write_all(&bytes[start..])
++        if start < bytes.len() {
++            buf.write_all(&bytes[start..])?;
++        }
++        Ok(())
+     }
+ }
+ 
+diff --git a/tera/src/value/mod.rs b/tera/src/value/mod.rs
+index e2abbb5..244590a 100644
+--- a/tera/src/value/mod.rs
++++ b/tera/src/value/mod.rs
+@@ -30,6 +30,133 @@ pub type Map = HashMap<Key<'static>, Value>;
+ #[cfg(feature = "preserve_order")]
+ pub type Map = indexmap::IndexMap<Key<'static>, Value>;
+ 
++#[cfg(not(feature = "no_fmt"))]
++const DEC_DIGITS_LUT: &[u8; 200] = b"\
++    0001020304050607080910111213141516171819\
++    2021222324252627282930313233343536373839\
++    4041424344454647484950515253545556575859\
++    6061626364656667686970717273747576777879\
++    8081828384858687888990919293949596979899";
++
++#[cfg(not(feature = "no_fmt"))]
++#[inline]
++fn write_u64_fast(mut v: u64, f: &mut impl std::io::Write) -> std::io::Result<()> {
++    if v < 10 {
++        let b = [b'0' + (v as u8)];
++        return f.write_all(&b);
++    }
++    if v < 100 {
++        let d = (v as usize) * 2;
++        return f.write_all(&DEC_DIGITS_LUT[d..d + 2]);
++    }
++    let mut buf = [0u8; 20];
++    let mut pos = buf.len();
++    while v >= 100 {
++        let rem = ((v % 100) as usize) * 2;
++        v /= 100;
++        pos -= 2;
++        buf[pos] = DEC_DIGITS_LUT[rem];
++        buf[pos + 1] = DEC_DIGITS_LUT[rem + 1];
++    }
++    if v < 10 {
++        pos -= 1;
++        buf[pos] = b'0' + (v as u8);
++    } else {
++        let d = (v as usize) * 2;
++        pos -= 2;
++        buf[pos] = DEC_DIGITS_LUT[d];
++        buf[pos + 1] = DEC_DIGITS_LUT[d + 1];
++    }
++    f.write_all(&buf[pos..])
++}
++
++#[cfg(not(feature = "no_fmt"))]
++#[inline]
++fn write_i64_fast(v: i64, f: &mut impl std::io::Write) -> std::io::Result<()> {
++    if v >= 0 {
++        return write_u64_fast(v as u64, f);
++    }
++    let mut buf = [0u8; 21];
++    let mut pos = buf.len();
++    let mut u = v.unsigned_abs();
++    while u >= 100 {
++        let rem = ((u % 100) as usize) * 2;
++        u /= 100;
++        pos -= 2;
++        buf[pos] = DEC_DIGITS_LUT[rem];
++        buf[pos + 1] = DEC_DIGITS_LUT[rem + 1];
++    }
++    if u < 10 {
++        pos -= 1;
++        buf[pos] = b'0' + (u as u8);
++    } else {
++        let d = (u as usize) * 2;
++        pos -= 2;
++        buf[pos] = DEC_DIGITS_LUT[d];
++        buf[pos + 1] = DEC_DIGITS_LUT[d + 1];
++    }
++    pos -= 1;
++    buf[pos] = b'-';
++    f.write_all(&buf[pos..])
++}
++
++#[cfg(not(feature = "no_fmt"))]
++#[inline]
++fn write_u128_fast(mut v: u128, f: &mut impl std::io::Write) -> std::io::Result<()> {
++    if v <= u64::MAX as u128 {
++        return write_u64_fast(v as u64, f);
++    }
++    let mut buf = [0u8; 40];
++    let mut pos = buf.len();
++    while v >= 100 {
++        let rem = ((v % 100) as usize) * 2;
++        v /= 100;
++        pos -= 2;
++        buf[pos] = DEC_DIGITS_LUT[rem];
++        buf[pos + 1] = DEC_DIGITS_LUT[rem + 1];
++    }
++    if v < 10 {
++        pos -= 1;
++        buf[pos] = b'0' + (v as u8);
++    } else {
++        let d = (v as usize) * 2;
++        pos -= 2;
++        buf[pos] = DEC_DIGITS_LUT[d];
++        buf[pos + 1] = DEC_DIGITS_LUT[d + 1];
++    }
++    f.write_all(&buf[pos..])
++}
++
++#[cfg(not(feature = "no_fmt"))]
++#[inline]
++fn write_i128_fast(v: i128, f: &mut impl std::io::Write) -> std::io::Result<()> {
++    if v >= 0 {
++        return write_u128_fast(v as u128, f);
++    }
++    let mut buf = [0u8; 41];
++    let mut pos = buf.len();
++    let mut u = v.unsigned_abs();
++    while u >= 100 {
++        let rem = ((u % 100) as usize) * 2;
++        u /= 100;
++        pos -= 2;
++        buf[pos] = DEC_DIGITS_LUT[rem];
++        buf[pos + 1] = DEC_DIGITS_LUT[rem + 1];
++    }
++    if u < 10 {
++        pos -= 1;
++        buf[pos] = b'0' + (u as u8);
++    } else {
++        let d = (u as usize) * 2;
++        pos -= 2;
++        buf[pos] = DEC_DIGITS_LUT[d];
++        buf[pos + 1] = DEC_DIGITS_LUT[d + 1];
++    }
++    pos -= 1;
++    buf[pos] = b'-';
++    f.write_all(&buf[pos..])
++}
++
+ #[inline]
+ pub(crate) fn format_map(map: &Map, f: &mut impl std::io::Write) -> std::io::Result<()> {
+     let mut key_val: Box<_> = map.iter().collect();
+@@ -474,12 +601,39 @@ impl Value {
+         matches!(self.kind(), ValueKind::Bytes)
+     }
+ 
++    #[inline]
+     pub(crate) fn format(&self, f: &mut impl std::io::Write) -> std::io::Result<()> {
+         match &self.inner {
+             ValueInner::None | ValueInner::Undefined => Ok(()),
+             ValueInner::Bool(v) => f.write_all(if *v { b"true" } else { b"false" }),
+-            ValueInner::Bytes(v) => f.write_all(String::from_utf8_lossy(v).as_bytes()),
+             ValueInner::String(v) => f.write_all(v.as_str().as_bytes()),
++            ValueInner::U64(v) => {
++                #[cfg(feature = "no_fmt")]
++                {
++                    let mut buf = itoa::Buffer::new();
++                    f.write_all(buf.format(*v).as_bytes())
++                }
++                #[cfg(not(feature = "no_fmt"))]
++                write_u64_fast(*v, f)
++            }
++            ValueInner::I64(v) => {
++                #[cfg(feature = "no_fmt")]
++                {
++                    let mut buf = itoa::Buffer::new();
++                    f.write_all(buf.format(*v).as_bytes())
++                }
++                #[cfg(not(feature = "no_fmt"))]
++                write_i64_fast(*v, f)
++            }
++            _ => self.format_cold(f),
++        }
++    }
++
++    #[cold]
++    #[inline(never)]
++    fn format_cold(&self, f: &mut impl std::io::Write) -> std::io::Result<()> {
++        match &self.inner {
++            ValueInner::Bytes(v) => f.write_all(String::from_utf8_lossy(v).as_bytes()),
+             ValueInner::Array(v) => {
+                 f.write_all(b"[")?;
+ 
+@@ -503,24 +657,6 @@ impl Value {
+                 // Debug rather than Display so integral floats keep their `.0`
+                 write!(f, "{v:?}")
+             }
+-            ValueInner::U64(v) => {
+-                #[cfg(feature = "no_fmt")]
+-                {
+-                    let mut buf = itoa::Buffer::new();
+-                    f.write_all(buf.format(*v).as_bytes())
+-                }
+-                #[cfg(not(feature = "no_fmt"))]
+-                write!(f, "{v}")
+-            }
+-            ValueInner::I64(v) => {
+-                #[cfg(feature = "no_fmt")]
+-                {
+-                    let mut buf = itoa::Buffer::new();
+-                    f.write_all(buf.format(*v).as_bytes())
+-                }
+-                #[cfg(not(feature = "no_fmt"))]
+-                write!(f, "{v}")
+-            }
+             ValueInner::U128(v) => {
+                 #[cfg(feature = "no_fmt")]
+                 {
+@@ -528,7 +664,7 @@ impl Value {
+                     f.write_all(buf.format(**v).as_bytes())
+                 }
+                 #[cfg(not(feature = "no_fmt"))]
+-                write!(f, "{}", **v)
++                write_u128_fast(**v, f)
+             }
+             ValueInner::I128(v) => {
+                 #[cfg(feature = "no_fmt")]
+@@ -537,8 +673,9 @@ impl Value {
+                     f.write_all(buf.format(**v).as_bytes())
+                 }
+                 #[cfg(not(feature = "no_fmt"))]
+-                write!(f, "{}", **v)
++                write_i128_fast(**v, f)
+             }
++            _ => unreachable!(),
+         }
+     }
+ 
+diff --git a/tera/src/vm/for_loop.rs b/tera/src/vm/for_loop.rs
+index 45bdf8f..015ef9a 100644
+--- a/tera/src/vm/for_loop.rs
++++ b/tera/src/vm/for_loop.rs
+@@ -1,5 +1,5 @@
++use crate::Value;
+ use crate::value::{Key, ValueInner};
+-use crate::{HashMap, Value};
+ use std::sync::Arc;
+ 
+ /// Lazy iterator for for-loop values that only clones the current item
+@@ -205,8 +205,9 @@ pub(crate) struct ForLoop<'a> {
+     iterator: ForLoopIterator,
+     loop_data: Loop,
+     pub(crate) end_ip: usize,
+-    /// The names are borrowed from the chunk being run so we don't allocate them on every loop
+-    pub(crate) context: HashMap<&'a str, Value>,
++    /// The names are borrowed from the chunk being run so we don't allocate them on every loop.
++    /// Small Vec avoids per-loop HashMap RandomState construction when loops don't use `{% set %}`.
++    pub(crate) context: Vec<(&'a str, Value)>,
+     value_name: &'a str,
+     key_name: Option<&'a str>,
+     current_values: (Option<Value>, Value),
+@@ -232,7 +233,7 @@ impl<'a> ForLoop<'a> {
+             iterator,
+             loop_data,
+             end_ip: 0,
+-            context: HashMap::new(),
++            context: Vec::new(),
+             value_name: "", // Will be set by store_local
+             key_name: None,
+             current_values: (None, Value::undefined()), // Will be set by first advance()
+@@ -257,25 +258,81 @@ impl<'a> ForLoop<'a> {
+         }
+     }
+ 
+-    /// Advance the counter only after the end ip has been set (eg we start incrementing only from the
+-    /// second time we see the loop)
++    /// Single-pass check + advance for `Instruction::Iterate(end_ip)`.
++    /// Returns `true` if the loop advanced to a new item, or `false` if iteration is complete.
+     #[inline(always)]
+-    pub(crate) fn advance(&mut self) {
+-        if let Some((key, value)) = self.iterator.next() {
+-            self.current_values = (key, value);
+-            self.iterated = true;
+-            if self.end_ip != 0 {
+-                self.loop_data.advance();
+-                if !self.context.is_empty() {
+-                    self.context.clear();
++    pub(crate) fn step(&mut self, end_ip: usize) -> bool {
++        match &mut self.iterator {
++            ForLoopIterator::Array { arr, index } => {
++                if *index >= arr.len() {
++                    return false;
++                }
++                *index += 1;
++            }
++            other => {
++                if let Some((key, value)) = other.next() {
++                    self.current_values = (key, value);
++                } else {
++                    return false;
++                }
++            }
++        }
++        self.iterated = true;
++        if self.end_ip != 0 {
++            self.loop_data.advance();
++            if !self.context.is_empty() {
++                self.context.clear();
++            }
++        } else {
++            self.end_ip = end_ip;
++        }
++        true
++    }
++
++    #[inline(always)]
++    fn current_value_ref(&self) -> &Value {
++        match &self.iterator {
++            ForLoopIterator::Array { arr, index } if *index > 0 => &arr[*index - 1],
++            _ => &self.current_values.1,
++        }
++    }
++
++    #[inline(always)]
++    pub(crate) fn array_fast_info(&self) -> Option<(&[Value], &'a str, bool)> {
++        if self.end_ip == 0 && self.key_name.is_none() && self.context.is_empty() {
++            if let ForLoopIterator::Array { arr, index: 0 } = &self.iterator {
++                if !arr.is_empty() {
++                    return Some((arr.as_slice(), self.value_name, self.is_comprehension));
+                 }
+             }
+         }
++        None
+     }
+ 
+     #[inline(always)]
+-    pub(crate) fn is_over(&self) -> bool {
+-        self.iterator.size_hint().0 == 0
++    pub(crate) fn finish_array(&mut self, end_ip: usize) {
++        if let ForLoopIterator::Array { arr, index } = &mut self.iterator {
++            let len = arr.len();
++            *index = len;
++            self.iterated = len > 0;
++            self.end_ip = end_ip;
++            if len > 0 {
++                self.loop_data.index0 = len - 1;
++                self.loop_data.first = len == 1;
++                self.loop_data.last = true;
++            }
++        }
++    }
++
++    pub(crate) fn set_array_error_pos(&mut self, idx: usize, end_ip: usize) {
++        if let ForLoopIterator::Array { index, .. } = &mut self.iterator {
++            *index = idx + 1;
++            self.iterated = true;
++            self.end_ip = end_ip;
++            self.loop_data.index0 = idx;
++            self.loop_data.first = idx == 0;
++            self.loop_data.last = idx + 1 == self.loop_data.length;
++        }
+     }
+ 
+     pub(crate) fn iterated(&self) -> bool {
+@@ -283,43 +340,82 @@ impl<'a> ForLoop<'a> {
+     }
+ 
+     pub(crate) fn store(&mut self, name: &'a str, value: Value) {
+-        self.context.insert(name, value);
++        for (k, v) in &mut self.context {
++            if *k == name {
++                *v = value;
++                return;
++            }
++        }
++        self.context.push((name, value));
+     }
+ 
+     #[inline(always)]
+-    pub(crate) fn get(&self, name: &str) -> Option<Value> {
+-        // Special casing the loop variable
+-        match name {
+-            "__tera_loop_index" if !self.is_comprehension => {
+-                Some(Value::from(self.loop_data.index() as u64))
+-            }
+-            "__tera_loop_index0" if !self.is_comprehension => {
+-                Some(Value::from(self.loop_data.index0 as u64))
+-            }
+-            "__tera_loop_first" if !self.is_comprehension => {
+-                Some(Value::from(self.loop_data.first))
++    fn get_context(&self, name: &str) -> Option<&Value> {
++        for (k, v) in &self.context {
++            if *k == name {
++                return Some(v);
+             }
+-            "__tera_loop_last" if !self.is_comprehension => Some(Value::from(self.loop_data.last)),
+-            "__tera_loop_length" if !self.is_comprehension => {
+-                Some(Value::from(self.loop_data.length as u64))
+-            }
+-            _ => {
+-                if !self.context.is_empty()
+-                    && let Some(v) = self.context.get(name)
+-                {
+-                    return Some(v.clone());
+-                }
++        }
++        None
++    }
+ 
+-                if self.value_name == name {
+-                    return Some(self.current_values.1.clone());
+-                }
++    /// Fast path for reading the innermost loop's value variable directly without scanning scopes.
++    #[inline(always)]
++    pub(crate) fn fast_value_ref(&self, name: &str) -> Option<&Value> {
++        if self.context.is_empty() && self.value_name == name {
++            Some(self.current_value_ref())
++        } else {
++            None
++        }
++    }
+ 
+-                if self.key_name == Some(name) {
+-                    return Some(self.current_values.0.clone().unwrap_or(Value::none()));
+-                }
++    /// Zero-copy borrowed lookup for non-synthetic loop variables (8-byte `Option<&Value>`, no Drop).
++    #[inline(always)]
++    pub(crate) fn get_borrowed(&self, name: &str) -> Option<&Value> {
++        if !self.context.is_empty()
++            && let Some(v) = self.get_context(name)
++        {
++            return Some(v);
++        }
++
++        if self.value_name == name {
++            return Some(self.current_value_ref());
++        }
+ 
+-                None
++        if self.key_name == Some(name) {
++            return self.current_values.0.as_ref();
++        }
++
++        None
++    }
++
++    #[inline(always)]
++    pub(crate) fn get(&self, name: &str) -> Option<Value> {
++        if !self.is_comprehension && name.as_bytes().first() == Some(&b'_') {
++            match name {
++                "__tera_loop_index" => return Some(Value::from(self.loop_data.index() as u64)),
++                "__tera_loop_index0" => return Some(Value::from(self.loop_data.index0 as u64)),
++                "__tera_loop_first" => return Some(Value::from(self.loop_data.first)),
++                "__tera_loop_last" => return Some(Value::from(self.loop_data.last)),
++                "__tera_loop_length" => return Some(Value::from(self.loop_data.length as u64)),
++                _ => {}
+             }
+         }
++
++        if !self.context.is_empty()
++            && let Some(v) = self.get_context(name)
++        {
++            return Some(v.clone());
++        }
++
++        if self.value_name == name {
++            return Some(self.current_value_ref().clone());
++        }
++
++        if self.key_name == Some(name) {
++            return Some(self.current_values.0.clone().unwrap_or(Value::none()));
++        }
++
++        None
+     }
+ }
+diff --git a/tera/src/vm/interpreter.rs b/tera/src/vm/interpreter.rs
+index 53316f5..3317997 100644
+--- a/tera/src/vm/interpreter.rs
++++ b/tera/src/vm/interpreter.rs
+@@ -145,8 +145,8 @@ impl<'tera> VirtualMachine<'tera> {
+ 
+         macro_rules! component {
+             ($name:expr, $span_idx:expr, $has_body:expr, $direct:expr) => {{
+-                let (kwargs, _) = state.stack.pop();
+-                let kwargs = kwargs.into_map().expect("to have kwargs");
++                let (kwargs_val, _) = state.stack.pop();
++                let kwargs = kwargs_val.as_map().expect("to have kwargs");
+                 let (component_def, component_chunk) = self
+                     .tera
+                     .components
+@@ -210,7 +210,15 @@ impl<'tera> VirtualMachine<'tera> {
+             }};
+         }
+ 
+-        while let Some((instr, _)) = state.chunk.expect("To have a chunk").get(ip) {
++        let chunk = state.chunk.expect("To have a chunk");
++        let instrs = chunk.instructions();
++        let autoescape = self.autoescape_enabled();
++        let use_default_escape = std::ptr::fn_addr_eq(
++            self.tera.escape_fn,
++            crate::utils::escape_html as crate::EscapeFn,
++        );
++
++        while let Some(instr) = instrs.get(ip) {
+             // Current instruction index as span reference
+             let current_ip = ip as u32;
+ 
+@@ -679,13 +687,253 @@ impl<'tera> VirtualMachine<'tera> {
+                     }
+                 }
+                 Instruction::Iterate(end_ip) => {
++                    if state.capture_buffers.is_empty()
++                        && *end_ip > ip + 1
++                        && *end_ip <= instrs.len()
++                        && matches!(instrs[*end_ip - 1], Instruction::Jump(target) if target == ip)
++                        && let Some(for_loop) = state.for_loops.last()
++                        && let Some((slice, val_name, is_comp)) = for_loop.array_fast_info()
++                    {
++                        #[derive(Copy, Clone)]
++                        enum FastLoopOp<'a> {
++                            Text(&'a [u8]),
++                            Item,
++                            LoopIndex,
++                            LoopIndex0,
++                        }
++
++                        let body = &instrs[ip + 1..*end_ip - 1];
++                        let mut ops = [FastLoopOp::Text(&[]); 16];
++                        let mut op_len = 0usize;
++                        let mut eligible = !body.is_empty() && body.len() <= ops.len();
++                        if eligible {
++                            for bi in body {
++                                match bi {
++                                    Instruction::WriteText(t) => {
++                                        ops[op_len] = FastLoopOp::Text(t.as_bytes());
++                                        op_len += 1;
++                                    }
++                                    Instruction::WritePath(p) if p.len() == 1 => {
++                                        let n = p[0].as_str();
++                                        if !is_comp && n == "__tera_loop_index" {
++                                            ops[op_len] = FastLoopOp::LoopIndex;
++                                        } else if !is_comp && n == "__tera_loop_index0" {
++                                            ops[op_len] = FastLoopOp::LoopIndex0;
++                                        } else if n == val_name {
++                                            ops[op_len] = FastLoopOp::Item;
++                                        } else {
++                                            eligible = false;
++                                            break;
++                                        }
++                                        op_len += 1;
++                                    }
++                                    _ => {
++                                        eligible = false;
++                                        break;
++                                    }
++                                }
++                            }
++                        }
++                        if eligible {
++                            let mut undef_at: Option<usize> = None;
++                            let active_ops = &ops[..op_len];
++                            let mut batch = [0u8; 4096];
++                            let mut bpos = 0usize;
++
++                            macro_rules! flush_batch {
++                                () => {{
++                                    if bpos > 0 {
++                                        output.write_all(&batch[..bpos])?;
++                                        bpos = 0;
++                                    }
++                                }};
++                            }
++
++                            macro_rules! push_slice {
++                                ($bytes:expr) => {{
++                                    let s: &[u8] = $bytes;
++                                    if s.len() <= 128 {
++                                        if bpos + s.len() > batch.len() {
++                                            output.write_all(&batch[..bpos])?;
++                                            bpos = 0;
++                                        }
++                                        // SAFETY: bpos + s.len() <= batch.len() checked above.
++                                        unsafe {
++                                            std::ptr::copy_nonoverlapping(
++                                                s.as_ptr(),
++                                                batch.as_mut_ptr().add(bpos),
++                                                s.len(),
++                                            );
++                                        }
++                                        bpos += s.len();
++                                    } else {
++                                        flush_batch!();
++                                        output.write_all(s)?;
++                                    }
++                                }};
++                            }
++
++                            macro_rules! push_u64 {
++                                ($val:expr) => {{
++                                    const LUT: &[u8; 200] = b"\
++                                        0001020304050607080910111213141516171819\
++                                        2021222324252627282930313233343536373839\
++                                        4041424344454647484950515253545556575859\
++                                        6061626364656667686970717273747576777879\
++                                        8081828384858687888990919293949596979899";
++                                    if bpos + 24 > batch.len() {
++                                        output.write_all(&batch[..bpos])?;
++                                        bpos = 0;
++                                    }
++                                    let mut v: u64 = $val;
++                                    if v < 10 {
++                                        batch[bpos] = b'0' + (v as u8);
++                                        bpos += 1;
++                                    } else if v < 100 {
++                                        let d = (v as usize) * 2;
++                                        batch[bpos] = LUT[d];
++                                        batch[bpos + 1] = LUT[d + 1];
++                                        bpos += 2;
++                                    } else {
++                                        let mut tmp = [0u8; 20];
++                                        let mut p = 20usize;
++                                        while v >= 100 {
++                                            let rem = ((v % 100) as usize) * 2;
++                                            v /= 100;
++                                            p -= 2;
++                                            tmp[p] = LUT[rem];
++                                            tmp[p + 1] = LUT[rem + 1];
++                                        }
++                                        if v < 10 {
++                                            p -= 1;
++                                            tmp[p] = b'0' + (v as u8);
++                                        } else {
++                                            let d = (v as usize) * 2;
++                                            p -= 2;
++                                            tmp[p] = LUT[d];
++                                            tmp[p + 1] = LUT[d + 1];
++                                        }
++                                        let n = 20 - p;
++                                        batch[bpos..bpos + n].copy_from_slice(&tmp[p..]);
++                                        bpos += n;
++                                    }
++                                }};
++                            }
++
++                            // Specialize the ultra-common `[Text(pre), Item, Text(post)]` pattern
++                            // (e.g. `<td>{{ col }}</td>`, `<li>{{ item }}</li>`) to eliminate the inner op loop.
++                            if let [
++                                FastLoopOp::Text(pre),
++                                FastLoopOp::Item,
++                                FastLoopOp::Text(post),
++                            ] = *active_ops
++                            {
++                                for (idx, elem) in slice.iter().enumerate() {
++                                    if elem.is_undefined() {
++                                        undef_at = Some(idx);
++                                        break;
++                                    }
++                                    push_slice!(pre);
++                                    match &elem.inner {
++                                        ValueInner::U64(v) => push_u64!(*v),
++                                        ValueInner::I64(v) if *v >= 0 => push_u64!(*v as u64),
++                                        ValueInner::Bool(b) => {
++                                            push_slice!(if *b { b"true" } else { b"false" });
++                                        }
++                                        ValueInner::None => {}
++                                        ValueInner::String(s)
++                                            if !autoescape || elem.is_safe() =>
++                                        {
++                                            push_slice!(s.as_str().as_bytes());
++                                        }
++                                        _ => {
++                                            flush_batch!();
++                                            self.write_value_fast(
++                                                elem,
++                                                autoescape,
++                                                use_default_escape,
++                                                &mut [],
++                                                &mut state.escape_buffer,
++                                                output,
++                                            )?;
++                                        }
++                                    }
++                                    push_slice!(post);
++                                }
++                            } else {
++                                'fast_loop: for (idx, elem) in slice.iter().enumerate() {
++                                    for &op in active_ops {
++                                        match op {
++                                            FastLoopOp::Text(bytes) => {
++                                                push_slice!(bytes);
++                                            }
++                                            FastLoopOp::LoopIndex => {
++                                                push_u64!((idx + 1) as u64);
++                                            }
++                                            FastLoopOp::LoopIndex0 => {
++                                                push_u64!(idx as u64);
++                                            }
++                                            FastLoopOp::Item => {
++                                                if elem.is_undefined() {
++                                                    undef_at = Some(idx);
++                                                    break 'fast_loop;
++                                                }
++                                                match &elem.inner {
++                                                    ValueInner::U64(v) => push_u64!(*v),
++                                                    ValueInner::I64(v) if *v >= 0 => {
++                                                        push_u64!(*v as u64);
++                                                    }
++                                                    ValueInner::Bool(b) => {
++                                                        push_slice!(if *b {
++                                                            b"true"
++                                                        } else {
++                                                            b"false"
++                                                        });
++                                                    }
++                                                    ValueInner::None => {}
++                                                    ValueInner::String(s)
++                                                        if !autoescape || elem.is_safe() =>
++                                                    {
++                                                        push_slice!(s.as_str().as_bytes());
++                                                    }
++                                                    _ => {
++                                                        flush_batch!();
++                                                        self.write_value_fast(
++                                                            elem,
++                                                            autoescape,
++                                                            use_default_escape,
++                                                            &mut [],
++                                                            &mut state.escape_buffer,
++                                                            output,
++                                                        )?;
++                                                    }
++                                                }
++                                            }
++                                        }
++                                    }
++                                }
++                            }
++                            if bpos > 0 {
++                                output.write_all(&batch[..bpos])?;
++                            }
++                            if let Some(fail_idx) = undef_at {
++                                if let Some(fl) = state.for_loops.last_mut() {
++                                    fl.set_array_error_pos(fail_idx, *end_ip);
++                                }
++                            } else {
++                                if let Some(fl) = state.for_loops.last_mut() {
++                                    fl.finish_array(*end_ip);
++                                }
++                                ip = *end_ip;
++                                continue;
++                            }
++                        }
++                    }
+                     if let Some(for_loop) = state.for_loops.last_mut() {
+-                        if for_loop.is_over() {
++                        if !for_loop.step(*end_ip) {
+                             ip = *end_ip;
+                             continue;
+                         }
+-                        for_loop.advance();
+-                        for_loop.end_ip = *end_ip;
+                     }
+                 }
+                 Instruction::StoreDidNotIterate => {
+@@ -792,32 +1040,134 @@ impl<'tera> VirtualMachine<'tera> {
+                 // Combined instructions
+                 Instruction::LoadPath(path) => {
+                     let chunk = state.chunk.expect("to have a chunk");
+-                    let mut val = if path.len() == 1 && path[0] == MAGICAL_DUMP_VAR {
+-                        state.dump_context()
++                    let val = if let Some(root) = state.get_borrowed(&path[0]) {
++                        let num_attrs = path.len() - 1;
++                        if num_attrs == 0 {
++                            root.clone()
++                        } else {
++                            if root.is_undefined() {
++                                let span = chunk
++                                    .get_span_at(current_ip, 0)
++                                    .expect("to have a span for error");
++                                return Err(self.undefined_var_error(state, chunk, &path[0], span));
++                            }
++                            let mut cur: &Value = root;
++                            let mut undefined_tail = false;
++                            for (k, attr) in path[1..].iter().enumerate() {
++                                if cur.is_undefined() {
++                                    let span = chunk
++                                        .get_span_at(current_ip, k + 1)
++                                        .expect("to have a span for error");
++                                    return Err(
++                                        self.undefined_field_error(cur, attr, span, chunk)
++                                    );
++                                }
++                                match cur.get_attr(attr) {
++                                    Some(next) => cur = next,
++                                    None => {
++                                        if k + 1 < num_attrs {
++                                            let span = chunk
++                                                .get_span_at(current_ip, k + 1)
++                                                .expect("to have a span for error");
++                                            return Err(
++                                                self.undefined_field_error(cur, attr, span, chunk)
++                                            );
++                                        }
++                                        undefined_tail = true;
++                                        break;
++                                    }
++                                }
++                            }
++                            if undefined_tail {
++                                Value::undefined()
++                            } else {
++                                cur.clone()
++                            }
++                        }
+                     } else {
+-                        state.get_value(&path[0])
++                        let mut val = if path.len() == 1 && path[0] == MAGICAL_DUMP_VAR {
++                            state.dump_context()
++                        } else {
++                            state.get_value(&path[0])
++                        };
++                        let num_attrs = path.len() - 1;
++                        if num_attrs > 0 {
++                            if val.is_undefined() {
++                                let span = chunk
++                                    .get_span_at(current_ip, 0)
++                                    .expect("to have a span for error");
++                                return Err(self.undefined_var_error(state, chunk, &path[0], span));
++                            }
++                            let mut cur: &Value = &val;
++                            let mut undefined_tail = false;
++                            for (k, attr) in path[1..].iter().enumerate() {
++                                if cur.is_undefined() {
++                                    let span = chunk
++                                        .get_span_at(current_ip, k + 1)
++                                        .expect("to have a span for error");
++                                    return Err(
++                                        self.undefined_field_error(cur, attr, span, chunk)
++                                    );
++                                }
++                                match cur.get_attr(attr) {
++                                    Some(next) => cur = next,
++                                    None => {
++                                        if k + 1 < num_attrs {
++                                            let span = chunk
++                                                .get_span_at(current_ip, k + 1)
++                                                .expect("to have a span for error");
++                                            return Err(
++                                                self.undefined_field_error(cur, attr, span, chunk)
++                                            );
++                                        }
++                                        undefined_tail = true;
++                                        break;
++                                    }
++                                }
++                            }
++                            val = if undefined_tail {
++                                Value::undefined()
++                            } else {
++                                cur.clone()
++                            };
++                        }
++                        val
+                     };
+-                    let num_attrs = path.len() - 1;
+-                    if num_attrs > 0 {
+-                        if val.is_undefined() {
++                    state.stack.push(val, current_ip..=current_ip);
++                }
++                Instruction::WritePath(path) => {
++                    if path.len() == 1
++                        && let Some(fl) = state.for_loops.last()
++                        && let Some(val) = fl.fast_value_ref(&path[0])
++                    {
++                        if !val.is_undefined() {
++                            self.write_value_fast(
++                                val,
++                                autoescape,
++                                use_default_escape,
++                                &mut state.capture_buffers,
++                                &mut state.escape_buffer,
++                                output,
++                            )?;
++                            ip += 1;
++                            continue;
++                        }
++                    }
++                    let (borrowed_opt, capture_buffers, escape_buffer) =
++                        state.get_borrowed_with_buffers(&path[0]);
++                    if let Some(root) = borrowed_opt {
++                        if root.is_undefined() {
+                             let span = chunk
+                                 .get_span_at(current_ip, 0)
+                                 .expect("to have a span for error");
+                             return Err(self.undefined_var_error(state, chunk, &path[0], span));
+                         }
+-                        let mut cur: &Value = &val;
+-                        let mut undefined_tail = false;
+-                        for (k, attr) in path[1..].iter().enumerate() {
+-                            if cur.is_undefined() {
+-                                let span = chunk
+-                                    .get_span_at(current_ip, k + 1)
+-                                    .expect("to have a span for error");
+-                                return Err(self.undefined_field_error(cur, attr, span, chunk));
+-                            }
+-                            match cur.get_attr(attr) {
+-                                Some(next) => cur = next,
+-                                None => {
+-                                    if k + 1 < num_attrs {
++                        let val: &Value = if path.len() > 1 {
++                            let mut cur: &Value = root;
++                            for (k, attr) in path[1..].iter().enumerate() {
++                                match cur.get_attr(attr) {
++                                    Some(next) => cur = next,
++                                    None => {
+                                         let span = chunk
+                                             .get_span_at(current_ip, k + 1)
+                                             .expect("to have a span for error");
+@@ -825,52 +1175,60 @@ impl<'tera> VirtualMachine<'tera> {
+                                             self.undefined_field_error(cur, attr, span, chunk)
+                                         );
+                                     }
+-                                    undefined_tail = true;
+-                                    break;
+                                 }
+                             }
+-                        }
+-                        val = if undefined_tail {
+-                            Value::undefined()
++                            cur
+                         } else {
+-                            cur.clone()
++                            root
+                         };
+-                    }
+-                    state.stack.push(val, current_ip..=current_ip);
+-                }
+-                Instruction::WritePath(path) => {
+-                    let chunk = state.chunk.expect("to have a chunk");
+-                    let root = if path.len() == 1 && path[0] == MAGICAL_DUMP_VAR {
+-                        state.dump_context()
++                        self.write_value_fast(
++                            val,
++                            autoescape,
++                            use_default_escape,
++                            capture_buffers,
++                            escape_buffer,
++                            output,
++                        )?;
+                     } else {
+-                        state.get_value(&path[0])
+-                    };
+-                    if root.is_undefined() {
+-                        let span = chunk
+-                            .get_span_at(current_ip, 0)
+-                            .expect("to have a span for error");
+-                        return Err(self.undefined_var_error(state, chunk, &path[0], span));
+-                    }
+-                    let num_attrs = path.len() - 1;
+-                    let val: &Value = if num_attrs > 0 {
+-                        let mut cur: &Value = &root;
+-                        for (k, attr) in path[1..].iter().enumerate() {
+-                            match cur.get_attr(attr) {
+-                                Some(next) => cur = next,
+-                                None => {
+-                                    let span = chunk
+-                                        .get_span_at(current_ip, k + 1)
+-                                        .expect("to have a span for error");
+-                                    return Err(self.undefined_field_error(cur, attr, span, chunk));
++                        let root = if path.len() == 1 && path[0] == MAGICAL_DUMP_VAR {
++                            state.dump_context()
++                        } else {
++                            state.get_value(&path[0])
++                        };
++                        if root.is_undefined() {
++                            let span = chunk
++                                .get_span_at(current_ip, 0)
++                                .expect("to have a span for error");
++                            return Err(self.undefined_var_error(state, chunk, &path[0], span));
++                        }
++                        let val: &Value = if path.len() > 1 {
++                            let mut cur: &Value = &root;
++                            for (k, attr) in path[1..].iter().enumerate() {
++                                match cur.get_attr(attr) {
++                                    Some(next) => cur = next,
++                                    None => {
++                                        let span = chunk
++                                            .get_span_at(current_ip, k + 1)
++                                            .expect("to have a span for error");
++                                        return Err(
++                                            self.undefined_field_error(cur, attr, span, chunk)
++                                        );
++                                    }
+                                 }
+                             }
+-                        }
+-                        cur
+-                    } else {
+-                        &root
+-                    };
+-
+-                    self.write_value(val, state, output)?;
++                            cur
++                        } else {
++                            &root
++                        };
++                        self.write_value_fast(
++                            val,
++                            autoescape,
++                            use_default_escape,
++                            &mut state.capture_buffers,
++                            &mut state.escape_buffer,
++                            output,
++                        )?;
++                    }
+                 }
+             }
+ 
+@@ -887,27 +1245,64 @@ impl<'tera> VirtualMachine<'tera> {
+         state: &mut State<'tera>,
+         output: &mut impl Write,
+     ) -> TeraResult<()> {
+-        if !self.autoescape_enabled() || value.is_safe() {
+-            if let Some(captured) = state.capture_buffers.last_mut() {
++        let autoescape = self.autoescape_enabled();
++        let use_default_escape = std::ptr::fn_addr_eq(
++            self.tera.escape_fn,
++            crate::utils::escape_html as crate::EscapeFn,
++        );
++        self.write_value_fast(
++            value,
++            autoescape,
++            use_default_escape,
++            &mut state.capture_buffers,
++            &mut state.escape_buffer,
++            output,
++        )
++    }
++
++    #[inline(always)]
++    fn write_value_fast(
++        &self,
++        value: &Value,
++        autoescape: bool,
++        use_default_escape: bool,
++        capture_buffers: &mut [Vec<u8>],
++        escape_buffer: &mut Vec<u8>,
++        output: &mut impl Write,
++    ) -> TeraResult<()> {
++        if !autoescape || value.is_safe() {
++            if let Some(captured) = capture_buffers.last_mut() {
+                 value.format(captured)?;
+             } else {
+                 value.format(output)?;
+             }
+         } else if let ValueInner::String(s) = &value.inner {
+-            if let Some(captured) = state.capture_buffers.last_mut() {
+-                (self.tera.escape_fn)(s.as_str(), captured)?;
++            if let Some(captured) = capture_buffers.last_mut() {
++                if use_default_escape {
++                    crate::utils::escape_html_generic(s.as_str(), captured)?;
++                } else {
++                    (self.tera.escape_fn)(s.as_str(), captured)?;
++                }
++            } else if use_default_escape {
++                crate::utils::escape_html_generic(s.as_str(), output)?;
+             } else {
+                 (self.tera.escape_fn)(s.as_str(), output)?;
+             }
+         } else {
+             // Avoiding String as much as possible for composite values.
+-            state.escape_buffer.clear();
+-            value.format(&mut state.escape_buffer)?;
++            escape_buffer.clear();
++            value.format(&mut *escape_buffer)?;
+             // SAFETY: the buffer was just filled by Value::format, which only
+             // writes valid UTF-8
+-            let escaped = unsafe { std::str::from_utf8_unchecked(&state.escape_buffer) };
+-            if let Some(captured) = state.capture_buffers.last_mut() {
+-                (self.tera.escape_fn)(escaped, captured)?;
++            let escaped = unsafe { std::str::from_utf8_unchecked(escape_buffer) };
++            if let Some(captured) = capture_buffers.last_mut() {
++                if use_default_escape {
++                    crate::utils::escape_html_generic(escaped, captured)?;
++                } else {
++                    (self.tera.escape_fn)(escaped, captured)?;
++                }
++            } else if use_default_escape {
++                crate::utils::escape_html_generic(escaped, output)?;
+             } else {
+                 (self.tera.escape_fn)(escaped, output)?;
+             }
+@@ -1044,6 +1439,7 @@ impl<'tera> VirtualMachine<'tera> {
+     ) -> TeraResult<String> {
+         let mut output = Vec::with_capacity(self.template.size_hint());
+         self.render_to(None, context, global_context, &mut output)?;
++        self.template.record_rendered_len(output.len());
+         Ok(String::from_utf8(output)?)
+     }
+ 
+diff --git a/tera/src/vm/state.rs b/tera/src/vm/state.rs
+index 336aa93..bfaf8ad 100644
+--- a/tera/src/vm/state.rs
++++ b/tera/src/vm/state.rs
+@@ -109,6 +109,82 @@ impl<'t> State<'t> {
+         self.set_variables.insert(name, value);
+     }
+ 
++    /// Zero-copy borrowed lookup for standard variables (returns `None` for synthetic `__tera_loop_*`
++    /// or undefined names, falling back to `get_value`).
++    #[inline(always)]
++    pub(crate) fn lookup_borrowed<'a>(
++        for_loops: &'a [ForLoop<'t>],
++        set_variables: &'a BTreeMap<&'t str, Value>,
++        include_parent: Option<&'a State<'t>>,
++        context: &'a Context,
++        global_context: Option<&'a Context>,
++        name: &str,
++    ) -> Option<&'a Value> {
++        if name.as_bytes().first() == Some(&b'_') && name.starts_with("__tera_loop_") {
++            return None;
++        }
++
++        for forloop in for_loops.iter().rev() {
++            if let Some(v) = forloop.get_borrowed(name) {
++                return Some(v);
++            }
++        }
++
++        if !set_variables.is_empty()
++            && let Some(val) = set_variables.get(name)
++        {
++            return Some(val);
++        }
++
++        if let Some(parent) = include_parent
++            && let Some(val) = parent.get_borrowed(name)
++            && !val.is_undefined()
++        {
++            return Some(val);
++        }
++
++        if let Some(val) = context.data.get(name) {
++            return Some(val);
++        }
++
++        if let Some(global) = global_context
++            && !global.data.is_empty()
++            && let Some(val) = global.data.get(name)
++        {
++            return Some(val);
++        }
++
++        None
++    }
++
++    #[inline(always)]
++    pub(crate) fn get_borrowed(&self, name: &str) -> Option<&Value> {
++        Self::lookup_borrowed(
++            &self.for_loops,
++            &self.set_variables,
++            self.include_parent,
++            self.context,
++            self.global_context,
++            name,
++        )
++    }
++
++    #[inline(always)]
++    pub(crate) fn get_borrowed_with_buffers<'a>(
++        &'a mut self,
++        name: &str,
++    ) -> (Option<&'a Value>, &'a mut Vec<Vec<u8>>, &'a mut Vec<u8>) {
++        let val = Self::lookup_borrowed(
++            &self.for_loops,
++            &self.set_variables,
++            self.include_parent,
++            self.context,
++            self.global_context,
++            name,
++        );
++        (val, &mut self.capture_buffers, &mut self.escape_buffer)
++    }
++
+     /// Loads the value with the current name on the stack
+     /// It goes in the following order for scopes:
+     /// 1. All loops from the inner to the outer
+@@ -123,7 +199,9 @@ impl<'t> State<'t> {
+             }
+         }
+ 
+-        if let Some(val) = self.set_variables.get(name) {
++        if !self.set_variables.is_empty()
++            && let Some(val) = self.set_variables.get(name)
++        {
+             return val.clone();
+         }
+ 
+@@ -139,6 +217,7 @@ impl<'t> State<'t> {
+         }
+ 
+         if let Some(global) = self.global_context
++            && !global.data.is_empty()
+             && let Some(val) = global.data.get(name)
+         {
+             return val.clone();
+@@ -286,7 +365,7 @@ impl<'t> State<'t> {
+         }
+ 
+         for forloop in &self.for_loops {
+-            for k in forloop.context.keys() {
++            for (k, _) in &forloop.context {
+                 vars.insert(k.to_string());
+             }
+         }

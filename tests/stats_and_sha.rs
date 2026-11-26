@@ -142,3 +142,48 @@ Binary Images:
     assert!(rep.hotspots[0].in_project);
     assert!(!rep.hotspots[1].in_project);
 }
+
+#[test]
+fn parses_linux_perf_srcline_with_snippets() {
+    use oa::profiler::parse_perf_report_srcline;
+    use std::fs;
+
+    let tmp = std::env::temp_dir().join(format!("oa_perf_src_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(tmp.join("src")).unwrap();
+    let src_file = tmp.join("src").join("render.rs");
+    fs::write(
+        &src_file,
+        "pub fn render_hot(xs: &[u8]) -> usize {\n    let mut acc = 0;\n    for &b in xs {\n        acc += (b as usize) * 3;\n    }\n    acc\n}\n",
+    )
+    .unwrap();
+    let abs_src = fs::canonicalize(&src_file).unwrap();
+
+    let raw = format!(
+        "# Overhead\tShared Object\tSymbol\tSource:Line\tIPC\n\
+          68.40%\tbench\t[.] mycrate::render::render_hot\t{}:4 (inlined)\t3.10\n\
+          21.10%\tlibc.so.6\t[.] __memmove_avx_unaligned\tlibc.so.6+0x4a230\t-\n\
+          10.50%\tbench\t[.] core::slice::<impl [T]>::sort\t/rustc/std/slice.rs:212\t-\n",
+        abs_src.display()
+    );
+
+    let hs = parse_perf_report_srcline(&raw, 100.0, &tmp, 5);
+    assert_eq!(hs.len(), 3);
+    assert_eq!(hs[0].function, "mycrate::render::render_hot");
+    assert_eq!(hs[0].line, 4);
+    assert!(hs[0].in_project);
+    assert!(hs[0].file.ends_with("render.rs"));
+    let snip = hs[0].snippet.as_ref().expect("source snippet resolved");
+    assert!(snip.contains(">    4 |         acc += (b as usize) * 3;"));
+
+    assert_eq!(hs[1].function, "__memmove_avx_unaligned");
+    assert_eq!(hs[1].file, "libc.so.6");
+    assert_eq!(hs[1].line, 0);
+    assert!(!hs[1].in_project);
+
+    assert_eq!(hs[2].function, "core::slice::<impl [T]>::sort");
+    assert_eq!(hs[2].line, 212);
+    assert!(!hs[2].in_project);
+
+    let _ = fs::remove_dir_all(&tmp);
+}

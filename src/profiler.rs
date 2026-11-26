@@ -433,6 +433,142 @@ fn parse_perf_stat_csv(stderr: &str) -> Option<HardwareCounters> {
     Some(counters)
 }
 
+fn strip_perf_sym_prefix(raw: &str) -> String {
+    let t = raw.trim();
+    for prefix in ["[.] ", "[k] ", "[g] ", "[u] ", "[H] ", "[G] "] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            return rest.trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
+fn parse_perf_srcline(
+    srcline: &str,
+    cwd: &Path,
+    canon_cwd: &Path,
+) -> Option<(String, usize, bool)> {
+    let t = srcline.trim();
+    if t.is_empty()
+        || t == "-"
+        || t.starts_with("??")
+        || t.starts_with("[unknown]")
+        || t.contains("+0x")
+    {
+        return None;
+    }
+    let (file_part, line_part) = t.rsplit_once(':')?;
+    let digits: String = line_part
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let line_no = digits.parse::<usize>().ok()?;
+    if line_no == 0 {
+        return None;
+    }
+
+    let file_trimmed = file_part.trim();
+    if file_trimmed.is_empty() {
+        return None;
+    }
+
+    let p = Path::new(file_trimmed);
+    if p.is_absolute() {
+        let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if let Ok(rel) = canon.strip_prefix(canon_cwd) {
+            return Some((rel.to_string_lossy().to_string(), line_no, true));
+        }
+        return Some((file_trimmed.to_string(), line_no, false));
+    }
+
+    let in_project = cwd.join(p).is_file();
+    Some((file_trimmed.to_string(), line_no, in_project))
+}
+
+/// Parses `perf report --stdio --no-children -s dso,symbol,srcline --full-source-path -t '\t'`
+/// (or standard whitespace `perf report`) into ranked `Hotspot` entries with source snippets.
+pub fn parse_perf_report_srcline(
+    raw: &str,
+    wall_ms: f64,
+    cwd: &Path,
+    top_k: usize,
+) -> Vec<Hotspot> {
+    let canon_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut hotspots = Vec::new();
+    let mut snippet_count = 0usize;
+
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+
+        if line.contains('\t') {
+            let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+            if cols.len() >= 3 && cols[0].ends_with('%') {
+                if let Ok(pct) = cols[0].trim_end_matches('%').parse::<f64>() {
+                    let dso = cols[1].to_string();
+                    let sym = strip_perf_sym_prefix(cols[2]);
+                    let srcline = cols.get(3).copied().unwrap_or("");
+                    let (file, line_no, in_project) =
+                        parse_perf_srcline(srcline, cwd, &canon_cwd).unwrap_or((dso, 0, false));
+                    let snippet = if in_project && line_no > 0 && snippet_count < 5 {
+                        let s = read_source_snippet(cwd, &file, line_no, 5);
+                        if s.is_some() {
+                            snippet_count += 1;
+                        }
+                        s
+                    } else {
+                        None
+                    };
+                    hotspots.push(Hotspot {
+                        function: sym,
+                        file,
+                        line: line_no,
+                        self_ms: ((wall_ms * pct) / 100.0 * 1000.0).round() / 1000.0,
+                        cum_ms: ((wall_ms * pct) / 100.0 * 1000.0).round() / 1000.0,
+                        self_pct: pct,
+                        cum_pct: pct,
+                        calls: 0,
+                        in_project,
+                        snippet,
+                    });
+                    if hotspots.len() >= top_k {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let cols: Vec<&str> = t.split_whitespace().collect();
+        if cols.len() >= 5 && cols[0].ends_with('%') {
+            if let Ok(pct) = cols[0].trim_end_matches('%').parse::<f64>() {
+                let dso = cols[2].to_string();
+                let sym = strip_perf_sym_prefix(&cols[4..].join(" "));
+                hotspots.push(Hotspot {
+                    function: sym,
+                    file: dso,
+                    line: 0,
+                    self_ms: ((wall_ms * pct) / 100.0 * 1000.0).round() / 1000.0,
+                    cum_ms: ((wall_ms * pct) / 100.0 * 1000.0).round() / 1000.0,
+                    self_pct: pct,
+                    cum_pct: pct,
+                    calls: 0,
+                    in_project: false,
+                    snippet: None,
+                });
+                if hotspots.len() >= top_k {
+                    break;
+                }
+            }
+        }
+    }
+
+    hotspots
+}
+
 #[cfg(target_os = "linux")]
 fn profile_linux_native(cmd: &str, cwd: &Path, top_k: usize) -> Result<ProfileReport, String> {
     let base = run_command(cmd, cwd, None, true)?;
@@ -503,48 +639,63 @@ fn profile_linux_native(cmd: &str, cwd: &Path, top_k: usize) -> Result<ProfileRe
                 .current_dir(cwd)
                 .output();
             if matches!(rec, Ok(ref r) if r.status.success()) {
-                if let Ok(rep) = Command::new("perf")
-                    .args([
+                let perf_path = perf_data.to_string_lossy().to_string();
+                let arg_variants: [&[&str]; 3] = [
+                    &[
+                        "report",
+                        "--stdio",
+                        "--no-children",
+                        "--percent-limit",
+                        "1.0",
+                        "-s",
+                        "dso,symbol,srcline",
+                        "--full-source-path",
+                        "-t",
+                        "\t",
+                        "-i",
+                        &perf_path,
+                    ],
+                    &[
+                        "report",
+                        "--stdio",
+                        "--no-children",
+                        "--percent-limit",
+                        "1.0",
+                        "-s",
+                        "dso,symbol,srcline",
+                        "-t",
+                        "\t",
+                        "-i",
+                        &perf_path,
+                    ],
+                    &[
                         "report",
                         "--stdio",
                         "--no-children",
                         "--percent-limit",
                         "1.0",
                         "-i",
-                        &perf_data.to_string_lossy(),
-                    ])
-                    .current_dir(cwd)
-                    .output()
-                {
-                    let rep_txt = String::from_utf8_lossy(&rep.stdout);
-                    for line in rep_txt.lines() {
-                        let t = line.trim();
-                        if t.is_empty() || t.starts_with('#') {
-                            continue;
-                        }
-                        let cols: Vec<&str> = t.split_whitespace().collect();
-                        if cols.len() >= 5 && cols[0].ends_with('%') {
-                            if let Ok(pct) = cols[0].trim_end_matches('%').parse::<f64>() {
-                                let dso = cols[2].to_string();
-                                let sym = cols[4..].join(" ");
-                                hotspots.push(Hotspot {
-                                    function: sym,
-                                    file: dso,
-                                    line: 0,
-                                    self_ms: (base.wall_ms * pct) / 100.0,
-                                    cum_ms: (base.wall_ms * pct) / 100.0,
-                                    self_pct: pct,
-                                    cum_pct: pct,
-                                    calls: 0,
-                                    in_project: false,
-                                    snippet: None,
-                                });
-                                if hotspots.len() >= top_k {
-                                    break;
-                                }
+                        &perf_path,
+                    ],
+                ];
+                for args in arg_variants {
+                    if let Ok(rep) = Command::new("perf").args(args).current_dir(cwd).output() {
+                        if rep.status.success() {
+                            let rep_txt = String::from_utf8_lossy(&rep.stdout);
+                            let parsed_hs =
+                                parse_perf_report_srcline(&rep_txt, base.wall_ms, cwd, top_k);
+                            if !parsed_hs.is_empty() {
+                                hotspots = parsed_hs;
+                                break;
                             }
                         }
                     }
+                }
+                if !hotspots.is_empty() && hotspots.iter().all(|h| h.line == 0) {
+                    notes.push(
+                        "Compile native targets with debug info (-g or CARGO_PROFILE_RELEASE_DEBUG=true) to resolve ELF source file:line snippets."
+                            .to_string(),
+                    );
                 }
             }
             let _ = fs::remove_file(&perf_data);

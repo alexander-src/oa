@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use crate::guard::EquivalencePolicy;
 use crate::session::{
-    checkpoint_session, compare_commands, evaluate_session, get_ledger, init_session,
+    checkpoint_session, compare_commands, evaluate_session, export_diff, get_ledger, init_session,
     profile_session, render_markdown_report, render_svg_report, session_status, verify_session,
     CheckpointAction, CheckpointParams, CompareParams, EvaluateParams, InitParams, MetricTarget,
     ProfileParams, VerifyParams,
@@ -220,6 +220,17 @@ fn tool_schemas() -> Value {
                     "warmup": { "type": "integer" },
                     "min_speedup": { "type": "number" },
                     "alpha": { "type": "number" }
+                }
+            }
+        },
+        {
+            "name": "oa_diff",
+            "description": "Return the clean unified patch and diff stat between refs/oa/baseline and refs/oa/best.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "format": { "type": "string", "enum": ["json", "patch"], "description": "Output format: json (default, includes changed_files, diff_stat, patch) or raw unified patch." }
                 }
             }
         }
@@ -453,6 +464,16 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
             };
             let res = verify_session(params)?;
             serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+        }
+        "oa_diff" => {
+            let path = str_arg(args, "path");
+            let format = str_arg(args, "format").unwrap_or_else(|| "json".to_string());
+            let res = export_diff(path.as_deref())?;
+            if format.eq_ignore_ascii_case("patch") {
+                Ok(res.patch)
+            } else {
+                serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+            }
         }
         other => Err(format!("unknown tool '{other}'")),
     }

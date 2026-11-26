@@ -1,0 +1,226 @@
+name: "oa - Verified Performance Gate"
+description: "Run statistical interleaved A/B benchmarks or verify an oa session with SHA-256 equivalence and Cheat Guard in CI."
+branding:
+  icon: "zap"
+  color: "green"
+
+inputs:
+  mode:
+    description: "Execution mode: 'compare' (standalone A/B benchmark) or 'verify' (verify an active .oa session against refs/oa/baseline)."
+    required: false
+    default: "compare"
+  cmd-a:
+    description: "Baseline command (required when mode is 'compare')."
+    required: false
+    default: ""
+  cmd-b:
+    description: "Candidate command (required when mode is 'compare')."
+    required: false
+    default: ""
+  path:
+    description: "Working directory or git repository path."
+    required: false
+    default: "."
+  metric:
+    description: "Metric to compare: 'wall' (median ms) or 'rss' (peak KiB)."
+    required: false
+    default: "wall"
+  pairs:
+    description: "Number of interleaved A/B pairs."
+    required: false
+    default: "15"
+  warmup:
+    description: "Number of warmup pairs."
+    required: false
+    default: "2"
+  min-speedup:
+    description: "Minimum 95% CI lower-bound ratio."
+    required: false
+    default: "1.03"
+  alpha:
+    description: "Mann-Whitney U two-sided significance threshold."
+    required: false
+    default: "0.01"
+  check-output:
+    description: "Fail if stdout SHA-256 differs between cmd-a and cmd-b (compare mode)."
+    required: false
+    default: "true"
+  fail-on-regression:
+    description: "Fail the workflow step if compare mode detects a statistically significant regression."
+    required: false
+    default: "true"
+  version:
+    description: "oa release version to download ('latest' or a tag like 'v0.4.0')."
+    required: false
+    default: "latest"
+
+outputs:
+  verdict:
+    description: "Verdict returned by oa (faster, noise, slower, verified, or failed)."
+    value: ${{ steps.run.outputs.verdict }}
+  ratio:
+    description: "Median paired ratio (A / B)."
+    value: ${{ steps.run.outputs.ratio }}
+  p-value:
+    description: "Mann-Whitney U two-sided p-value."
+    value: ${{ steps.run.outputs.p-value }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install oa binary
+      shell: bash
+      env:
+        OA_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        BIN_DIR="${RUNNER_TEMP}/oa-bin"
+        mkdir -p "$BIN_DIR"
+
+        case "${RUNNER_OS}:${RUNNER_ARCH}" in
+          Linux:X64)   ASSET="oa-linux-x86_64.tar.gz" ;;
+          macOS:ARM64) ASSET="oa-macos-arm64.tar.gz" ;;
+          macOS:X64)   ASSET="oa-macos-x86_64.tar.gz" ;;
+          Windows:X64) ASSET="oa-windows-x86_64.zip" ;;
+          *)
+            echo "::error::Unsupported runner platform: ${RUNNER_OS}/${RUNNER_ARCH}"
+            exit 1
+            ;;
+        esac
+
+        if [ "$OA_VERSION" = "latest" ]; then
+          BASE_URL="https://github.com/alexander-src/oa/releases/latest/download"
+        else
+          BASE_URL="https://github.com/alexander-src/oa/releases/download/${OA_VERSION}"
+        fi
+
+        TMP_DIR="$(mktemp -d)"
+        trap 'rm -rf "$TMP_DIR"' EXIT
+        curl -fsSL "${BASE_URL}/${ASSET}" -o "${TMP_DIR}/${ASSET}"
+        if curl -fsSL "${BASE_URL}/SHA256SUMS.txt" -o "${TMP_DIR}/SHA256SUMS.txt"; then
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$TMP_DIR" && grep " ${ASSET}$" SHA256SUMS.txt | sha256sum -c -)
+          elif command -v shasum >/dev/null 2>&1; then
+            (cd "$TMP_DIR" && grep " ${ASSET}$" SHA256SUMS.txt | shasum -a 256 -c -)
+          fi
+        fi
+
+        case "$ASSET" in
+          *.tar.gz)
+            tar -xzf "${TMP_DIR}/${ASSET}" -C "$BIN_DIR"
+            chmod +x "${BIN_DIR}/oa"
+            ;;
+          *.zip)
+            unzip -qo "${TMP_DIR}/${ASSET}" -d "$BIN_DIR"
+            ;;
+        esac
+
+        echo "$BIN_DIR" >> "$GITHUB_PATH"
+
+    - name: Run oa gate
+      id: run
+      shell: bash
+      env:
+        OA_MODE: ${{ inputs.mode }}
+        OA_CMD_A: ${{ inputs.cmd-a }}
+        OA_CMD_B: ${{ inputs.cmd-b }}
+        OA_PATH: ${{ inputs.path }}
+        OA_METRIC: ${{ inputs.metric }}
+        OA_PAIRS: ${{ inputs.pairs }}
+        OA_WARMUP: ${{ inputs.warmup }}
+        OA_MIN_SPEEDUP: ${{ inputs.min-speedup }}
+        OA_ALPHA: ${{ inputs.alpha }}
+        OA_CHECK_OUTPUT: ${{ inputs.check-output }}
+        OA_FAIL_REGRESSION: ${{ inputs.fail-on-regression }}
+      run: |
+        set -euo pipefail
+        PY_BIN="python3"
+        if ! command -v "$PY_BIN" >/dev/null 2>&1; then
+          PY_BIN="python"
+        fi
+        OUT_JSON="${RUNNER_TEMP}/oa-result.json"
+
+        if [ "$OA_MODE" = "verify" ]; then
+          set +e
+          oa verify \
+            --path "$OA_PATH" \
+            --metric "$OA_METRIC" \
+            --pairs "$OA_PAIRS" \
+            --warmup "$OA_WARMUP" \
+            --min-speedup "$OA_MIN_SPEEDUP" \
+            --alpha "$OA_ALPHA" \
+            --json > "$OUT_JSON"
+          STATUS=$?
+          set -e
+
+          "$PY_BIN" - "$OUT_JSON" <<'PY'
+        import json, os, sys
+        data = json.load(open(sys.argv[1]))
+        passed = bool(data.get("passed"))
+        ev = data.get("evaluation") or {}
+        st = ev.get("stats") or {}
+        ratio = st.get("paired_ratio_median", "")
+        pval = st.get("mann_whitney_p", "")
+        verdict = "verified" if passed else "failed"
+        with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.write(f"verdict={verdict}\nratio={ratio}\np-value={pval}\n")
+        badge = data.get("badge", "")
+        print(badge)
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as sm:
+            sm.write(f"### oa verify\n\n`{badge}`\n")
+        PY
+          exit "$STATUS"
+        fi
+
+        if [ -z "$OA_CMD_A" ] || [ -z "$OA_CMD_B" ]; then
+          echo "::error::compare mode requires both cmd-a and cmd-b inputs."
+          exit 1
+        fi
+
+        EXTRA_ARGS=()
+        if [ "$OA_CHECK_OUTPUT" = "true" ]; then
+          EXTRA_ARGS+=(--check-output)
+        fi
+
+        oa compare "$OA_CMD_A" "$OA_CMD_B" \
+          --path "$OA_PATH" \
+          --metric "$OA_METRIC" \
+          --pairs "$OA_PAIRS" \
+          --warmup "$OA_WARMUP" \
+          --min-speedup "$OA_MIN_SPEEDUP" \
+          --alpha "$OA_ALPHA" \
+          "${EXTRA_ARGS[@]}" \
+          --json > "$OUT_JSON"
+
+        "$PY_BIN" - "$OUT_JSON" "$OA_FAIL_REGRESSION" <<'PY'
+        import json, os, sys
+        data = json.load(open(sys.argv[1]))
+        fail_reg = sys.argv[2].lower() == "true"
+        verdict = str(data.get("verdict", "")).lower()
+        st = data.get("stats") or {}
+        base = st.get("baseline") or {}
+        cand = st.get("candidate") or {}
+        ratio = st.get("paired_ratio_median", 1.0)
+        ci_lo = st.get("ci95_low", 1.0)
+        ci_hi = st.get("ci95_high", 1.0)
+        pval = st.get("mann_whitney_p", 1.0)
+        unit = "KiB" if data.get("metric") == "rss" else "ms"
+        eq = "identical" if data.get("outputs_identical") else "differs"
+        sha_a = (data.get("stdout_sha256_a") or "")[:16]
+        with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+            out.write(f"verdict={verdict}\nratio={ratio:.4f}\np-value={pval:.6f}\n")
+        md = (
+            f"### oa compare (`{verdict}`)\n\n"
+            f"| Metric | Cmd A | Cmd B | Result |\n"
+            f"| --- | ---: | ---: | ---: |\n"
+            f"| Median ({unit}) | {base.get('median_ms', 0):.2f} | {cand.get('median_ms', 0):.2f} | **{ratio:.2f}x** |\n"
+            f"| 95% CI / p-value | n={base.get('count', 0)} pairs | [{ci_lo:.2f}x, {ci_hi:.2f}x] | `p = {pval:.4f}` |\n"
+            f"| Output SHA-256 | `{sha_a}` | {eq} | |\n"
+        )
+        print(md)
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as sm:
+            sm.write(md + "\n")
+        if fail_reg and verdict == "slower":
+            print("::error::oa compare detected a statistically significant regression.", file=sys.stderr)
+            sys.exit(2)
+        PY

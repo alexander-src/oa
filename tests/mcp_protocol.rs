@@ -127,7 +127,8 @@ fn mcp_ndjson_roundtrip_and_tools() {
             "oa_report",
             "oa_status",
             "oa_compare",
-            "oa_verify"
+            "oa_verify",
+            "oa_diff"
         ]
     );
 
@@ -192,6 +193,24 @@ fn mcp_ndjson_roundtrip_and_tools() {
         .as_str()
         .unwrap();
     assert!(md.contains("# oa Optimization Report"));
+
+    let diff_tool = send_recv(
+        &mut stdin,
+        &mut reader,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "oa_diff",
+                "arguments": { "path": dir.to_string_lossy() }
+            }
+        }),
+    );
+    assert_eq!(diff_tool["result"]["isError"], false);
+    let diff_json: Value =
+        serde_json::from_str(diff_tool["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(diff_json["changed_files"].as_array().unwrap().is_empty());
 
     drop(stdin);
     let status = child.wait().unwrap();

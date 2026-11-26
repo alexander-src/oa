@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="504" viewBox="0 0 880 504" role="img" aria-label="Verified multi-language speedups and peak RSS reductions measured with oa">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="558" viewBox="0 0 880 558" role="img" aria-label="Verified multi-language speedups and peak RSS reductions measured with oa">
   <style>
     .title { font: 600 15px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #e6edf3; }
     .hdr-right { font: 400 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #8b949e; }
@@ -12,9 +12,9 @@
     .foot { font: 400 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #8b949e; }
   </style>
 
-  <rect x="1" y="1" width="878" height="502" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.2"/>
+  <rect x="1" y="1" width="878" height="556" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.2"/>
 
-  <text x="28" y="34" class="title">Verified gains measured with oa (Python · C · Node.js · Rust)</text>
+  <text x="28" y="34" class="title">Verified gains measured with oa (Python · Rust · C · Node.js)</text>
   <text x="852" y="34" text-anchor="end" class="hdr-right">interleaved A/B · Mann-Whitney U · exact SHA-256</text>
   <line x1="28" y1="48" x2="852" y2="48" stroke="#21262d" stroke-width="1"/>
 
@@ -52,42 +52,51 @@
   <text x="852" y="210" text-anchor="end" class="num">1047.8 -&gt; 283.6 ms</text>
   <text x="852" y="226" text-anchor="end" class="meta">2.49x CLI · -20.3% RSS · p = 0.0000</text>
 
-  <!-- Row 4: Python-Markdown 1.92x -->
-  <text x="28" y="264" class="repo">Python-Markdown/markdown</text>
-  <text x="28" y="280" class="sub">Python · docs corpus · 1,230/1,230 tests</text>
+  <!-- Row 4: Keats/tera 2.98x -->
+  <text x="28" y="264" class="repo">Keats/tera</text>
+  <text x="28" y="280" class="sub">Rust · 3.8k stars · linux:perf · 99/99 tests</text>
   <rect x="280" y="254" width="215" height="10" rx="3" fill="#21262d"/>
-  <rect x="280" y="268" width="112" height="10" rx="3" fill="#3fb950"/>
-  <text x="564" y="270" text-anchor="end" class="gain-wall">1.92x</text>
-  <text x="852" y="264" text-anchor="end" class="num">497.3 -&gt; 258.8 ms</text>
-  <text x="852" y="280" text-anchor="end" class="meta">1.53x CLI · p = 0.0000</text>
+  <rect x="280" y="268" width="72" height="10" rx="3" fill="#3fb950"/>
+  <text x="564" y="270" text-anchor="end" class="gain-wall">2.98x</text>
+  <text x="852" y="264" text-anchor="end" class="num">130.5 -&gt; 43.9 ms</text>
+  <text x="852" y="280" text-anchor="end" class="meta">5.27x big-table · -72.4% insns · p = 0.0000</text>
 
-  <!-- Row 5: DaveGamble/cJSON 1.89x -->
-  <text x="28" y="318" class="repo">DaveGamble/cJSON</text>
-  <text x="28" y="334" class="sub">C (-O3) · 11.5k stars · linux:perf · 19 CTest</text>
+  <!-- Row 5: Python-Markdown 1.92x -->
+  <text x="28" y="318" class="repo">Python-Markdown/markdown</text>
+  <text x="28" y="334" class="sub">Python · docs corpus · 1,230/1,230 tests</text>
   <rect x="280" y="308" width="215" height="10" rx="3" fill="#21262d"/>
-  <rect x="280" y="322" width="114" height="10" rx="3" fill="#3fb950"/>
-  <text x="564" y="324" text-anchor="end" class="gain-wall">1.89x</text>
-  <text x="852" y="318" text-anchor="end" class="num">104.2 -&gt; 55.6 ms</text>
-  <text x="852" y="334" text-anchor="end" class="meta">-39.7% insns · -55.7% br-miss · 5.0 IPC</text>
+  <rect x="280" y="322" width="112" height="10" rx="3" fill="#3fb950"/>
+  <text x="564" y="324" text-anchor="end" class="gain-wall">1.92x</text>
+  <text x="852" y="318" text-anchor="end" class="num">497.3 -&gt; 258.8 ms</text>
+  <text x="852" y="334" text-anchor="end" class="meta">1.53x CLI · p = 0.0000</text>
 
-  <!-- Row 6: nodeca/js-yaml 1.77x -->
-  <text x="28" y="372" class="repo">nodeca/js-yaml</text>
-  <text x="28" y="388" class="sub">TS / Node.js · 80M/wk · v8-cpu-prof · 1,633 tests</text>
+  <!-- Row 6: DaveGamble/cJSON 1.89x -->
+  <text x="28" y="372" class="repo">DaveGamble/cJSON</text>
+  <text x="28" y="388" class="sub">C (-O3) · 11.5k stars · linux:perf · 19 CTest</text>
   <rect x="280" y="362" width="215" height="10" rx="3" fill="#21262d"/>
-  <rect x="280" y="376" width="121" height="10" rx="3" fill="#3fb950"/>
-  <text x="564" y="378" text-anchor="end" class="gain-wall">1.77x</text>
-  <text x="852" y="372" text-anchor="end" class="num">78.3 -&gt; 44.2 ms</text>
-  <text x="852" y="388" text-anchor="end" class="meta">1.37x CLI · -32.8% RSS · p = 0.0000</text>
+  <rect x="280" y="376" width="114" height="10" rx="3" fill="#3fb950"/>
+  <text x="564" y="378" text-anchor="end" class="gain-wall">1.89x</text>
+  <text x="852" y="372" text-anchor="end" class="num">104.2 -&gt; 55.6 ms</text>
+  <text x="852" y="388" text-anchor="end" class="meta">-39.7% insns · -55.7% br-miss · 5.0 IPC</text>
 
-  <!-- Row 7: brave/adblock-rust 1.05x -->
-  <text x="28" y="426" class="repo">brave/adblock-rust</text>
-  <text x="28" y="442" class="sub">Rust · 134k rules · linux:perf · 246 tests</text>
+  <!-- Row 7: nodeca/js-yaml 1.77x -->
+  <text x="28" y="426" class="repo">nodeca/js-yaml</text>
+  <text x="28" y="442" class="sub">TS / Node.js · 80M/wk · v8-cpu-prof · 1,633 tests</text>
   <rect x="280" y="416" width="215" height="10" rx="3" fill="#21262d"/>
-  <rect x="280" y="430" width="205" height="10" rx="3" fill="#3fb950"/>
-  <text x="564" y="432" text-anchor="end" class="gain-wall">1.05x</text>
-  <text x="852" y="426" text-anchor="end" class="num">142.7 -&gt; 136.1 ms</text>
-  <text x="852" y="442" text-anchor="end" class="meta">4 bad edits blocked · 3.05 IPC · p = 0.0002</text>
+  <rect x="280" y="430" width="121" height="10" rx="3" fill="#3fb950"/>
+  <text x="564" y="432" text-anchor="end" class="gain-wall">1.77x</text>
+  <text x="852" y="426" text-anchor="end" class="num">78.3 -&gt; 44.2 ms</text>
+  <text x="852" y="442" text-anchor="end" class="meta">1.37x CLI · -32.8% RSS · p = 0.0000</text>
 
-  <line x1="28" y1="464" x2="852" y2="464" stroke="#21262d" stroke-width="1"/>
-  <text x="28" y="486" class="foot">Shorter bars are better. Full patches, perf counters, and rejected dead ends live under docs/showcases/.</text>
+  <!-- Row 8: brave/adblock-rust 1.05x -->
+  <text x="28" y="480" class="repo">brave/adblock-rust</text>
+  <text x="28" y="496" class="sub">Rust · 134k rules · linux:perf · 246 tests</text>
+  <rect x="280" y="470" width="215" height="10" rx="3" fill="#21262d"/>
+  <rect x="280" y="484" width="205" height="10" rx="3" fill="#3fb950"/>
+  <text x="564" y="486" text-anchor="end" class="gain-wall">1.05x</text>
+  <text x="852" y="480" text-anchor="end" class="num">142.7 -&gt; 136.1 ms</text>
+  <text x="852" y="496" text-anchor="end" class="meta">4 bad edits blocked · 3.05 IPC · p = 0.0002</text>
+
+  <line x1="28" y1="518" x2="852" y2="518" stroke="#21262d" stroke-width="1"/>
+  <text x="28" y="540" class="foot">Shorter bars are better. Full patches, perf counters, and rejected dead ends live under docs/showcases/.</text>
 </svg>

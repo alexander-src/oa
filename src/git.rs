@@ -161,6 +161,31 @@ pub fn snapshot_working_tree(
         .env("GIT_INDEX_FILE", &tmp_index)
         .output();
 
+    if let Ok(staged) = Command::new("git")
+        .args(["ls-files"])
+        .current_dir(root)
+        .env("GIT_INDEX_FILE", &tmp_index)
+        .output()
+    {
+        if staged.status.success() {
+            let ignored: Vec<String> = String::from_utf8_lossy(&staged.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|p| !p.is_empty() && is_ignored_artifact(p))
+                .map(str::to_string)
+                .collect();
+            if !ignored.is_empty() {
+                let mut rm_cmd = Command::new("git");
+                rm_cmd
+                    .args(["rm", "-rf", "--cached", "--ignore-unmatch", "--"])
+                    .args(&ignored)
+                    .current_dir(root)
+                    .env("GIT_INDEX_FILE", &tmp_index);
+                let _ = rm_cmd.output();
+            }
+        }
+    }
+
     let write_tree = Command::new("git")
         .args(["write-tree"])
         .current_dir(root)
@@ -296,6 +321,59 @@ pub fn list_tracked_files(root: &Path) -> Result<Vec<String>, String> {
 
 pub fn diff_stat_refs(root: &Path, from_ref: &str, to_ref: &str) -> String {
     git_cmd(root, &["diff", "--stat", from_ref, to_ref]).unwrap_or_default()
+}
+
+pub fn diff_refs(root: &Path, from_ref: &str, to_ref: &str) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["diff", from_ref, to_ref])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("failed to run git diff {from_ref} {to_ref}: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!("git diff {from_ref} {to_ref} failed: {stderr}"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+pub fn diff_name_only_refs(root: &Path, from_ref: &str, to_ref: &str) -> Vec<String> {
+    git_cmd(root, &["diff", "--name-only", from_ref, to_ref])
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !is_ignored_artifact(l))
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn remove_shadow_worktree(root: &Path, worktree_path: &Path) -> bool {
+    if !worktree_path.exists() {
+        return false;
+    }
+    let _ = git_cmd(
+        root,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            &worktree_path.to_string_lossy(),
+        ],
+    );
+    if worktree_path.exists() {
+        let _ = fs::remove_dir_all(worktree_path);
+    }
+    let _ = git_cmd(root, &["worktree", "prune"]);
+    true
+}
+
+pub fn delete_oa_refs(root: &Path) -> Result<Vec<String>, String> {
+    let raw = git_cmd(root, &["for-each-ref", "--format=%(refname)", "refs/oa/"])?;
+    let mut deleted = Vec::new();
+    for r in raw.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        git_cmd(root, &["update-ref", "-d", r])?;
+        deleted.push(r.to_string());
+    }
+    Ok(deleted)
 }
 
 /// Ensures `.oa/` is excluded via `.git/info/exclude` without dirtying tracked `.gitignore`.

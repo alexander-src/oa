@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="446" viewBox="0 0 820 446" role="img" aria-label="oa optimization report for tera">
+  <style>
+    .title { font: 600 15px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #e6edf3; }
+    .sub { font: 400 11.5px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #8b949e; }
+    .label { font: 600 12.5px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #e6edf3; }
+    .meta { font: 400 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #6e7681; }
+    .val { font: 600 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #e6edf3; }
+    .gain { font: 700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #3fb950; }
+    .pill { font: 600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #3fb950; }
+  </style>
+  <rect x="1" y="1" width="818" height="444" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1.2"/>
+  <text x="24" y="32" class="title">tera (wall latency)</text>
+  <text x="24" y="50" class="sub">Balanced interleaved A/B pairs | shorter bar is better</text>
+  <rect x="529" y="18" width="267" height="26" rx="13" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="662" y="35" text-anchor="middle" class="pill">2.98x faster | SHA-256 a0d32f333...</text>
+  <line x1="24" y1="66" x2="796" y2="66" stroke="#21262d" stroke-width="1"/>
+  <text x="24" y="92" class="label">Baseline</text>
+  <text x="24" y="107" class="meta">refs/oa/baseline</text>
+  <rect x="246" y="87" width="340" height="14" rx="4" fill="#161b22"/>
+  <rect x="246" y="87" width="340" height="14" rx="4" fill="#30363d"/>
+  <text x="656" y="98" text-anchor="end" class="meta">1.00x</text>
+  <text x="796" y="92" text-anchor="end" class="val">130.23 ms</text>
+  <text x="796" y="107" text-anchor="end" class="meta">baseline</text>
+  <text x="24" y="138" class="label">Zero-dep 2-digit LUT stac...</text>
+  <text x="24" y="153" class="meta">#1 tera/src/value/mod.rs</text>
+  <rect x="246" y="133" width="340" height="14" rx="4" fill="#161b22"/>
+  <rect x="246" y="133" width="288" height="14" rx="4" fill="#3fb950"/>
+  <text x="656" y="144" text-anchor="end" class="gain">1.18x</text>
+  <text x="796" y="138" text-anchor="end" class="val">110.16 ms</text>
+  <text x="796" y="153" text-anchor="end" class="meta">p=0.0000</text>
+  <text x="24" y="184" class="label">SSE2 16-byte SIMD scan + ...</text>
+  <text x="24" y="199" class="meta">#2 tera/src/utils.rs, tera/sr...</text>
+  <rect x="246" y="179" width="340" height="14" rx="4" fill="#161b22"/>
+  <rect x="246" y="179" width="211" height="14" rx="4" fill="#3fb950"/>
+  <text x="656" y="190" text-anchor="end" class="gain">1.61x</text>
+  <text x="796" y="184" text-anchor="end" class="val">80.96 ms</text>
+  <text x="796" y="199" text-anchor="end" class="meta">p=0.0000</text>
+  <text x="24" y="230" class="label">Zero-drop Copy Option&lt;&amp;Va...</text>
+  <text x="24" y="245" class="meta">#4 tera/src/vm/for_loop.rs, t...</text>
+  <rect x="246" y="225" width="340" height="14" rx="4" fill="#161b22"/>
+  <rect x="246" y="225" width="178" height="14" rx="4" fill="#3fb950"/>
+  <text x="656" y="236" text-anchor="end" class="gain">1.93x</text>
+  <text x="796" y="230" text-anchor="end" class="val">68.20 ms</text>
+  <text x="796" y="245" text-anchor="end" class="meta">p=0.0000</text>
+  <text x="24" y="276" class="label">SoA Chunk, adaptive size ...</text>
+  <text x="24" y="291" class="meta">#5 tera/src/parsing/ast.rs, t...</text>
+  <rect x="246" y="271" width="340" height="14" rx="4" fill="#161b22"/>
+  <rect x="246" y="271" width="136" height="14" rx="4" fill="#3fb950"/>
+  <text x="656" y="282" text-anchor="end" class="gain">2.53x</text>
+  <text x="796" y="276" text-anchor="end" class="val">51.97 ms</text>
+  <text x="796" y="291" text-anchor="end" class="meta">p=0.0000</text>
+  <text x="24" y="322" class="label">AVX2 32-byte SIMD scan wi...</text>
+  <text x="24" y="337" class="meta">#6 tera/src/utils.rs</text>
+  <rect x="246" y="317" width="340" height="14" rx="4" fill="#161b22"/>
+  <rect x="246" y="317" width="128" height="14" rx="4" fill="#3fb950"/>
+  <text x="656" y="328" text-anchor="end" class="gain">2.72x</text>
+  <text x="796" y="322" text-anchor="end" class="val">49.22 ms</text>
+  <text x="796" y="337" text-anchor="end" class="meta">p=0.0000</text>
+  <text x="24" y="368" class="label">Inline scalar Value::form...</text>
+  <text x="24" y="383" class="meta">#7 tera/src/value/mod.rs, ter...</text>
+  <rect x="246" y="363" width="340" height="14" rx="4" fill="#161b22"/>
+  <rect x="246" y="363" width="115" height="14" rx="4" fill="#3fb950"/>
+  <text x="656" y="374" text-anchor="end" class="gain">2.98x</text>
+  <text x="796" y="368" text-anchor="end" class="val">43.94 ms</text>
+  <text x="796" y="383" text-anchor="end" class="meta">p=0.0000</text>
+  <line x1="24" y1="402" x2="796" y2="402" stroke="#21262d" stroke-width="1"/>
+  <text x="24" y="426" class="meta">11 locked files | 6 kept, 1 reverted | Peak RSS 13.8 -&gt; 13.7 MiB (-0.9%)</text>
+  <text x="796" y="426" text-anchor="end" class="meta">generated by oa report --format svg</text>
+</svg>

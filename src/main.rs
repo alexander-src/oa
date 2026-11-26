@@ -9,10 +9,11 @@ use oa::doctor;
 use oa::guard::EquivalencePolicy;
 use oa::mcp;
 use oa::session::{
-    checkpoint_session, compare_commands, evaluate_session, get_ledger, init_session,
-    profile_session, render_compare_markdown, render_markdown_report, render_svg_report,
-    session_status, verify_session, CheckpointAction, CheckpointParams, CompareParams, EvalVerdict,
-    EvaluateParams, InitParams, MetricTarget, ProfileParams, VerifyParams,
+    checkpoint_session, clean_session, compare_commands, evaluate_session, export_diff, get_ledger,
+    init_session, profile_session, render_compare_markdown, render_markdown_report,
+    render_svg_report, session_status, verify_session, CheckpointAction, CheckpointParams,
+    CompareParams, EvalVerdict, EvaluateParams, InitParams, MetricTarget, ProfileParams,
+    VerifyParams,
 };
 use oa::setup;
 use oa::svg::SvgTheme;
@@ -32,6 +33,8 @@ COMMANDS:
   status      Inspect live session health, Cheat Guard locks, cumulative gain, and diff stat
   ledger      Inspect the experiment ledger, Pareto frontier, and dead ends
   report      Generate a PR-ready Markdown, JSON, or dark/light SVG chart report
+  diff        Export the clean unified patch between refs/oa/baseline and refs/oa/best
+  clean       Remove .oa/ shadow worktrees and session state (preserves working tree edits)
   compare     Standalone interleaved A/B comparison of any two commands (no session required)
   demo        Run a 4-second self-contained live demo (Cheat Guard, Equivalence Gate, verified speedup)
   doctor      Inspect local profilers (Python, Node, Go, perf, sample), RSS, and agent configs
@@ -61,6 +64,12 @@ fn print_subcommand_help(cmd: &str) {
         "report" => println!(
             "USAGE:\n  oa report [--format md|json|svg] [--theme dark|light] [--out <FILE>] [--path <DIR>]"
         ),
+        "diff" => println!(
+            "USAGE:\n  oa diff [--out <FILE>] [--stat] [--path <DIR>] [--json]\n\nExports the unified git diff between refs/oa/baseline and refs/oa/best."
+        ),
+        "clean" => println!(
+            "USAGE:\n  oa clean [--refs] [--path <DIR>] [--json]\n\nRemoves .oa/ shadow worktrees and session files without modifying working tree edits.\nPass --refs to also delete refs/oa/* git references."
+        ),
         "verify" => println!(
             "USAGE:\n  oa verify [OPTIONS]\n\nOPTIONS:\n  --metric <wall|rss>    Override metric (wall latency ms or rss peak KiB)\n  --pairs <N>            Interleaved A/B pairs vs baseline (default 15)\n  --warmup <N>           Warmup pairs\n  --min-speedup <RATIO>  Override minimum 95% CI lower bound\n  --alpha <P>            Override Mann-Whitney alpha\n  --path <DIR>           Target repository directory\n  --json                 Emit raw JSON output"
         ),
@@ -80,7 +89,7 @@ fn print_subcommand_help(cmd: &str) {
             "USAGE:\n  oa setup [--agent all|claude|antigravity|cursor|gemini|codex] [--dry-run] [--json]"
         ),
         "mcp" => println!(
-            "USAGE:\n  oa mcp\n\nRuns the stdio JSON-RPC 2.0 MCP server (exposes oa_init, oa_profile, oa_evaluate, oa_checkpoint, oa_verify, oa_status, oa_ledger, oa_report, oa_compare)."
+            "USAGE:\n  oa mcp\n\nRuns the stdio JSON-RPC 2.0 MCP server (exposes oa_init, oa_profile, oa_evaluate, oa_checkpoint, oa_verify, oa_status, oa_ledger, oa_report, oa_diff, oa_compare)."
         ),
         _ => print!("{HELP}"),
     }
@@ -601,6 +610,87 @@ fn run_cli() -> Result<ExitCode, String> {
                 println!("Wrote report to {file}");
             } else {
                 print!("{content}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "diff" => {
+            let mut out_path = None;
+            let mut stat_only = false;
+            let mut path = None;
+            let mut as_json = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--out" | "--patch" => out_path = Some(next_val(rest, &mut i, "--out")?),
+                    "--stat" => stat_only = true,
+                    "--path" => path = Some(next_val(rest, &mut i, "--path")?),
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown option '{other}' for diff")),
+                }
+                i += 1;
+            }
+            let rep = export_diff(path.as_deref())?;
+            if let Some(file) = out_path {
+                fs::write(&file, &rep.patch)
+                    .map_err(|e| format!("failed to write patch to '{file}': {e}"))?;
+                println!(
+                    "Wrote patch ({} file(s), {} bytes) to {file}",
+                    rep.changed_files.len(),
+                    rep.patch.len()
+                );
+            } else if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else if stat_only {
+                println!("{}", rep.diff_stat);
+            } else {
+                print!("{}", rep.patch);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "clean" => {
+            let mut delete_refs = false;
+            let mut path = None;
+            let mut as_json = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--refs" => delete_refs = true,
+                    "--path" => path = Some(next_val(rest, &mut i, "--path")?),
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown option '{other}' for clean")),
+                }
+                i += 1;
+            }
+            let rep = clean_session(path.as_deref(), delete_refs)?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("Cleaned oa session in {}", rep.repo_root);
+                println!(
+                    "  Worktrees removed : {}",
+                    if rep.removed_worktrees.is_empty() {
+                        "none".to_string()
+                    } else {
+                        rep.removed_worktrees.join(", ")
+                    }
+                );
+                println!("  .oa/ removed      : {}", rep.removed_oa_dir);
+                if delete_refs {
+                    println!(
+                        "  Refs deleted      : {}",
+                        if rep.deleted_refs.is_empty() {
+                            "none".to_string()
+                        } else {
+                            rep.deleted_refs.join(", ")
+                        }
+                    );
+                }
             }
             Ok(ExitCode::SUCCESS)
         }

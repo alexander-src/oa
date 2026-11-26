@@ -116,7 +116,74 @@ pub fn command_exists(bin: &str) -> bool {
 #[cfg(unix)]
 const PY_RUSAGE_WRAPPER: &str = "import resource,subprocess,sys; tf,cmd=sys.argv[1],sys.argv[2]; p=subprocess.run(['sh','-c',cmd]); r=resource.getrusage(resource.RUSAGE_CHILDREN); rss=r.ru_maxrss//1024 if sys.platform=='darwin' else r.ru_maxrss; open(tf,'w').write(f'OA_RUSAGE {r.ru_utime:.6f} {r.ru_stime:.6f} {rss}\\n'); sys.exit(p.returncode)";
 
-/// Runs a command with optional CPU core pinning (`taskset` on Linux) and optional resource stats (`/usr/bin/time` or Python `resource` fallback).
+#[cfg(windows)]
+const WIN_RUSAGE_WRAPPER: &str = r#"import ctypes,ctypes.wintypes as wt,subprocess,sys
+class PMC(ctypes.Structure):
+    _fields_=[('cb',wt.DWORD),('PageFaultCount',wt.DWORD),('PeakWorkingSetSize',ctypes.c_size_t),('WorkingSetSize',ctypes.c_size_t),('QuotaPeakPagedPoolUsage',ctypes.c_size_t),('QuotaPagedPoolUsage',ctypes.c_size_t),('QuotaPeakNonPagedPoolUsage',ctypes.c_size_t),('QuotaNonPagedPoolUsage',ctypes.c_size_t),('PagefileUsage',ctypes.c_size_t),('PeakPagefileUsage',ctypes.c_size_t)]
+class JBASIC(ctypes.Structure):
+    _fields_=[('PerProcessUserTimeLimit',ctypes.c_int64),('PerJobUserTimeLimit',ctypes.c_int64),('LimitFlags',wt.DWORD),('MinimumWorkingSetSize',ctypes.c_size_t),('MaximumWorkingSetSize',ctypes.c_size_t),('ActiveProcessLimit',wt.DWORD),('Affinity',ctypes.c_size_t),('PriorityClass',wt.DWORD),('SchedulingClass',wt.DWORD)]
+class IOC(ctypes.Structure):
+    _fields_=[(n,ctypes.c_uint64) for n in ('a','b','c','d','e','f')]
+class JEXT(ctypes.Structure):
+    _fields_=[('BasicLimitInformation',JBASIC),('IoInfo',IOC),('ProcessMemoryLimit',ctypes.c_size_t),('JobMemoryLimit',ctypes.c_size_t),('PeakProcessMemoryUsed',ctypes.c_size_t),('PeakJobMemoryUsed',ctypes.c_size_t)]
+k32=ctypes.WinDLL('kernel32',use_last_error=True)
+k32.K32GetProcessMemoryInfo.argtypes=[wt.HANDLE,ctypes.POINTER(PMC),wt.DWORD]
+k32.K32GetProcessMemoryInfo.restype=wt.BOOL
+k32.GetProcessTimes.argtypes=[wt.HANDLE,ctypes.POINTER(wt.FILETIME),ctypes.POINTER(wt.FILETIME),ctypes.POINTER(wt.FILETIME),ctypes.POINTER(wt.FILETIME)]
+k32.GetProcessTimes.restype=wt.BOOL
+k32.CreateJobObjectW.argtypes=[ctypes.c_void_p,wt.LPCWSTR]
+k32.CreateJobObjectW.restype=wt.HANDLE
+k32.AssignProcessToJobObject.argtypes=[wt.HANDLE,wt.HANDLE]
+k32.AssignProcessToJobObject.restype=wt.BOOL
+k32.QueryInformationJobObject.argtypes=[wt.HANDLE,ctypes.c_int,ctypes.c_void_p,wt.DWORD,ctypes.POINTER(wt.DWORD)]
+k32.QueryInformationJobObject.restype=wt.BOOL
+k32.CloseHandle.argtypes=[wt.HANDLE]
+tf,cmd=sys.argv[1],sys.argv[2]
+use_shell=any(ch in cmd for ch in '|&><^%;')
+p=None
+if not use_shell:
+    try:
+        p=subprocess.Popen(cmd,shell=False)
+    except OSError:
+        p=None
+if p is None:
+    p=subprocess.Popen(cmd,shell=True)
+job=k32.CreateJobObjectW(None,None)
+if job:
+    k32.AssignProcessToJobObject(job,int(p._handle))
+rc=p.wait()
+pmc=PMC()
+pmc.cb=ctypes.sizeof(PMC)
+peak_bytes=pmc.PeakWorkingSetSize if k32.K32GetProcessMemoryInfo(int(p._handle),ctypes.byref(pmc),pmc.cb) else 0
+if job:
+    jext=JEXT()
+    ret_len=wt.DWORD(0)
+    if k32.QueryInformationJobObject(job,9,ctypes.byref(jext),ctypes.sizeof(JEXT),ctypes.byref(ret_len)):
+        peak_bytes=max(peak_bytes,int(jext.PeakJobMemoryUsed))
+    k32.CloseHandle(job)
+c_t,e_t,k_t,u_t=wt.FILETIME(),wt.FILETIME(),wt.FILETIME(),wt.FILETIME()
+user_s,sys_s=0.0,0.0
+if k32.GetProcessTimes(int(p._handle),ctypes.byref(c_t),ctypes.byref(e_t),ctypes.byref(k_t),ctypes.byref(u_t)):
+    user_s=((u_t.dwHighDateTime<<32)|u_t.dwLowDateTime)/1e7
+    sys_s=((k_t.dwHighDateTime<<32)|k_t.dwLowDateTime)/1e7
+rss_kb=max(1,int(peak_bytes)//1024) if peak_bytes>0 else 0
+if rss_kb>0:
+    open(tf,'w').write(f'OA_RUSAGE {user_s:.6f} {sys_s:.6f} {rss_kb}\n')
+sys.exit(rc)
+"#;
+
+#[cfg(windows)]
+fn windows_python_bin() -> Option<&'static str> {
+    if command_exists("python") {
+        Some("python")
+    } else if command_exists("python3") {
+        Some("python3")
+    } else {
+        None
+    }
+}
+
+/// Runs a command with optional CPU core pinning (`taskset` on Linux) and optional resource stats (`/usr/bin/time`, Python `resource`, or Windows Win32 `K32GetProcessMemoryInfo` / JobObject).
 pub fn run_command(
     cmd: &str,
     cwd: &Path,
@@ -141,12 +208,18 @@ pub fn run_command(
     let use_py_rusage =
         measure_rusage && !use_gnu_time && !use_bsd_time && command_exists("python3");
     #[cfg(not(unix))]
-    let use_py_rusage = {
-        let _ = measure_rusage;
-        false
-    };
+    let use_py_rusage = false;
 
-    let time_file = if use_gnu_time || use_py_rusage {
+    #[cfg(windows)]
+    let win_py_bin = if measure_rusage {
+        windows_python_bin()
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let win_py_bin: Option<&'static str> = None;
+
+    let time_file = if use_gnu_time || use_py_rusage || win_py_bin.is_some() {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!("oa_rusage_{}_{}.txt", std::process::id(), seq));
         Some(p)
@@ -205,6 +278,23 @@ pub fn run_command(
         };
         #[cfg(not(unix))]
         let mut c = shell_command(cmd, cwd);
+        c.current_dir(cwd);
+        c
+    } else if let Some(py_bin) = win_py_bin {
+        #[cfg(windows)]
+        let mut c = {
+            let _ = pin_core;
+            let tf = time_file.as_ref().expect("time_file set");
+            let mut inner = Command::new(py_bin);
+            inner.args(["-c", WIN_RUSAGE_WRAPPER, &tf.to_string_lossy(), cmd]);
+            inner.current_dir(cwd);
+            inner
+        };
+        #[cfg(not(windows))]
+        let mut c = {
+            let _ = py_bin;
+            shell_command(cmd, cwd)
+        };
         c.current_dir(cwd);
         c
     } else if use_bsd_time {

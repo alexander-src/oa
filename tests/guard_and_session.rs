@@ -313,6 +313,27 @@ if __name__ == "__main__":
     let doc = oa::doctor::run_doctor();
     assert!(!doc.checks.is_empty());
     assert!(doc.checks.iter().any(|c| c.name == "git" && c.available));
+    assert!(doc
+        .checks
+        .iter()
+        .any(|c| c.name == "metric:rss" && c.available));
+
+    // 8. Export clean patch (`oa diff`) and remove session state (`oa clean --refs`).
+    let diff = oa::session::export_diff(Some(&repo.path_str())).expect("export_diff");
+    assert_eq!(diff.changed_files, vec!["work.py".to_string()]);
+    assert!(diff.patch.contains("diff --git a/work.py b/work.py"));
+    assert!(diff.patch.contains("+    seen = set()"));
+
+    let cleaned = oa::session::clean_session(Some(&repo.path_str()), true).expect("clean_session");
+    assert!(cleaned.removed_oa_dir);
+    assert!(!repo.path.join(".oa").exists());
+    assert!(cleaned.deleted_refs.iter().any(|r| r == "refs/oa/best"));
+    assert!(
+        fs::read_to_string(repo.path.join("work.py"))
+            .unwrap()
+            .contains("seen = set()"),
+        "oa clean must preserve optimized working tree files"
+    );
 }
 
 #[test]
@@ -350,7 +371,6 @@ fn standalone_compare_detects_speedup_and_equivalence() {
     assert!(md.contains("### oa compare") && md.contains("Mann-Whitney U"));
 }
 
-#[cfg(unix)]
 #[test]
 fn rss_metric_detects_memory_reduction() {
     use oa::session::MetricTarget;

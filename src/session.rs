@@ -777,7 +777,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
     let measure_rss = metric == MetricTarget::Rss;
     if measure_rss && (candidate_peak_rss_kb.is_none() || reference_peak_rss_kb.is_none()) {
         return Err(
-            "metric 'rss' requires peak RSS measurement (/usr/bin/time or python3 resource.getrusage on Linux/macOS)"
+            "metric 'rss' requires peak RSS measurement (/usr/bin/time or python3 on Linux/macOS; python Win32 K32GetProcessMemoryInfo on Windows)"
                 .to_string(),
         );
     }
@@ -1277,7 +1277,8 @@ pub fn render_svg_report(
 
     let mut steps = Vec::new();
     for e in ledger.entries.iter().filter(|e| e.action == "KEPT") {
-        let val = match config.metric {
+        let is_best = e.commit.as_deref() == Some(config.best_commit.as_str());
+        let raw_val = match config.metric {
             MetricTarget::Wall => e.candidate_median_ms.unwrap_or(ledger.best_median_ms),
             MetricTarget::Rss => e
                 .candidate_peak_rss_kb
@@ -1285,10 +1286,26 @@ pub fn render_svg_report(
                 .or(e.candidate_median_ms)
                 .unwrap_or(best_value),
         };
-        let gain = if val > 1e-9 && baseline_value > 1e-9 {
-            baseline_value / val
+        let gain = if is_best && ledger.cumulative_speedup > 0.0 {
+            ledger.cumulative_speedup
+        } else if let Some(g) = e.speedup_vs_baseline.filter(|g| g.is_finite() && *g > 0.0) {
+            g
+        } else if raw_val > 1e-9 && baseline_value > 1e-9 {
+            baseline_value / raw_val
         } else {
-            e.speedup_vs_baseline.unwrap_or(1.0)
+            1.0
+        };
+        let val = if is_best && best_value > 1e-9 {
+            best_value
+        } else if config.metric == MetricTarget::Wall && baseline_value > 1e-9 && gain > 1e-9 {
+            let expected = baseline_value / gain;
+            if (raw_val - expected).abs() / expected > 0.15 {
+                expected
+            } else {
+                raw_val
+            }
+        } else {
+            raw_val
         };
         let subtitle = if e.changed_files.is_empty() {
             format!("#{} kept", e.id)
@@ -1693,6 +1710,94 @@ pub fn render_compare_markdown(res: &CompareResult) -> String {
         res.stats.baseline.count,
         res.stats.mann_whitney_p,
     )
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffReport {
+    pub repo_root: String,
+    pub baseline_commit: String,
+    pub best_commit: String,
+    pub changed_files: Vec<String>,
+    pub diff_stat: String,
+    pub patch: String,
+}
+
+/// Exports the clean unified diff between `refs/oa/baseline` and `refs/oa/best`.
+pub fn export_diff(path: Option<&str>) -> Result<DiffReport, String> {
+    let root = resolve_root(path)?;
+    let config: SessionConfig = read_json(&oa_path(&root, "config.json"))?;
+    let changed_files = git::diff_name_only_refs(&root, REF_BASELINE, REF_BEST);
+    let diff_stat = git::diff_stat_refs(&root, REF_BASELINE, REF_BEST);
+    let patch = git::diff_refs(&root, REF_BASELINE, REF_BEST)?;
+
+    Ok(DiffReport {
+        repo_root: root.to_string_lossy().to_string(),
+        baseline_commit: config.baseline_commit,
+        best_commit: config.best_commit,
+        changed_files,
+        diff_stat,
+        patch,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanReport {
+    pub repo_root: String,
+    pub removed_worktrees: Vec<String>,
+    pub removed_oa_dir: bool,
+    pub deleted_refs: Vec<String>,
+}
+
+/// Removes `.oa/` shadow worktrees and session state (and optionally `refs/oa/*`) without touching working tree edits.
+pub fn clean_session(path: Option<&str>, delete_refs: bool) -> Result<CleanReport, String> {
+    let root = resolve_root(path)?;
+    let oa_dir = root.join(OA_DIR);
+    let worktrees_dir = oa_dir.join("worktrees");
+    let mut removed_worktrees = Vec::new();
+
+    if worktrees_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&worktrees_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() && git::remove_shadow_worktree(&root, &p) {
+                    if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+                        removed_worktrees.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    for name in ["baseline", "best"] {
+        let p = worktrees_dir.join(name);
+        if p.exists()
+            && git::remove_shadow_worktree(&root, &p)
+            && !removed_worktrees.iter().any(|x| x == name)
+        {
+            removed_worktrees.push(name.to_string());
+        }
+    }
+    removed_worktrees.sort();
+
+    let removed_oa_dir = if oa_dir.exists() {
+        fs::remove_dir_all(&oa_dir)
+            .map_err(|e| format!("failed to remove '{}': {e}", oa_dir.display()))?;
+        true
+    } else {
+        false
+    };
+
+    let deleted_refs = if delete_refs {
+        git::delete_oa_refs(&root)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(CleanReport {
+        repo_root: root.to_string_lossy().to_string(),
+        removed_worktrees,
+        removed_oa_dir,
+        deleted_refs,
+    })
 }
 
 fn median_u64(vals: &[u64]) -> Option<u64> {
