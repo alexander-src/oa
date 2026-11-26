@@ -353,8 +353,8 @@ fn standalone_compare_detects_speedup_and_equivalence() {
     let py = python_bin();
     let res = compare_commands(CompareParams {
         path: None,
-        cmd_a: format!("{py} -c \"print(sum(i*i for i in range(400000)))\""),
-        cmd_b: format!("{py} -c \"n=399999; print(n*(n+1)*(2*n+1)//6)\""),
+        cmd_a: format!("{py} -c \"print(sum(i*i for i in range(1200000)))\""),
+        cmd_b: format!("{py} -c \"n=1199999; print(n*(n+1)*(2*n+1)//6)\""),
         metric: MetricTarget::Wall,
         pairs: 6,
         warmup: 1,
