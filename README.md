@@ -106,7 +106,6 @@ Every result below was measured on real code across Python, C (`-O3`), TypeScrip
   <thead>
     <tr>
       <th>Target</th>
-      <th>Stack / Profiler</th>
       <th>Verified result</th>
       <th>Verification</th>
       <th>Patch</th>
@@ -114,51 +113,44 @@ Every result below was measured on real code across Python, C (`-O3`), TypeScrip
   </thead>
   <tbody>
     <tr>
-      <td><a href="docs/showcases/rich.md"><strong>Textualize/rich</strong></a><br><sub>52k+ stars · terminal tables</sub></td>
-      <td>Python<br><code>cProfile+tracemalloc</code></td>
-      <td><strong>3.69x</strong> Table render (<code>1047.8&nbsp;-&gt;&nbsp;283.6&nbsp;ms</code>)<br><strong>2.49x</strong> full CLI · <strong>-20.3% peak RSS</strong> · <code>p=0.0000</code></td>
+      <td><a href="docs/showcases/rich.md"><strong>Textualize/rich</strong></a><br><sub>Python · 52k+ stars · <code>cProfile</code></sub></td>
+      <td><strong>3.69x</strong> Table render (<code>1047.8&nbsp;→&nbsp;283.6&nbsp;ms</code>)<br><strong>2.49x</strong> CLI · <strong>-20.3% peak RSS</strong> · <code>p=0.0000</code></td>
       <td>954/954 pytest pass<br>exact ANSI SHA-256</td>
       <td><a href="docs/showcases/rich.patch"><code>rich.patch</code></a></td>
     </tr>
     <tr>
-      <td><a href="docs/showcases/sqlparse.md"><strong>andialbrecht/sqlparse</strong></a><br><sub>30M+ PyPI/mo · SQL formatter</sub></td>
-      <td>Python<br><code>cProfile+tracemalloc</code></td>
-      <td><strong>4.3x to 10.5x</strong> upstream <code>benchmarks/*.py</code><br><strong>2.55x</strong> E2E (<code>253.9&nbsp;-&gt;&nbsp;99.8&nbsp;ms</code>) · <code>-7.9% RSS</code></td>
+      <td><a href="docs/showcases/sqlparse.md"><strong>andialbrecht/sqlparse</strong></a><br><sub>Python · 30M+ PyPI/mo · <code>cProfile</code></sub></td>
+      <td><strong>4.3x to 10.5x</strong> upstream <code>benchmarks/*.py</code><br><strong>2.55x</strong> E2E (<code>253.9&nbsp;→&nbsp;99.8&nbsp;ms</code>) · <code>-7.9% RSS</code></td>
       <td>537/537 pytest pass<br>caught 1 regression (<code>0.96x</code>)</td>
       <td><a href="docs/showcases/sqlparse.patch"><code>sqlparse.patch</code></a></td>
     </tr>
     <tr>
-      <td><a href="docs/showcases/cjson.md"><strong>DaveGamble/cJSON</strong></a><br><sub>11.5k+ stars · C89 JSON lib</sub></td>
-      <td>C (<code>-O3</code>)<br><code>linux:perf</code></td>
-      <td><strong>1.89x</strong> parse+print (<code>104.2&nbsp;-&gt;&nbsp;55.6&nbsp;ms</code>)<br><strong>-39.7% insns</strong> · <strong>-55.7% br-miss</strong> · <code>5.0 IPC</code></td>
+      <td><a href="docs/showcases/cjson.md"><strong>DaveGamble/cJSON</strong></a><br><sub>C (<code>-O3</code>) · 11.5k+ stars · <code>linux:perf</code></sub></td>
+      <td><strong>1.89x</strong> parse+print (<code>104.2&nbsp;→&nbsp;55.6&nbsp;ms</code>)<br><strong>-39.7% insns</strong> · <strong>-55.7% br-miss</strong> · <code>5.0 IPC</code></td>
       <td>19/19 CTest pass (<code>-Werror</code>)<br>180 locked files · 1 file changed</td>
       <td><a href="docs/showcases/cjson.patch"><code>cjson.patch</code></a></td>
     </tr>
     <tr>
-      <td><a href="docs/showcases/js-yaml.md"><strong>nodeca/js-yaml</strong></a><br><sub>80M+ npm/wk · YAML 1.2</sub></td>
-      <td>TypeScript / Node.js<br><code>node:v8-cpu-prof</code></td>
-      <td><strong>1.77x</strong> <code>yaml.load</code> 6.9 MB (<code>78.3&nbsp;-&gt;&nbsp;44.2&nbsp;ms</code>)<br><strong>1.37x</strong> CLI · <strong>-32.8% peak RSS</strong> (<code>-58.5 MiB</code>)</td>
+      <td><a href="docs/showcases/js-yaml.md"><strong>nodeca/js-yaml</strong></a><br><sub>TS/Node · 80M+ npm/wk · <code>v8-cpu-prof</code></sub></td>
+      <td><strong>1.77x</strong> <code>yaml.load</code> 6.9 MB (<code>78.3&nbsp;→&nbsp;44.2&nbsp;ms</code>)<br><strong>1.37x</strong> CLI · <strong>-32.8% peak RSS</strong> (<code>-58.5 MiB</code>)</td>
       <td>1,633 core + spec tests pass<br>caught 1 noise edit (<code>p=0.0404</code>)</td>
       <td><a href="docs/showcases/js-yaml.patch"><code>js-yaml.patch</code></a></td>
     </tr>
     <tr>
-      <td><a href="docs/showcases/python-markdown.md"><strong>Python-Markdown</strong></a><br><sub>powers MkDocs · docs engine</sub></td>
-      <td>Python<br><code>cProfile+tracemalloc</code></td>
-      <td><strong>1.92x</strong> pure <code>convert</code> (<code>497.3&nbsp;-&gt;&nbsp;258.8&nbsp;ms</code>)<br><strong>1.53x</strong> CLI (<code>138.4&nbsp;-&gt;&nbsp;90.3&nbsp;ms</code>) · killed O(N^2) TOC</td>
+      <td><a href="docs/showcases/python-markdown.md"><strong>Python-Markdown</strong></a><br><sub>Python · MkDocs engine · <code>cProfile</code></sub></td>
+      <td><strong>1.92x</strong> pure <code>convert</code> (<code>497.3&nbsp;→&nbsp;258.8&nbsp;ms</code>)<br><strong>1.53x</strong> CLI (<code>138.4&nbsp;→&nbsp;90.3&nbsp;ms</code>) · O(N^2) TOC fix</td>
       <td>1,230/1,230 unittest pass<br>caught 1 noise edit (<code>p=0.1572</code>)</td>
       <td><a href="docs/showcases/python-markdown.patch"><code>markdown.patch</code></a></td>
     </tr>
     <tr>
-      <td><a href="docs/showcases/adblock-rust.md"><strong>brave/adblock-rust</strong></a><br><sub>134k EasyList/EasyPrivacy rules</sub></td>
-      <td>Rust<br><code>linux:perf</code></td>
-      <td><strong>1.05x</strong> (<code>142.7&nbsp;-&gt;&nbsp;136.1&nbsp;ms</code>, <code>p=0.0002</code>)<br><code>3.05 IPC</code> on already-tuned Rust</td>
+      <td><a href="docs/showcases/adblock-rust.md"><strong>brave/adblock-rust</strong></a><br><sub>Rust · 134k rules · <code>linux:perf</code></sub></td>
+      <td><strong>1.05x</strong> (<code>142.7&nbsp;→&nbsp;136.1&nbsp;ms</code>, <code>p=0.0002</code>)<br><code>3.05 IPC</code> on already-tuned Rust</td>
       <td>246/246 cargo tests pass<br>blocked 2 regressions + 2 noise</td>
       <td><a href="docs/showcases/adblock-rust.patch"><code>adblock.patch</code></a></td>
     </tr>
     <tr>
-      <td><a href="docs/showcases/ram-aggregator.md"><strong>examples/ram_aggregator</strong></a><br><sub>bundled <code>--metric rss</code> demo</sub></td>
-      <td>Python<br><code>--metric rss</code></td>
-      <td><strong>8.34x less Peak RSS</strong> (<code>160.0&nbsp;-&gt;&nbsp;19.2&nbsp;MiB</code>)<br><code>-88.0%</code> RAM · <code>1.29x</code> wall speedup</td>
+      <td><a href="docs/showcases/ram-aggregator.md"><strong>examples/ram_aggregator</strong></a><br><sub>Python · bundled <code>--metric rss</code> demo</sub></td>
+      <td><strong>8.34x less Peak RSS</strong> (<code>160.0&nbsp;→&nbsp;19.2&nbsp;MiB</code>)<br><code>-88.0%</code> RAM · <code>1.29x</code> wall speedup</td>
       <td>exact SHA-256 (<code>6f5b1b2e</code>)<br><code>p=0.0002</code></td>
       <td><a href="examples/ram_aggregator"><code>examples/</code></a></td>
     </tr>
