@@ -12,7 +12,7 @@ Use `oa` whenever a user asks to optimize latency, throughput, CPU usage, or mem
 | Tool | Purpose |
 | --- | --- |
 | `oa_init` | Lock test/bench files, snapshot `refs/oa/baseline` and `refs/oa/best`, capture output SHA-256, run initial profile |
-| `oa_profile` | Profile current code (`auto`, `python`, `node`, `go`, `perf`, `sample`, `native`) with source snippets, allocations, and `--diff-from` deltas |
+| `oa_profile` | Profile active session or standalone `cmd` (`auto`, `python`, `node`, `go`, `perf`, `sample`, `native`) with source snippets, allocations, and `--diff-from` deltas |
 | `oa_evaluate` | Run Cheat Guard -> build -> locked tests -> SHA-256 equivalence -> balanced interleaved A/B pairs (`wall` or `rss`) |
 | `oa_checkpoint` | Keep a verified win (`refs/oa/best` advances) or revert to best and log a dead end in `.oa/ledger.jsonl` |
 | `oa_verify` | Fresh end-to-end verification of `HEAD` vs `refs/oa/baseline` (15 interleaved pairs, Cheat Guard, tests, SHA-256 badge) |
@@ -20,7 +20,7 @@ Use `oa` whenever a user asks to optimize latency, throughput, CPU usage, or mem
 | `oa_ledger` | Full experiment history, Pareto frontier IDs, and ruled-out dead ends |
 | `oa_report` | Generate a PR-ready Markdown report, raw JSON ledger, or dark/light SVG chart (`format: "svg"`) |
 | `oa_diff` | Export the clean unified patch and diff stat between `refs/oa/baseline` and `refs/oa/best` |
-| `oa_compare` | Standalone interleaved A/B benchmark of any two commands without initializing a session |
+| `oa_compare` | Standalone interleaved A/B benchmark of two commands (`cmd_a`/`cmd_b`) or git revisions (`git_a`/`git_b` + `bench_cmd`) without initializing a session |
 
 ## Standard Optimization Loop
 

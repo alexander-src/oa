@@ -29,6 +29,10 @@ pub fn head_sha(root: &Path) -> Result<String, String> {
     git_cmd(root, &["rev-parse", "HEAD"])
 }
 
+pub fn resolve_rev(root: &Path, rev: &str) -> Result<String, String> {
+    git_cmd(root, &["rev-parse", "--verify", rev])
+}
+
 pub fn has_uncommitted_tracked_changes(root: &Path) -> Result<bool, String> {
     let out = git_cmd(root, &["status", "--porcelain", "--untracked-files=no"])?;
     Ok(!out.is_empty())

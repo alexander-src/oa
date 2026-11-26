@@ -94,10 +94,17 @@ oa clean --refs
   </picture>
 </p>
 
-Need a quick interleaved A/B comparison without initializing a session? Run `oa compare` on any two commands (add `--markdown` for a paste-ready PR table):
+Need a quick interleaved A/B comparison or hotspot profile without initializing a session? Run `oa compare` on any two commands or git revisions (add `--markdown` for a paste-ready PR table), or run `oa profile --cmd` directly:
 
 ```bash
+# Compare your working tree (or a branch) against main in detached worktrees
+oa compare --git main --bench "cargo run --release" --build "cargo build --release" --pairs 15 --check-output --markdown
+
+# Compare any two shell commands
 oa compare "python3 old.py" "python3 new.py" --pairs 15 --check-output --markdown
+
+# One-shot profile with source snippets (no oa init required)
+oa profile --cmd "python3 bench.py" --top 10
 ```
 
 To reduce memory footprint instead of latency, pass `--metric rss` to `oa init`, `oa evaluate`, `oa verify`, or `oa compare` (supported on Linux, macOS, and Windows). Bundled walkthroughs live under [`examples/slow_log_parser`](examples/slow_log_parser) (`--metric wall`) and [`examples/ram_aggregator`](examples/ram_aggregator) (`--metric rss`).
@@ -219,19 +226,21 @@ Running `oa report --format svg --theme dark` on the `Keats/tera` session produc
 
 ## GitHub Action
 
-Drop `uses: alexander-src/oa@v0.4.0` into any workflow to gate pull requests on statistically verified speedups, peak RSS, and output SHA-256 equivalence (posts results to `$GITHUB_STEP_SUMMARY` and fails on regression or output mismatch):
+Drop `uses: alexander-src/oa@v0.5.0` into any workflow to gate pull requests against their base branch on statistically verified speedups, peak RSS, and output SHA-256 equivalence (posts results to `$GITHUB_STEP_SUMMARY` and fails on regression or output mismatch):
 
 ```yaml
-- uses: alexander-src/oa@v0.4.0
+- uses: alexander-src/oa@v0.5.0
   with:
-    cmd-a: ./baseline/bench
-    cmd-b: ./candidate/bench
+    mode: git-compare
+    base-ref: ${{ github.event.pull_request.base.sha }}
+    build-cmd: cargo build --release
+    bench-cmd: ./target/release/my_bench
     pairs: 15
     check-output: true
     fail-on-regression: true
 ```
 
-To verify an existing `oa` session (`HEAD` against `refs/oa/baseline`), set `mode: verify`. See [`action.yml`](action.yml) for all inputs and outputs (`verdict`, `ratio`, `p-value`).
+Also supports `mode: compare` (any two commands via `cmd-a` and `cmd-b`) and `mode: verify` (verifies an active `.oa/` session against `refs/oa/baseline`). See [`action.yml`](action.yml) for all inputs and outputs (`verdict`, `ratio`, `p-value`).
 
 ## MCP & CLI
 
@@ -240,7 +249,7 @@ To verify an existing `oa` session (`HEAD` against `refs/oa/baseline`), set `mod
 | MCP Tool | CLI Equivalent | Purpose |
 | --- | --- | --- |
 | `oa_init` | `oa init` | Lock test/bench files, snapshot `refs/oa/baseline`, capture output SHA-256 and baseline profile |
-| `oa_profile` | `oa profile` | Profile current tree, classify bottleneck, diff hotspots vs `baseline` or `best` |
+| `oa_profile` | `oa profile` | Profile current tree (or standalone `--cmd`), classify bottleneck, diff hotspots vs `baseline` or `best` |
 | `oa_evaluate` | `oa evaluate` (`bench`) | Enforce Cheat Guard, build, run tests, check SHA-256 equivalence, run interleaved A/B pairs |
 | `oa_checkpoint` | `oa checkpoint` | Advance `refs/oa/best` on verified wins or revert working tree and log dead ends |
 | `oa_verify` | `oa verify` | Fresh end-to-end verification of `HEAD` vs `refs/oa/baseline` with CI exit code and badge |
@@ -248,7 +257,7 @@ To verify an existing `oa` session (`HEAD` against `refs/oa/baseline`), set `mod
 | `oa_ledger` | `oa ledger` | Inspect experiment history, Pareto frontier IDs, and ruled-out dead ends |
 | `oa_report` | `oa report` | Export a PR-ready Markdown report, raw JSON ledger, or dark/light SVG chart (`--format svg`) |
 | `oa_diff` | `oa diff` | Export the clean unified patch and diff stat between `refs/oa/baseline` and `refs/oa/best` |
-| `oa_compare` | `oa compare` | Standalone interleaved A/B comparison of any two commands (`--markdown`, `--check-output`) |
+| `oa_compare` | `oa compare` | Standalone interleaved A/B comparison of two commands or `--git <rev>[..<rev2>]` (`--markdown`, `--check-output`) |
 
 Utility commands (CLI): `oa demo` (1-second self-contained walkthrough), `oa doctor` (local profiler & agent check), `oa setup` (auto-configure MCP + `SKILL.md`), `oa clean [--refs]` (remove `.oa/` shadow worktrees and session state while keeping working tree edits).
 

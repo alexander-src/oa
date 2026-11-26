@@ -1,7 +1,10 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static COMPARE_WT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 use serde::{Deserialize, Serialize};
 
@@ -193,6 +196,7 @@ pub struct InitReport {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileParams {
     pub path: Option<String>,
+    pub cmd: Option<String>,
     pub mode: Option<String>,
     pub top_k: Option<usize>,
     pub diff_from: Option<String>,
@@ -554,6 +558,24 @@ pub fn init_session(params: InitParams) -> Result<InitReport, String> {
 }
 
 pub fn profile_session(params: ProfileParams) -> Result<ProfileResponse, String> {
+    let mode = params.mode.as_deref().unwrap_or("auto");
+    let top_k = params.top_k.unwrap_or(10).clamp(1, 30);
+
+    if let Some(ref cmd) = params.cmd {
+        if params.diff_from.is_some() {
+            return Err(
+                "cannot combine --cmd with --diff-from (hotspot diffing requires an active oa session)"
+                    .to_string(),
+            );
+        }
+        let cwd = match params.path {
+            Some(ref p) => PathBuf::from(p),
+            None => std::env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?,
+        };
+        let report = profiler::run_profile(cmd, &cwd, mode, top_k)?;
+        return Ok(ProfileResponse { report, diff: None });
+    }
+
     let root = resolve_root(params.path.as_deref())?;
     let config: SessionConfig = read_json(&oa_path(&root, "config.json"))?;
 
@@ -570,8 +592,6 @@ pub fn profile_session(params: ProfileParams) -> Result<ProfileResponse, String>
         }
     }
 
-    let mode = params.mode.as_deref().unwrap_or("auto");
-    let top_k = params.top_k.unwrap_or(10).clamp(1, 30);
     let report = profiler::run_profile(&config.profile_cmd, &root, mode, top_k)?;
 
     let fingerprint = git::working_tree_fingerprint(&root)?;
@@ -1521,10 +1541,29 @@ pub struct CompareParams {
     pub check_output: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompareGitParams {
+    pub path: Option<String>,
+    pub git_a: String,
+    pub git_b: Option<String>,
+    pub bench_cmd: String,
+    pub build_cmd: Option<String>,
+    pub copy_files: Vec<String>,
+    pub metric: MetricTarget,
+    pub pairs: usize,
+    pub warmup: usize,
+    pub min_speedup: f64,
+    pub alpha: f64,
+    pub pin_core: Option<usize>,
+    pub check_output: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompareResult {
     pub cmd_a: String,
     pub cmd_b: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_cmd: Option<String>,
     pub metric: MetricTarget,
     pub verdict: stats::BenchVerdict,
     pub stats: ComparisonStats,
@@ -1537,21 +1576,78 @@ pub struct CompareResult {
     pub warnings: Vec<String>,
 }
 
-/// Standalone interleaved A/B comparison of any two shell commands (no `oa init` needed).
-pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> {
-    let cwd = match params.path {
-        Some(p) => PathBuf::from(p),
-        None => std::env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?,
-    };
-    let pairs = params.pairs.max(3);
-    let warmup = params.warmup;
-    let measure_rss = params.metric == MetricTarget::Rss;
+struct TempWorktreeGuard {
+    root: PathBuf,
+    worktree: PathBuf,
+}
+
+impl Drop for TempWorktreeGuard {
+    fn drop(&mut self) {
+        let _ = git::remove_shadow_worktree(&self.root, &self.worktree);
+    }
+}
+
+fn copy_extra_files(root: &Path, dst_dir: &Path, rel_paths: &[String]) -> Result<(), String> {
+    for rel in rel_paths {
+        let rel_path = Path::new(rel);
+        if rel_path.is_absolute()
+            || rel_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "--copy path '{rel}' must be relative to repository root without '..'"
+            ));
+        }
+        let src = root.join(rel_path);
+        if !src.is_file() {
+            return Err(format!(
+                "--copy file '{}' not found in {}",
+                rel,
+                root.display()
+            ));
+        }
+        let dst = dst_dir.join(rel_path);
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create directory '{}': {e}", parent.display()))?;
+        }
+        fs::copy(&src, &dst).map_err(|e| {
+            format!(
+                "failed to copy '{}' to '{}': {e}",
+                src.display(),
+                dst.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_interleaved_compare(
+    dir_a: &Path,
+    exec_a: &str,
+    label_a: String,
+    dir_b: &Path,
+    exec_b: &str,
+    label_b: String,
+    bench_cmd: Option<String>,
+    metric: MetricTarget,
+    pairs: usize,
+    warmup: usize,
+    min_speedup: f64,
+    alpha: f64,
+    pin_core: Option<usize>,
+    check_output: bool,
+) -> Result<CompareResult, String> {
+    let pairs = pairs.max(3);
+    let measure_rss = metric == MetricTarget::Rss;
 
     // Initial check + SHA-256 + Peak RSS measurement for both commands.
-    let probe_a = runner::run_command(&params.cmd_a, &cwd, params.pin_core, true)?;
+    let probe_a = runner::run_command(exec_a, dir_a, pin_core, true)?;
     if probe_a.exit_code != 0 {
         return Err(format!(
-            "command A exited {}: {}",
+            "command A ({label_a}) exited {}: {}",
             probe_a.exit_code,
             String::from_utf8_lossy(&probe_a.stderr)
                 .chars()
@@ -1559,10 +1655,10 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
                 .collect::<String>()
         ));
     }
-    let probe_b = runner::run_command(&params.cmd_b, &cwd, params.pin_core, true)?;
+    let probe_b = runner::run_command(exec_b, dir_b, pin_core, true)?;
     if probe_b.exit_code != 0 {
         return Err(format!(
-            "command B exited {}: {}",
+            "command B ({label_b}) exited {}: {}",
             probe_b.exit_code,
             String::from_utf8_lossy(&probe_b.stderr)
                 .chars()
@@ -1574,7 +1670,7 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
     let sha_a = crate::sha256::sha256_hex(&probe_a.stdout);
     let sha_b = crate::sha256::sha256_hex(&probe_b.stdout);
     let outputs_identical = sha_a == sha_b;
-    if params.check_output && !outputs_identical {
+    if check_output && !outputs_identical {
         return Err(format!(
             "stdout SHA-256 mismatch: A={}.. vs B={}..",
             &sha_a[..16],
@@ -1584,11 +1680,11 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
 
     for i in 0..warmup {
         if i % 2 == 0 {
-            let _ = runner::run_command(&params.cmd_a, &cwd, params.pin_core, false)?;
-            let _ = runner::run_command(&params.cmd_b, &cwd, params.pin_core, false)?;
+            let _ = runner::run_command(exec_a, dir_a, pin_core, false)?;
+            let _ = runner::run_command(exec_b, dir_b, pin_core, false)?;
         } else {
-            let _ = runner::run_command(&params.cmd_b, &cwd, params.pin_core, false)?;
-            let _ = runner::run_command(&params.cmd_a, &cwd, params.pin_core, false)?;
+            let _ = runner::run_command(exec_b, dir_b, pin_core, false)?;
+            let _ = runner::run_command(exec_a, dir_a, pin_core, false)?;
         }
     }
 
@@ -1605,19 +1701,19 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
 
     for i in 0..pairs {
         let (out_a, out_b) = if i % 2 == 0 {
-            let a = runner::run_command(&params.cmd_a, &cwd, params.pin_core, measure_rss)?;
-            let b = runner::run_command(&params.cmd_b, &cwd, params.pin_core, measure_rss)?;
+            let a = runner::run_command(exec_a, dir_a, pin_core, measure_rss)?;
+            let b = runner::run_command(exec_b, dir_b, pin_core, measure_rss)?;
             (a, b)
         } else {
-            let b = runner::run_command(&params.cmd_b, &cwd, params.pin_core, measure_rss)?;
-            let a = runner::run_command(&params.cmd_a, &cwd, params.pin_core, measure_rss)?;
+            let b = runner::run_command(exec_b, dir_b, pin_core, measure_rss)?;
+            let a = runner::run_command(exec_a, dir_a, pin_core, measure_rss)?;
             (a, b)
         };
         if out_a.exit_code != 0 {
-            return Err(format!("command A failed on pair {}", i + 1));
+            return Err(format!("command A ({label_a}) failed on pair {}", i + 1));
         }
         if out_b.exit_code != 0 {
-            return Err(format!("command B failed on pair {}", i + 1));
+            return Err(format!("command B ({label_b}) failed on pair {}", i + 1));
         }
         if let Some(r) = out_a.peak_rss_kb {
             rss_a_samples.push(r);
@@ -1625,7 +1721,7 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
         if let Some(r) = out_b.peak_rss_kb {
             rss_b_samples.push(r);
         }
-        match params.metric {
+        match metric {
             MetricTarget::Wall => {
                 samples_a.push(out_a.wall_ms);
                 samples_b.push(out_b.wall_ms);
@@ -1643,16 +1739,17 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
         }
     }
 
-    let cmp = stats::compare_samples(&samples_a, &samples_b, params.min_speedup, params.alpha);
+    let cmp = stats::compare_samples(&samples_a, &samples_b, min_speedup, alpha);
     let verdict = cmp.verdict;
-    let warnings = collect_noise_warnings(&cmp, params.metric);
+    let warnings = collect_noise_warnings(&cmp, metric);
     let peak_rss_a_kb = median_u64(&rss_a_samples);
     let peak_rss_b_kb = median_u64(&rss_b_samples);
 
     Ok(CompareResult {
-        cmd_a: params.cmd_a,
-        cmd_b: params.cmd_b,
-        metric: params.metric,
+        cmd_a: label_a,
+        cmd_b: label_b,
+        bench_cmd,
+        metric,
         verdict,
         stats: cmp,
         peak_rss_a_kb,
@@ -1662,6 +1759,99 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
         outputs_identical,
         warnings,
     })
+}
+
+/// Standalone interleaved A/B comparison of any two shell commands (no `oa init` needed).
+pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> {
+    let cwd = match params.path {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?,
+    };
+    run_interleaved_compare(
+        &cwd,
+        &params.cmd_a,
+        params.cmd_a.clone(),
+        &cwd,
+        &params.cmd_b,
+        params.cmd_b.clone(),
+        None,
+        params.metric,
+        params.pairs,
+        params.warmup,
+        params.min_speedup,
+        params.alpha,
+        params.pin_core,
+        params.check_output,
+    )
+}
+
+/// Zero-setup interleaved A/B comparison between two git revisions (or a git revision vs working tree).
+pub fn compare_git_revs(params: CompareGitParams) -> Result<CompareResult, String> {
+    let root = resolve_root(params.path.as_deref())?;
+    let sha_a = git::resolve_rev(&root, &params.git_a)?;
+    let seq = COMPARE_WT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let wt_a = std::env::temp_dir().join(format!("oa-cmp-{pid}-{seq}-a"));
+    git::ensure_shadow_worktree(&root, &wt_a, &sha_a)?;
+    let _guard_a = TempWorktreeGuard {
+        root: root.clone(),
+        worktree: wt_a.clone(),
+    };
+    copy_extra_files(&root, &wt_a, &params.copy_files)?;
+
+    let mut _guard_b = None;
+    let (dir_b, label_b) = if let Some(ref rev_b) = params.git_b {
+        let sha_b = git::resolve_rev(&root, rev_b)?;
+        let wt_b = std::env::temp_dir().join(format!("oa-cmp-{pid}-{seq}-b"));
+        git::ensure_shadow_worktree(&root, &wt_b, &sha_b)?;
+        copy_extra_files(&root, &wt_b, &params.copy_files)?;
+        let label = format!("{rev_b} ({})", &sha_b[..8.min(sha_b.len())]);
+        _guard_b = Some(TempWorktreeGuard {
+            root: root.clone(),
+            worktree: wt_b.clone(),
+        });
+        (wt_b, label)
+    } else {
+        (root.clone(), "working tree".to_string())
+    };
+
+    let label_a = format!("{} ({})", params.git_a, &sha_a[..8.min(sha_a.len())]);
+
+    if let Some(ref build_cmd) = params.build_cmd {
+        let out_a = runner::run_command(build_cmd, &wt_a, None, false)?;
+        if out_a.exit_code != 0 {
+            return Err(format!(
+                "build failed for {label_a} (exit {}): {}",
+                out_a.exit_code,
+                snippet_output(&out_a.stderr, 300)
+            ));
+        }
+        let out_b = runner::run_command(build_cmd, &dir_b, None, false)?;
+        if out_b.exit_code != 0 {
+            return Err(format!(
+                "build failed for {label_b} (exit {}): {}",
+                out_b.exit_code,
+                snippet_output(&out_b.stderr, 300)
+            ));
+        }
+    }
+
+    run_interleaved_compare(
+        &wt_a,
+        &params.bench_cmd,
+        label_a,
+        &dir_b,
+        &params.bench_cmd,
+        label_b,
+        Some(params.bench_cmd.clone()),
+        params.metric,
+        params.pairs,
+        params.warmup,
+        params.min_speedup,
+        params.alpha,
+        params.pin_core,
+        params.check_output,
+    )
 }
 
 /// Formats a standalone `oa compare` result as a GitHub-flavored Markdown table.
@@ -1683,21 +1873,29 @@ pub fn render_compare_markdown(res: &CompareResult) -> String {
             &res.stdout_sha256_b[..16]
         )
     };
+    let (col_a, col_b, context_line) = if let Some(ref bcmd) = res.bench_cmd {
+        (
+            res.cmd_a.as_str(),
+            res.cmd_b.as_str(),
+            format!("Command: `{bcmd}`\n\n"),
+        )
+    } else {
+        (
+            "Cmd A",
+            "Cmd B",
+            format!("Cmd A: `{}`\nCmd B: `{}`\n\n", res.cmd_a, res.cmd_b),
+        )
+    };
     format!(
         "### oa compare (`{:?}`)\n\n\
-         - **Cmd A:** `{}`\n\
-         - **Cmd B:** `{}`\n\
-         - **Output SHA-256:** {}\n\n\
-         | Metric | Cmd A | Cmd B | Result |\n\
+         {context_line}\
+         | Metric | {col_a} | {col_b} | Result |\n\
          | --- | ---: | ---: | ---: |\n\
          | Median ({unit}) | {:.2} | {:.2} | **{:.2}x** |\n\
          | p95 / MAD ({unit}) | {:.2} / {:.2} | {:.2} / {:.2} | 95% CI [{:.2}x, {:.2}x] |\n\
          {rss_row}\
-         | Significance | n={} pairs | Mann-Whitney U | `p = {:.4}` |\n",
+         | Output SHA-256 | `{}` | {} | n={} pairs, Mann-Whitney U `p = {:.4}` |\n",
         res.verdict,
-        res.cmd_a,
-        res.cmd_b,
-        eq_status,
         res.stats.baseline.median_ms,
         res.stats.candidate.median_ms,
         res.stats.paired_ratio_median,
@@ -1707,6 +1905,8 @@ pub fn render_compare_markdown(res: &CompareResult) -> String {
         res.stats.candidate.mad_ms,
         res.stats.ci95_low,
         res.stats.ci95_high,
+        &res.stdout_sha256_a[..16],
+        eq_status,
         res.stats.baseline.count,
         res.stats.mann_whitney_p,
     )

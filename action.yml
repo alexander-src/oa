@@ -6,7 +6,7 @@ branding:
 
 inputs:
   mode:
-    description: "Execution mode: 'compare' (standalone A/B benchmark) or 'verify' (verify an active .oa session against refs/oa/baseline)."
+    description: "Execution mode: 'compare' (two commands), 'git-compare' (git base-ref vs head/working tree), or 'verify' (active .oa session)."
     required: false
     default: "compare"
   cmd-a:
@@ -15,6 +15,22 @@ inputs:
     default: ""
   cmd-b:
     description: "Candidate command (required when mode is 'compare')."
+    required: false
+    default: ""
+  base-ref:
+    description: "Base git revision for 'git-compare' mode (e.g. origin/main or pull_request.base.sha)."
+    required: false
+    default: ""
+  head-ref:
+    description: "Optional candidate git revision for 'git-compare' mode (defaults to working tree)."
+    required: false
+    default: ""
+  bench-cmd:
+    description: "Benchmark command executed in both revisions when mode is 'git-compare'."
+    required: false
+    default: ""
+  build-cmd:
+    description: "Optional build command executed once per worktree when mode is 'git-compare'."
     required: false
     default: ""
   path:
@@ -124,6 +140,10 @@ runs:
         OA_MODE: ${{ inputs.mode }}
         OA_CMD_A: ${{ inputs.cmd-a }}
         OA_CMD_B: ${{ inputs.cmd-b }}
+        OA_BASE_REF: ${{ inputs.base-ref }}
+        OA_HEAD_REF: ${{ inputs.head-ref }}
+        OA_BENCH_CMD: ${{ inputs.bench-cmd }}
+        OA_BUILD_CMD: ${{ inputs.build-cmd }}
         OA_PATH: ${{ inputs.path }}
         OA_METRIC: ${{ inputs.metric }}
         OA_PAIRS: ${{ inputs.pairs }}
@@ -172,25 +192,47 @@ runs:
           exit "$STATUS"
         fi
 
-        if [ -z "$OA_CMD_A" ] || [ -z "$OA_CMD_B" ]; then
-          echo "::error::compare mode requires both cmd-a and cmd-b inputs."
-          exit 1
-        fi
-
         EXTRA_ARGS=()
         if [ "$OA_CHECK_OUTPUT" = "true" ]; then
           EXTRA_ARGS+=(--check-output)
         fi
 
-        oa compare "$OA_CMD_A" "$OA_CMD_B" \
-          --path "$OA_PATH" \
-          --metric "$OA_METRIC" \
-          --pairs "$OA_PAIRS" \
-          --warmup "$OA_WARMUP" \
-          --min-speedup "$OA_MIN_SPEEDUP" \
-          --alpha "$OA_ALPHA" \
-          "${EXTRA_ARGS[@]}" \
-          --json > "$OUT_JSON"
+        if [ "$OA_MODE" = "git-compare" ]; then
+          if [ -z "$OA_BASE_REF" ] || [ -z "$OA_BENCH_CMD" ]; then
+            echo "::error::git-compare mode requires both base-ref and bench-cmd inputs."
+            exit 1
+          fi
+          GIT_SPEC="$OA_BASE_REF"
+          if [ -n "$OA_HEAD_REF" ]; then
+            GIT_SPEC="${OA_BASE_REF}..${OA_HEAD_REF}"
+          fi
+          if [ -n "$OA_BUILD_CMD" ]; then
+            EXTRA_ARGS+=(--build "$OA_BUILD_CMD")
+          fi
+          oa compare --git "$GIT_SPEC" --bench "$OA_BENCH_CMD" \
+            --path "$OA_PATH" \
+            --metric "$OA_METRIC" \
+            --pairs "$OA_PAIRS" \
+            --warmup "$OA_WARMUP" \
+            --min-speedup "$OA_MIN_SPEEDUP" \
+            --alpha "$OA_ALPHA" \
+            "${EXTRA_ARGS[@]}" \
+            --json > "$OUT_JSON"
+        else
+          if [ -z "$OA_CMD_A" ] || [ -z "$OA_CMD_B" ]; then
+            echo "::error::compare mode requires both cmd-a and cmd-b inputs."
+            exit 1
+          fi
+          oa compare "$OA_CMD_A" "$OA_CMD_B" \
+            --path "$OA_PATH" \
+            --metric "$OA_METRIC" \
+            --pairs "$OA_PAIRS" \
+            --warmup "$OA_WARMUP" \
+            --min-speedup "$OA_MIN_SPEEDUP" \
+            --alpha "$OA_ALPHA" \
+            "${EXTRA_ARGS[@]}" \
+            --json > "$OUT_JSON"
+        fi
 
         "$PY_BIN" - "$OUT_JSON" "$OA_FAIL_REGRESSION" <<'PY'
         import json, os, sys

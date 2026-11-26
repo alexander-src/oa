@@ -433,3 +433,101 @@ fn rss_metric_detects_memory_reduction() {
     );
     assert!(eval.reference_peak_rss_kb.unwrap() > eval.candidate_peak_rss_kb.unwrap() * 2);
 }
+
+#[test]
+fn standalone_profile_cmd_works_without_session() {
+    use oa::session::{profile_session, ProfileParams};
+
+    let py = python_bin();
+    let repo = TempRepo::new("standalone_prof");
+    repo.write(
+        "hot.py",
+        "def slow_sum(n):\n    t = 0\n    for i in range(n):\n        t += (i * 17) % 97\n    return t\nprint(slow_sum(250000))\n",
+    );
+    let res = profile_session(ProfileParams {
+        path: Some(repo.path_str()),
+        cmd: Some(format!("{py} hot.py")),
+        mode: Some("python".to_string()),
+        top_k: Some(5),
+        diff_from: None,
+        skip_build: false,
+    })
+    .expect("standalone profile should run without oa init");
+    assert!(res.diff.is_none());
+    assert!(
+        res.report
+            .hotspots
+            .iter()
+            .any(|h| h.function.contains("slow_sum")),
+        "expected slow_sum hotspot, got {:?}",
+        res.report.hotspots
+    );
+}
+
+#[test]
+fn compare_git_revs_detects_speedup_and_cleans_worktrees() {
+    use oa::session::{compare_git_revs, render_compare_markdown, CompareGitParams, MetricTarget};
+    use oa::stats::BenchVerdict;
+
+    let py = python_bin();
+    let repo = TempRepo::new("git_cmp");
+    repo.git(&["init"]);
+    repo.git(&["config", "user.name", "Test"]);
+    repo.git(&["config", "user.email", "test@example.com"]);
+
+    repo.write(
+        "algo.py",
+        "def compute(n):\n    return sum(i * i for i in range(n))\n",
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "slow baseline"]);
+
+    // Untracked local benchmark script copied into detached worktree via --copy.
+    repo.write(
+        "local_bench.py",
+        "import algo\nprint(algo.compute(1200000))\n",
+    );
+
+    // Edit working tree to O(1) closed form (uncommitted).
+    repo.write(
+        "algo.py",
+        "def compute(n):\n    m = n - 1\n    return m * (m + 1) * (2 * m + 1) // 6\n",
+    );
+
+    let res = compare_git_revs(CompareGitParams {
+        path: Some(repo.path_str()),
+        git_a: "HEAD".to_string(),
+        git_b: None,
+        bench_cmd: format!("{py} local_bench.py"),
+        build_cmd: None,
+        copy_files: vec!["local_bench.py".to_string()],
+        metric: MetricTarget::Wall,
+        pairs: 6,
+        warmup: 1,
+        min_speedup: 1.05,
+        alpha: 0.05,
+        pin_core: None,
+        check_output: true,
+    })
+    .expect("compare_git_revs should succeed");
+
+    assert!(res.outputs_identical);
+    assert_eq!(res.verdict, BenchVerdict::Faster);
+    assert!(res.stats.paired_ratio_median > 1.1);
+    assert_eq!(res.cmd_b, "working tree");
+    let md = render_compare_markdown(&res);
+    assert!(md.contains("Command:") && md.contains("working tree"));
+
+    // Verify no leaked temporary worktrees remain registered.
+    let wt_list = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&repo.path)
+        .output()
+        .expect("git worktree list");
+    let wt_text = String::from_utf8_lossy(&wt_list.stdout);
+    let wt_count = wt_text
+        .lines()
+        .filter(|l| l.starts_with("worktree "))
+        .count();
+    assert_eq!(wt_count, 1, "expected only main worktree, got:\n{wt_text}");
+}

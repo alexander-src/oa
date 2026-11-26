@@ -9,13 +9,14 @@ use oa::doctor;
 use oa::guard::EquivalencePolicy;
 use oa::mcp;
 use oa::session::{
-    checkpoint_session, clean_session, compare_commands, evaluate_session, export_diff, get_ledger,
-    init_session, profile_session, render_compare_markdown, render_markdown_report,
-    render_svg_report, session_status, verify_session, CheckpointAction, CheckpointParams,
-    CompareParams, EvalVerdict, EvaluateParams, InitParams, MetricTarget, ProfileParams,
-    VerifyParams,
+    checkpoint_session, clean_session, compare_commands, compare_git_revs, evaluate_session,
+    export_diff, get_ledger, init_session, profile_session, render_compare_markdown,
+    render_markdown_report, render_svg_report, session_status, verify_session, CheckpointAction,
+    CheckpointParams, CompareGitParams, CompareParams, EvalVerdict, EvaluateParams, InitParams,
+    MetricTarget, ProfileParams, VerifyParams,
 };
 use oa::setup;
+use oa::stats::BenchVerdict;
 use oa::svg::SvgTheme;
 
 const HELP: &str = "\
@@ -50,7 +51,7 @@ fn print_subcommand_help(cmd: &str) {
             "USAGE:\n  oa init --bench <CMD> [OPTIONS]\n\nOPTIONS:\n  --bench <CMD>          Benchmark command to optimize (required)\n  --test <CMD>           Test suite command required before keeping changes\n  --build <CMD>          Build command run before profiling/evaluating\n  --profile-cmd <CMD>    Optional command for profiling (defaults to --bench)\n  --metric <wall|rss>    Primary metric: wall (latency ms, default) or rss (peak memory KiB)\n  --output-file <PATH>   Output file path whose SHA-256 must match baseline (repeatable)\n  --lock <PATH>          Extra file locked by Cheat Guard (repeatable)\n  --no-auto-lock         Disable automatic locking of tracked test/bench files\n  --ignore-line <SUBSTR> Ignore lines containing substring during equivalence check (repeatable)\n  --oracle <CMD>         External oracle command used instead of SHA-256 equivalence\n  --min-speedup <RATIO>  Minimum 95% CI lower bound to accept (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha threshold (default 0.01)\n  --warmup <N>           Warmup runs/pairs (default 2)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --pin-core <ID>        Pin benchmark runs to Linux CPU core via taskset\n  --allow-dirty          Allow starting on a dirty working tree\n  --path <DIR>           Target repository directory\n  --json                 Emit raw JSON output"
         ),
         "profile" => println!(
-            "USAGE:\n  oa profile [OPTIONS]\n\nOPTIONS:\n  --mode <auto|python|node|go|perf|sample|native>  Profiler backend (default auto)\n  --top <N>                                        Max hotspots (default 10)\n  --diff-from <baseline|best>                      Compare hotspot self-time against baseline or best\n  --skip-build                                     Skip build_cmd before profiling\n  --path <DIR>                                     Target repository directory\n  --json                                           Emit raw JSON output"
+            "USAGE:\n  oa profile [OPTIONS]\n\nOPTIONS:\n  --cmd <CMD>                                      Standalone command to profile (no oa init needed)\n  --mode <auto|python|node|go|perf|sample|native>  Profiler backend (default auto)\n  --top <N>                                        Max hotspots (default 10)\n  --diff-from <baseline|best>                      Compare hotspot self-time against baseline or best\n  --skip-build                                     Skip build_cmd before profiling\n  --path <DIR>                                     Target repository directory\n  --json                                           Emit raw JSON output"
         ),
         "evaluate" | "bench" => println!(
             "USAGE:\n  oa evaluate [OPTIONS]\n\nOPTIONS:\n  --against <best|baseline>  Reference worktree to interleave against (default best)\n  --metric <wall|rss>        Override metric (wall latency ms or rss peak KiB)\n  --pairs <N>                Override interleaved A/B pairs\n  --warmup <N>               Override warmup pairs\n  --min-speedup <RATIO>      Override min speedup threshold\n  --alpha <P>                Override Mann-Whitney alpha\n  --path <DIR>               Target repository directory\n  --json                     Emit raw JSON output"
@@ -77,7 +78,7 @@ fn print_subcommand_help(cmd: &str) {
             "USAGE:\n  oa status [--path <DIR>] [--json]"
         ),
         "compare" => println!(
-            "USAGE:\n  oa compare <CMD_A> <CMD_B> [OPTIONS]\n\nOPTIONS:\n  --metric <wall|rss>    Metric to compare: wall (ms, default) or rss (peak KiB)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --warmup <N>           Warmup pairs (default 2)\n  --min-speedup <RATIO>  Minimum 95% CI lower bound (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha (default 0.01)\n  --pin-core <ID>        Pin runs to Linux CPU core via taskset\n  --check-output         Fail if stdout SHA-256 differs between CMD_A and CMD_B\n  --markdown             Emit a paste-ready GitHub Markdown comparison table\n  --path <DIR>           Working directory\n  --json                 Emit raw JSON output"
+            "USAGE:\n  oa compare <CMD_A> <CMD_B> [OPTIONS]\n  oa compare --git <REV_A>[..<REV_B>] --bench <CMD> [OPTIONS]\n\nOPTIONS:\n  --git <REV[..REV2]>    Compare git revision vs working tree (or REV1..REV2 in detached worktrees)\n  --bench <CMD>          Benchmark command to run in each revision (required with --git)\n  --build <CMD>          Optional build command run once per worktree before timing\n  --copy <PATH>          Copy an untracked relative file into detached worktrees (repeatable)\n  --metric <wall|rss>    Metric to compare: wall (ms, default) or rss (peak KiB)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --warmup <N>           Warmup pairs (default 2)\n  --min-speedup <RATIO>  Minimum 95% CI lower bound (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha (default 0.01)\n  --pin-core <ID>        Pin runs to Linux CPU core via taskset\n  --check-output         Fail if stdout SHA-256 differs between A and B\n  --fail-on-regression   Exit non-zero (code 2) if verdict is Slower\n  --markdown             Emit a paste-ready GitHub Markdown comparison table\n  --path <DIR>           Working directory or git repository path\n  --json                 Emit raw JSON output"
         ),
         "demo" => println!(
             "USAGE:\n  oa demo [--json]\n\nRuns a self-contained 4-second demo in a temporary git repository and cleans up on exit."
@@ -281,6 +282,7 @@ fn run_cli() -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         "profile" => {
+            let mut cmd_override = None;
             let mut mode = None;
             let mut top_k = None;
             let mut diff_from = None;
@@ -291,6 +293,7 @@ fn run_cli() -> Result<ExitCode, String> {
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
+                    "--cmd" => cmd_override = Some(next_val(rest, &mut i, "--cmd")?),
                     "--mode" => mode = Some(next_val(rest, &mut i, "--mode")?),
                     "--top" => {
                         let v = next_val(rest, &mut i, "--top")?;
@@ -310,6 +313,7 @@ fn run_cli() -> Result<ExitCode, String> {
 
             let res = profile_session(ProfileParams {
                 path,
+                cmd: cmd_override,
                 mode,
                 top_k,
                 diff_from,
@@ -837,6 +841,10 @@ fn run_cli() -> Result<ExitCode, String> {
         }
         "compare" => {
             let mut positional = Vec::new();
+            let mut git_spec = None;
+            let mut bench_cmd = None;
+            let mut build_cmd = None;
+            let mut copy_files = Vec::new();
             let mut metric = MetricTarget::Wall;
             let mut pairs = 10usize;
             let mut warmup = 2usize;
@@ -844,6 +852,7 @@ fn run_cli() -> Result<ExitCode, String> {
             let mut alpha = 0.01;
             let mut pin_core = None;
             let mut check_output = false;
+            let mut fail_on_regression = false;
             let mut as_markdown = false;
             let mut path = None;
             let mut as_json = false;
@@ -851,6 +860,10 @@ fn run_cli() -> Result<ExitCode, String> {
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
+                    "--git" => git_spec = Some(next_val(rest, &mut i, "--git")?),
+                    "--bench" => bench_cmd = Some(next_val(rest, &mut i, "--bench")?),
+                    "--build" => build_cmd = Some(next_val(rest, &mut i, "--build")?),
+                    "--copy" => copy_files.push(next_val(rest, &mut i, "--copy")?),
                     "--metric" => {
                         let v = next_val(rest, &mut i, "--metric")?;
                         metric = MetricTarget::parse_str(&v)?;
@@ -887,6 +900,7 @@ fn run_cli() -> Result<ExitCode, String> {
                         );
                     }
                     "--check-output" => check_output = true,
+                    "--fail-on-regression" => fail_on_regression = true,
                     "--markdown" | "--md" => as_markdown = true,
                     "--path" => path = Some(next_val(rest, &mut i, "--path")?),
                     "--json" => as_json = true,
@@ -898,24 +912,63 @@ fn run_cli() -> Result<ExitCode, String> {
                 i += 1;
             }
 
-            if positional.len() != 2 {
-                return Err(
-                    "compare requires exactly two commands: oa compare <CMD_A> <CMD_B>".to_string(),
-                );
-            }
-
-            let res = compare_commands(CompareParams {
-                path,
-                cmd_a: positional[0].clone(),
-                cmd_b: positional[1].clone(),
-                metric,
-                pairs,
-                warmup,
-                min_speedup,
-                alpha,
-                pin_core,
-                check_output,
-            })?;
+            let res = if let Some(spec) = git_spec {
+                let bcmd = bench_cmd
+                    .or_else(|| (positional.len() == 1).then(|| positional[0].clone()))
+                    .ok_or_else(|| {
+                        "compare --git requires --bench <CMD> (e.g. oa compare --git main --bench \"python3 bench.py\")"
+                            .to_string()
+                    })?;
+                let (git_a, git_b) = if let Some((a, b)) = spec.split_once("..") {
+                    if a.is_empty() {
+                        return Err(format!(
+                            "invalid --git range '{spec}': missing base revision"
+                        ));
+                    }
+                    let rev_b = if b.is_empty() {
+                        None
+                    } else {
+                        Some(b.to_string())
+                    };
+                    (a.to_string(), rev_b)
+                } else {
+                    (spec, None)
+                };
+                compare_git_revs(CompareGitParams {
+                    path,
+                    git_a,
+                    git_b,
+                    bench_cmd: bcmd,
+                    build_cmd,
+                    copy_files,
+                    metric,
+                    pairs,
+                    warmup,
+                    min_speedup,
+                    alpha,
+                    pin_core,
+                    check_output,
+                })?
+            } else {
+                if positional.len() != 2 {
+                    return Err(
+                        "compare requires two commands (oa compare <CMD_A> <CMD_B>) or --git <REV> --bench <CMD>"
+                            .to_string(),
+                    );
+                }
+                compare_commands(CompareParams {
+                    path,
+                    cmd_a: positional[0].clone(),
+                    cmd_b: positional[1].clone(),
+                    metric,
+                    pairs,
+                    warmup,
+                    min_speedup,
+                    alpha,
+                    pin_core,
+                    check_output,
+                })?
+            };
 
             if as_json {
                 println!(
@@ -930,6 +983,9 @@ fn run_cli() -> Result<ExitCode, String> {
                     MetricTarget::Rss => "KiB",
                 };
                 println!("Verdict : {:?} (metric {:?})", res.verdict, res.metric);
+                if let Some(ref bcmd) = res.bench_cmd {
+                    println!("Bench   : {bcmd}");
+                }
                 println!(
                     "Cmd A   : {:.2} {unit} median (p95 {:.2} {unit}, MAD {:.2} {unit}, n={})  [{}]",
                     res.stats.baseline.median_ms,
@@ -975,7 +1031,11 @@ fn run_cli() -> Result<ExitCode, String> {
                     println!("Warning : {w}");
                 }
             }
-            Ok(ExitCode::SUCCESS)
+            if fail_on_regression && res.verdict == BenchVerdict::Slower {
+                Ok(ExitCode::from(2))
+            } else {
+                Ok(ExitCode::SUCCESS)
+            }
         }
         "demo" => {
             let mut as_json = false;

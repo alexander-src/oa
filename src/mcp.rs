@@ -4,10 +4,10 @@ use serde_json::{json, Value};
 
 use crate::guard::EquivalencePolicy;
 use crate::session::{
-    checkpoint_session, compare_commands, evaluate_session, export_diff, get_ledger, init_session,
-    profile_session, render_markdown_report, render_svg_report, session_status, verify_session,
-    CheckpointAction, CheckpointParams, CompareParams, EvaluateParams, InitParams, MetricTarget,
-    ProfileParams, VerifyParams,
+    checkpoint_session, compare_commands, compare_git_revs, evaluate_session, export_diff,
+    get_ledger, init_session, profile_session, render_markdown_report, render_svg_report,
+    session_status, verify_session, CheckpointAction, CheckpointParams, CompareGitParams,
+    CompareParams, EvaluateParams, InitParams, MetricTarget, ProfileParams, VerifyParams,
 };
 use crate::svg::SvgTheme;
 
@@ -113,11 +113,12 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "oa_profile",
-            "description": "Profile the current working tree and return ranked hotspots with source snippets, allocation sites, bottleneck classification, and optional hotspot deltas vs baseline or best.",
+            "description": "Profile an active session or any standalone command (via cmd) and return ranked hotspots with source snippets, allocation sites, bottleneck classification, and optional hotspot deltas vs baseline or best.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "cmd": { "type": "string", "description": "Optional standalone command to profile without initializing a session." },
                     "mode": { "type": "string", "enum": ["auto", "python", "node", "go", "perf", "sample", "native"] },
                     "top_k": { "type": "integer", "description": "Maximum number of hotspots to return (default 10)." },
                     "diff_from": { "type": "string", "enum": ["baseline", "best"], "description": "Optional baseline or best profile to diff hotspots against." },
@@ -190,22 +191,26 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "oa_compare",
-            "description": "Run a standalone balanced interleaved A/B comparison of any two commands with Mann-Whitney U p-value, 95% bootstrap CI, Peak RSS, and stdout SHA-256 equivalence (no oa_init required).",
+            "description": "Run a standalone balanced interleaved A/B comparison of any two commands (cmd_a + cmd_b) OR two git revisions (git_a + optional git_b + bench_cmd) with Mann-Whitney U p-value, 95% bootstrap CI, Peak RSS, and stdout SHA-256 equivalence.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "cmd_a": { "type": "string", "description": "Baseline/reference shell command." },
-                    "cmd_b": { "type": "string", "description": "Candidate shell command." },
+                    "cmd_a": { "type": "string", "description": "Baseline/reference shell command (when not using git_a)." },
+                    "cmd_b": { "type": "string", "description": "Candidate shell command (when not using git_a)." },
+                    "git_a": { "type": "string", "description": "Base git revision (e.g. 'main' or commit SHA) for detached worktree comparison." },
+                    "git_b": { "type": "string", "description": "Optional candidate git revision (defaults to current working tree)." },
+                    "bench_cmd": { "type": "string", "description": "Benchmark command executed in both revisions when git_a is set." },
+                    "build_cmd": { "type": "string", "description": "Optional build command executed once per worktree when git_a is set." },
+                    "copy_files": { "type": "array", "items": { "type": "string" }, "description": "Optional untracked relative files to copy into detached worktrees." },
                     "metric": { "type": "string", "enum": ["wall", "rss"] },
                     "pairs": { "type": "integer", "description": "Interleaved A/B pairs (default 10)." },
                     "warmup": { "type": "integer", "description": "Warmup pairs (default 2)." },
                     "min_speedup": { "type": "number" },
                     "alpha": { "type": "number" },
                     "pin_core": { "type": "integer" },
-                    "check_output": { "type": "boolean", "description": "Fail if stdout SHA-256 differs between cmd_a and cmd_b." }
-                },
-                "required": ["cmd_a", "cmd_b"]
+                    "check_output": { "type": "boolean", "description": "Fail if stdout SHA-256 differs between A and B." }
+                }
             }
         },
         {
@@ -315,6 +320,7 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
         "oa_profile" => {
             let params = ProfileParams {
                 path: str_arg(args, "path"),
+                cmd: str_arg(args, "cmd"),
                 mode: str_arg(args, "mode"),
                 top_k: args
                     .get("top_k")
@@ -403,44 +409,71 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
             serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
         }
         "oa_compare" => {
-            let cmd_a = str_arg(args, "cmd_a")
-                .ok_or_else(|| "missing required argument 'cmd_a'".to_string())?;
-            let cmd_b = str_arg(args, "cmd_b")
-                .ok_or_else(|| "missing required argument 'cmd_b'".to_string())?;
             let metric = match str_arg(args, "metric") {
                 Some(m) => MetricTarget::parse_str(&m)?,
                 None => MetricTarget::Wall,
             };
-            let params = CompareParams {
-                path: str_arg(args, "path"),
-                cmd_a,
-                cmd_b,
-                metric,
-                pairs: args
-                    .get("pairs")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(10),
-                warmup: args
-                    .get("warmup")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(2),
-                min_speedup: args
-                    .get("min_speedup")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.03),
-                alpha: args.get("alpha").and_then(|v| v.as_f64()).unwrap_or(0.01),
-                pin_core: args
-                    .get("pin_core")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize),
-                check_output: args
-                    .get("check_output")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+            let pairs = args
+                .get("pairs")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(10);
+            let warmup = args
+                .get("warmup")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(2);
+            let min_speedup = args
+                .get("min_speedup")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.03);
+            let alpha = args.get("alpha").and_then(|v| v.as_f64()).unwrap_or(0.01);
+            let pin_core = args
+                .get("pin_core")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let check_output = args
+                .get("check_output")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            let res = if let Some(git_a) = str_arg(args, "git_a") {
+                let bench_cmd = str_arg(args, "bench_cmd").ok_or_else(|| {
+                    "missing required argument 'bench_cmd' when 'git_a' is provided".to_string()
+                })?;
+                compare_git_revs(CompareGitParams {
+                    path: str_arg(args, "path"),
+                    git_a,
+                    git_b: str_arg(args, "git_b"),
+                    bench_cmd,
+                    build_cmd: str_arg(args, "build_cmd"),
+                    copy_files: str_vec_arg(args, "copy_files"),
+                    metric,
+                    pairs,
+                    warmup,
+                    min_speedup,
+                    alpha,
+                    pin_core,
+                    check_output,
+                })?
+            } else {
+                let cmd_a = str_arg(args, "cmd_a")
+                    .ok_or_else(|| "missing required argument 'cmd_a' (or 'git_a')".to_string())?;
+                let cmd_b = str_arg(args, "cmd_b")
+                    .ok_or_else(|| "missing required argument 'cmd_b'".to_string())?;
+                compare_commands(CompareParams {
+                    path: str_arg(args, "path"),
+                    cmd_a,
+                    cmd_b,
+                    metric,
+                    pairs,
+                    warmup,
+                    min_speedup,
+                    alpha,
+                    pin_core,
+                    check_output,
+                })?
             };
-            let res = compare_commands(params)?;
             serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
         }
         "oa_verify" => {
