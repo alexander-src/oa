@@ -18,73 +18,73 @@
   <text x="852" y="34" text-anchor="end" class="hdr-right">interleaved A/B · Mann-Whitney U · exact SHA-256</text>
   <line x1="28" y1="48" x2="852" y2="48" stroke="#eaeef2" stroke-width="1"/>
 
-  <rect x="290" y="60" width="11" height="8" rx="2" fill="#d8dee4"/>
-  <text x="307" y="68" class="legend">Baseline (100%)</text>
-  <rect x="415" y="60" width="11" height="8" rx="2" fill="#1a7f37"/>
-  <text x="432" y="68" class="legend">After oa (wall time)</text>
-  <rect x="556" y="60" width="11" height="8" rx="2" fill="#0969da"/>
-  <text x="573" y="68" class="legend">After oa (peak RSS)</text>
+  <rect x="280" y="60" width="11" height="8" rx="2" fill="#d8dee4"/>
+  <text x="297" y="68" class="legend">Baseline (100%)</text>
+  <rect x="405" y="60" width="11" height="8" rx="2" fill="#1a7f37"/>
+  <text x="422" y="68" class="legend">After oa (wall time)</text>
+  <rect x="546" y="60" width="11" height="8" rx="2" fill="#0969da"/>
+  <text x="563" y="68" class="legend">After oa (peak RSS)</text>
 
   <!-- Row 1: sqlparse 10.5x -->
   <text x="28" y="102" class="repo">andialbrecht/sqlparse</text>
   <text x="28" y="118" class="sub">Python · bench_grouping · 537/537 tests</text>
-  <rect x="290" y="92" width="275" height="10" rx="3" fill="#eaeef2"/>
-  <rect x="290" y="106" width="26" height="10" rx="3" fill="#1a7f37"/>
-  <text x="642" y="108" text-anchor="end" class="gain-wall">10.5x</text>
+  <rect x="280" y="92" width="215" height="10" rx="3" fill="#eaeef2"/>
+  <rect x="280" y="106" width="20" height="10" rx="3" fill="#1a7f37"/>
+  <text x="564" y="108" text-anchor="end" class="gain-wall">10.5x</text>
   <text x="852" y="102" text-anchor="end" class="num">68.1 ms -&gt; 6.5 ms</text>
   <text x="852" y="118" text-anchor="end" class="meta">4.3x to 10.5x upstream · 2.55x E2E</text>
 
   <!-- Row 2: ram_aggregator 8.34x RSS -->
   <text x="28" y="156" class="repo">examples/ram_aggregator</text>
   <text x="28" y="172" class="sub">Python · --metric rss · bundled demo</text>
-  <rect x="290" y="146" width="275" height="10" rx="3" fill="#eaeef2"/>
-  <rect x="290" y="160" width="33" height="10" rx="3" fill="#0969da"/>
-  <text x="642" y="162" text-anchor="end" class="gain-rss">8.34x</text>
+  <rect x="280" y="146" width="215" height="10" rx="3" fill="#eaeef2"/>
+  <rect x="280" y="160" width="26" height="10" rx="3" fill="#0969da"/>
+  <text x="564" y="162" text-anchor="end" class="gain-rss">8.34x</text>
   <text x="852" y="156" text-anchor="end" class="num">160.0 -&gt; 19.2 MiB</text>
   <text x="852" y="172" text-anchor="end" class="meta">-88.0% peak RSS · p = 0.0002</text>
 
   <!-- Row 3: Textualize/rich 3.69x -->
   <text x="28" y="210" class="repo">Textualize/rich</text>
   <text x="28" y="226" class="sub">Python · 52k stars · 954/954 tests</text>
-  <rect x="290" y="200" width="275" height="10" rx="3" fill="#eaeef2"/>
-  <rect x="290" y="214" width="75" height="10" rx="3" fill="#1a7f37"/>
-  <text x="642" y="216" text-anchor="end" class="gain-wall">3.69x</text>
+  <rect x="280" y="200" width="215" height="10" rx="3" fill="#eaeef2"/>
+  <rect x="280" y="214" width="58" height="10" rx="3" fill="#1a7f37"/>
+  <text x="564" y="216" text-anchor="end" class="gain-wall">3.69x</text>
   <text x="852" y="210" text-anchor="end" class="num">1047.8 -&gt; 283.6 ms</text>
   <text x="852" y="226" text-anchor="end" class="meta">2.49x CLI · -20.3% RSS · p = 0.0000</text>
 
   <!-- Row 4: Python-Markdown 1.92x -->
   <text x="28" y="264" class="repo">Python-Markdown/markdown</text>
   <text x="28" y="280" class="sub">Python · docs corpus · 1,230/1,230 tests</text>
-  <rect x="290" y="254" width="275" height="10" rx="3" fill="#eaeef2"/>
-  <rect x="290" y="268" width="143" height="10" rx="3" fill="#1a7f37"/>
-  <text x="642" y="270" text-anchor="end" class="gain-wall">1.92x</text>
+  <rect x="280" y="254" width="215" height="10" rx="3" fill="#eaeef2"/>
+  <rect x="280" y="268" width="112" height="10" rx="3" fill="#1a7f37"/>
+  <text x="564" y="270" text-anchor="end" class="gain-wall">1.92x</text>
   <text x="852" y="264" text-anchor="end" class="num">497.3 -&gt; 258.8 ms</text>
   <text x="852" y="280" text-anchor="end" class="meta">1.53x CLI · p = 0.0000</text>
 
   <!-- Row 5: DaveGamble/cJSON 1.89x -->
   <text x="28" y="318" class="repo">DaveGamble/cJSON</text>
   <text x="28" y="334" class="sub">C (-O3) · 11.5k stars · linux:perf · 19 CTest</text>
-  <rect x="290" y="308" width="275" height="10" rx="3" fill="#eaeef2"/>
-  <rect x="290" y="322" width="146" height="10" rx="3" fill="#1a7f37"/>
-  <text x="642" y="324" text-anchor="end" class="gain-wall">1.89x</text>
+  <rect x="280" y="308" width="215" height="10" rx="3" fill="#eaeef2"/>
+  <rect x="280" y="322" width="114" height="10" rx="3" fill="#1a7f37"/>
+  <text x="564" y="324" text-anchor="end" class="gain-wall">1.89x</text>
   <text x="852" y="318" text-anchor="end" class="num">104.2 -&gt; 55.6 ms</text>
   <text x="852" y="334" text-anchor="end" class="meta">-39.7% insns · -55.7% br-miss · 5.0 IPC</text>
 
   <!-- Row 6: nodeca/js-yaml 1.77x -->
   <text x="28" y="372" class="repo">nodeca/js-yaml</text>
   <text x="28" y="388" class="sub">TS / Node.js · 80M/wk · v8-cpu-prof · 1,633 tests</text>
-  <rect x="290" y="362" width="275" height="10" rx="3" fill="#eaeef2"/>
-  <rect x="290" y="376" width="155" height="10" rx="3" fill="#1a7f37"/>
-  <text x="642" y="378" text-anchor="end" class="gain-wall">1.77x</text>
+  <rect x="280" y="362" width="215" height="10" rx="3" fill="#eaeef2"/>
+  <rect x="280" y="376" width="121" height="10" rx="3" fill="#1a7f37"/>
+  <text x="564" y="378" text-anchor="end" class="gain-wall">1.77x</text>
   <text x="852" y="372" text-anchor="end" class="num">78.3 -&gt; 44.2 ms</text>
   <text x="852" y="388" text-anchor="end" class="meta">1.37x CLI · -32.8% RSS · p = 0.0000</text>
 
   <!-- Row 7: brave/adblock-rust 1.05x -->
   <text x="28" y="426" class="repo">brave/adblock-rust</text>
   <text x="28" y="442" class="sub">Rust · 134k rules · linux:perf · 246 tests</text>
-  <rect x="290" y="416" width="275" height="10" rx="3" fill="#eaeef2"/>
-  <rect x="290" y="430" width="262" height="10" rx="3" fill="#1a7f37"/>
-  <text x="642" y="432" text-anchor="end" class="gain-wall">1.05x</text>
+  <rect x="280" y="416" width="215" height="10" rx="3" fill="#eaeef2"/>
+  <rect x="280" y="430" width="205" height="10" rx="3" fill="#1a7f37"/>
+  <text x="564" y="432" text-anchor="end" class="gain-wall">1.05x</text>
   <text x="852" y="426" text-anchor="end" class="num">142.7 -&gt; 136.1 ms</text>
   <text x="852" y="442" text-anchor="end" class="meta">4 bad edits blocked · 3.05 IPC · p = 0.0002</text>
 
