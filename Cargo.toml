@@ -1,9 +1,10 @@
 [package]
 name = "oa"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Optimize Anything: cross-language profiling, equivalence-gated interleaved benchmarking, and autonomous performance loops for coding agents"
+readme = "README.md"
 license = "MIT"
 repository = "https://github.com/alexander-src/oa"
 homepage = "https://github.com/alexander-src/oa"

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod doctor;
 pub mod git;
 pub mod guard;
 pub mod mcp;

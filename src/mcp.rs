@@ -4,9 +4,9 @@ use serde_json::{json, Value};
 
 use crate::guard::EquivalencePolicy;
 use crate::session::{
-    checkpoint_session, evaluate_session, get_ledger, init_session, profile_session,
-    render_markdown_report, CheckpointAction, CheckpointParams, EvaluateParams, InitParams,
-    MetricTarget, ProfileParams,
+    checkpoint_session, compare_commands, evaluate_session, get_ledger, init_session,
+    profile_session, render_markdown_report, session_status, CheckpointAction, CheckpointParams,
+    CompareParams, EvaluateParams, InitParams, MetricTarget, ProfileParams,
 };
 
 #[derive(Clone, Copy)]
@@ -116,7 +116,7 @@ fn tool_schemas() -> Value {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "mode": { "type": "string", "enum": ["auto", "python", "node", "perf", "native"] },
+                    "mode": { "type": "string", "enum": ["auto", "python", "node", "go", "perf", "sample", "native"] },
                     "top_k": { "type": "integer", "description": "Maximum number of hotspots to return (default 10)." },
                     "diff_from": { "type": "string", "enum": ["baseline", "best"], "description": "Optional baseline or best profile to diff hotspots against." },
                     "skip_build": { "type": "boolean" }
@@ -173,6 +173,36 @@ fn tool_schemas() -> Value {
                     "path": { "type": "string" },
                     "format": { "type": "string", "enum": ["markdown", "json"] }
                 }
+            }
+        },
+        {
+            "name": "oa_status",
+            "description": "Inspect live session status: metric target, cumulative gain, Cheat Guard lock health, modified files vs best, and diff stat vs baseline.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "oa_compare",
+            "description": "Run a standalone balanced interleaved A/B comparison of any two commands with Mann-Whitney U p-value, 95% bootstrap CI, Peak RSS, and stdout SHA-256 equivalence (no oa_init required).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "cmd_a": { "type": "string", "description": "Baseline/reference shell command." },
+                    "cmd_b": { "type": "string", "description": "Candidate shell command." },
+                    "metric": { "type": "string", "enum": ["wall", "rss"] },
+                    "pairs": { "type": "integer", "description": "Interleaved A/B pairs (default 10)." },
+                    "warmup": { "type": "integer", "description": "Warmup pairs (default 2)." },
+                    "min_speedup": { "type": "number" },
+                    "alpha": { "type": "number" },
+                    "pin_core": { "type": "integer" },
+                    "check_output": { "type": "boolean", "description": "Fail if stdout SHA-256 differs between cmd_a and cmd_b." }
+                },
+                "required": ["cmd_a", "cmd_b"]
             }
         }
     ])
@@ -331,6 +361,52 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
             } else {
                 render_markdown_report(path.as_deref())
             }
+        }
+        "oa_status" => {
+            let path = str_arg(args, "path");
+            let res = session_status(path.as_deref())?;
+            serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+        }
+        "oa_compare" => {
+            let cmd_a = str_arg(args, "cmd_a")
+                .ok_or_else(|| "missing required argument 'cmd_a'".to_string())?;
+            let cmd_b = str_arg(args, "cmd_b")
+                .ok_or_else(|| "missing required argument 'cmd_b'".to_string())?;
+            let metric = match str_arg(args, "metric") {
+                Some(m) => MetricTarget::parse_str(&m)?,
+                None => MetricTarget::Wall,
+            };
+            let params = CompareParams {
+                path: str_arg(args, "path"),
+                cmd_a,
+                cmd_b,
+                metric,
+                pairs: args
+                    .get("pairs")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(10),
+                warmup: args
+                    .get("warmup")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(2),
+                min_speedup: args
+                    .get("min_speedup")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.03),
+                alpha: args.get("alpha").and_then(|v| v.as_f64()).unwrap_or(0.01),
+                pin_core: args
+                    .get("pin_core")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize),
+                check_output: args
+                    .get("check_output")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            };
+            let res = compare_commands(params)?;
+            serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown tool '{other}'")),
     }

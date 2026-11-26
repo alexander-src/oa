@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::runner::command_exists;
 use crate::runner::run_command;
 
@@ -915,6 +915,468 @@ fn profile_node(
     parse_v8_cpuprofile(&raw_json, wall_ms, cwd, top_k)
 }
 
+fn detect_go_test_invocation(cmd: &str) -> Option<(String, Vec<String>)> {
+    let trimmed = cmd.trim();
+    if trimmed.contains('|') || trimmed.contains("&&") || trimmed.contains(';') {
+        return None;
+    }
+    let tokens: Vec<String> = trimmed.split_whitespace().map(str::to_string).collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let base = Path::new(&tokens[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if (base == "go" || base == "go.exe") && tokens[1] == "test" {
+        return Some((tokens[0].clone(), tokens[2..].to_vec()));
+    }
+    None
+}
+
+fn parse_pprof_duration_ms(token: &str) -> Option<f64> {
+    let t = token.trim();
+    if let Some(v) = t.strip_suffix("ms") {
+        return v.parse::<f64>().ok();
+    }
+    if let Some(v) = t.strip_suffix("us").or_else(|| t.strip_suffix("µs")) {
+        return v.parse::<f64>().ok().map(|x| x / 1000.0);
+    }
+    if let Some(v) = t.strip_suffix("ns") {
+        return v.parse::<f64>().ok().map(|x| x / 1_000_000.0);
+    }
+    if let Some(v) = t.strip_suffix('s') {
+        return v.parse::<f64>().ok().map(|x| x * 1000.0);
+    }
+    if t == "0" {
+        return Some(0.0);
+    }
+    None
+}
+
+/// Parses `go tool pprof -top` text output into a structured `ProfileReport`.
+pub fn parse_go_pprof_top(
+    raw_text: &str,
+    wall_ms: f64,
+    cwd: &Path,
+    top_k: usize,
+) -> Result<ProfileReport, String> {
+    let mut hotspots = Vec::new();
+    let mut in_table = false;
+
+    for line in raw_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("flat") && trimmed.contains("cum%") {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() < 6 {
+            continue;
+        }
+        let Some(self_ms) = parse_pprof_duration_ms(cols[0]) else {
+            continue;
+        };
+        let Some(self_pct) = cols[1].trim_end_matches('%').parse::<f64>().ok() else {
+            continue;
+        };
+        let Some(cum_ms) = parse_pprof_duration_ms(cols[3]) else {
+            continue;
+        };
+        let Some(cum_pct) = cols[4].trim_end_matches('%').parse::<f64>().ok() else {
+            continue;
+        };
+        let rest = cols[5..].join(" ");
+        let (function, file, line_no) = if let Some((func_part, loc_part)) = rest.rsplit_once(' ') {
+            if loc_part.contains(".go") {
+                let (f, ln) = match loc_part.rsplit_once(':') {
+                    Some((fp, l)) => (fp.to_string(), l.parse::<usize>().unwrap_or(0)),
+                    None => (loc_part.to_string(), 0),
+                };
+                (func_part.to_string(), f, ln)
+            } else {
+                (rest, String::new(), 0)
+            }
+        } else {
+            (rest, String::new(), 0)
+        };
+
+        let in_project = !function.starts_with("runtime.")
+            && !function.starts_with("syscall.")
+            && !function.starts_with("internal/");
+        let snippet = if in_project && !file.is_empty() && hotspots.len() < 5 {
+            read_source_snippet(cwd, &file, line_no, 5)
+        } else {
+            None
+        };
+
+        hotspots.push(Hotspot {
+            function,
+            file,
+            line: line_no,
+            self_ms: (self_ms * 1000.0).round() / 1000.0,
+            cum_ms: (cum_ms * 1000.0).round() / 1000.0,
+            self_pct: (self_pct * 100.0).round() / 100.0,
+            cum_pct: (cum_pct * 100.0).round() / 100.0,
+            calls: 0,
+            in_project,
+            snippet,
+        });
+        if hotspots.len() >= top_k {
+            break;
+        }
+    }
+
+    let (bottleneck_class, diagnosis) = if let Some(top) = hotspots.first() {
+        let lower = top.function.to_ascii_lowercase();
+        if lower.contains("mallocgc") || lower.contains("gcbg") || lower.contains("runtime.gc") {
+            (
+                "GC_OR_ALLOC_BOUND".to_string(),
+                format!(
+                    "Top Go pprof hotspot {} ({:.1}% flat) indicates heap/GC pressure; preallocate slices or reuse buffers with sync.Pool.",
+                    top.function, top.self_pct
+                ),
+            )
+        } else if lower.contains("lock") || lower.contains("futex") || lower.contains("semacquire")
+        {
+            (
+                "LOCK_CONTENTION".to_string(),
+                format!(
+                    "Top Go pprof hotspot {} ({:.1}% flat) indicates mutex/synchronization contention.",
+                    top.function, top.self_pct
+                ),
+            )
+        } else {
+            (
+                "CPU_ALGORITHMIC".to_string(),
+                format!(
+                    "Top Go pprof hotspot {} accounts for {:.1}% flat / {:.1}% cumulative CPU.",
+                    top.function, top.self_pct, top.cum_pct
+                ),
+            )
+        }
+    } else {
+        (
+            "UNKNOWN".to_string(),
+            "No Go pprof samples captured (benchmark may be too short; increase iterations)."
+                .to_string(),
+        )
+    };
+
+    Ok(ProfileReport {
+        profiler: "go:pprof".to_string(),
+        wall_ms,
+        user_ms: None,
+        sys_ms: None,
+        peak_rss_kb: None,
+        peak_alloc_kb: None,
+        bottleneck_class,
+        diagnosis,
+        counters: None,
+        hotspots,
+        alloc_sites: Vec::new(),
+        notes: vec![
+            "Sampling profile via `go test -cpuprofile` + `go tool pprof -top`; use oa_evaluate for unbiased interleaved A/B timings."
+                .to_string(),
+        ],
+    })
+}
+
+fn profile_go(
+    go_bin: &str,
+    test_args: &[String],
+    cwd: &Path,
+    top_k: usize,
+) -> Result<ProfileReport, String> {
+    let seq = PROF_SEQ.fetch_add(1, Ordering::Relaxed);
+    let prof_path =
+        std::env::temp_dir().join(format!("oa_goprof_{}_{}.prof", std::process::id(), seq));
+
+    let mut args = vec![
+        "test".to_string(),
+        format!("-cpuprofile={}", prof_path.to_string_lossy()),
+    ];
+    for a in test_args {
+        if !a.starts_with("-cpuprofile") {
+            args.push(a.clone());
+        }
+    }
+
+    let t0 = std::time::Instant::now();
+    let run_out = Command::new(go_bin)
+        .args(&args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("failed to run Go profiler: {e}"))?;
+    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    if !run_out.status.success() {
+        let _ = fs::remove_file(&prof_path);
+        return Err(format!(
+            "go test -cpuprofile exited {}: {}",
+            run_out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&run_out.stderr)
+                .chars()
+                .take(400)
+                .collect::<String>()
+        ));
+    }
+
+    let top_out = Command::new(go_bin)
+        .args([
+            "tool",
+            "pprof",
+            "-top",
+            "-unit=ms",
+            "-nodecount=30",
+            &prof_path.to_string_lossy(),
+        ])
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("failed to invoke `go tool pprof`: {e}"))?;
+    let _ = fs::remove_file(&prof_path);
+
+    if !top_out.status.success() {
+        return Err(format!(
+            "go tool pprof failed: {}",
+            String::from_utf8_lossy(&top_out.stderr)
+                .chars()
+                .take(400)
+                .collect::<String>()
+        ));
+    }
+
+    let raw = String::from_utf8_lossy(&top_out.stdout);
+    parse_go_pprof_top(&raw, wall_ms, cwd, top_k)
+}
+
+/// Parses macOS `/usr/bin/sample` output into a structured `ProfileReport`.
+///
+/// Supports the standard `Sort by top of stack, same collapsed (when >= 5):`
+/// summary emitted by `sample` as well as direct `Call graph:` leaf lines.
+pub fn parse_macos_sample(
+    raw_text: &str,
+    wall_ms: f64,
+    top_k: usize,
+) -> Result<ProfileReport, String> {
+    let mut entries: Vec<(String, String, u64)> = Vec::new();
+    let mut in_top_of_stack = false;
+
+    for line in raw_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Sort by top of stack") {
+            in_top_of_stack = true;
+            continue;
+        }
+        if !in_top_of_stack {
+            continue;
+        }
+        if trimmed.is_empty()
+            || trimmed.starts_with("Binary Images:")
+            || trimmed.starts_with("Total number in stack")
+        {
+            if !entries.is_empty() {
+                break;
+            }
+            continue;
+        }
+        // Format: "symbol_name  (in binary_name)        142"
+        if let Some((left, count_str)) = trimmed.rsplit_once(char::is_whitespace) {
+            if let Ok(samples) = count_str.trim().parse::<u64>() {
+                let left = left.trim();
+                let (func, bin) = if let Some(idx) = left.rfind("(in ") {
+                    let sym = left[..idx].trim().to_string();
+                    let module = left[idx + 4..].trim_end_matches(')').trim().to_string();
+                    (sym, module)
+                } else {
+                    (left.to_string(), String::new())
+                };
+                if !func.is_empty() && samples > 0 {
+                    entries.push((func, bin, samples));
+                }
+            }
+        }
+    }
+
+    let total_samples: u64 = entries.iter().map(|e| e.2).sum();
+    entries.sort_by_key(|a| std::cmp::Reverse(a.2));
+
+    let mut hotspots = Vec::new();
+    for (func, module, samples) in entries.into_iter().take(top_k) {
+        let pct = if total_samples > 0 {
+            (samples as f64 / total_samples as f64) * 100.0
+        } else {
+            0.0
+        };
+        let self_ms = wall_ms * (pct / 100.0);
+        let in_project = !module.starts_with("libsystem")
+            && !module.starts_with("dyld")
+            && !module.starts_with("CoreFoundation");
+        hotspots.push(Hotspot {
+            function: func,
+            file: module,
+            line: 0,
+            self_ms: (self_ms * 1000.0).round() / 1000.0,
+            cum_ms: (self_ms * 1000.0).round() / 1000.0,
+            self_pct: (pct * 100.0).round() / 100.0,
+            cum_pct: (pct * 100.0).round() / 100.0,
+            calls: samples,
+            in_project,
+            snippet: None,
+        });
+    }
+
+    let (bottleneck_class, diagnosis) = if let Some(top) = hotspots.first() {
+        let lower = top.function.to_ascii_lowercase();
+        if lower.contains("malloc") || lower.contains("free") || lower.contains("realloc") {
+            (
+                "ALLOC_PRESSURE".to_string(),
+                format!(
+                    "Top macOS sample frame {} ({:.1}% samples) indicates allocator pressure.",
+                    top.function, top.self_pct
+                ),
+            )
+        } else if lower.contains("psynch") || lower.contains("ulock") || lower.contains("mutex") {
+            (
+                "LOCK_CONTENTION".to_string(),
+                format!(
+                    "Top macOS sample frame {} ({:.1}% samples) indicates lock/synchronization waiting.",
+                    top.function, top.self_pct
+                ),
+            )
+        } else {
+            (
+                "CPU_ALGORITHMIC".to_string(),
+                format!(
+                    "Top macOS sample frame {} in {} accounts for {:.1}% of stack samples.",
+                    top.function, top.file, top.self_pct
+                ),
+            )
+        }
+    } else {
+        (
+            "UNKNOWN".to_string(),
+            "No macOS sample frames captured (command may have finished before sampling attached)."
+                .to_string(),
+        )
+    };
+
+    Ok(ProfileReport {
+        profiler: "macos:sample".to_string(),
+        wall_ms,
+        user_ms: None,
+        sys_ms: None,
+        peak_rss_kb: None,
+        peak_alloc_kb: None,
+        bottleneck_class,
+        diagnosis,
+        counters: None,
+        hotspots,
+        alloc_sites: Vec::new(),
+        notes: vec![
+            "Sampling profile via macOS /usr/bin/sample (1 ms interval); use oa_evaluate for unbiased interleaved A/B timings."
+                .to_string(),
+        ],
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn profile_macos_native(cmd: &str, cwd: &Path, top_k: usize) -> Result<ProfileReport, String> {
+    let base = run_command(cmd, cwd, None, true)?;
+    if !command_exists("sample") {
+        let (bottleneck_class, diagnosis) = classify_native_profile(&base, None, &[]);
+        return Ok(ProfileReport {
+            profiler: "macos:rusage".to_string(),
+            wall_ms: base.wall_ms,
+            user_ms: base.user_ms,
+            sys_ms: base.sys_ms,
+            peak_rss_kb: base.peak_rss_kb,
+            peak_alloc_kb: None,
+            bottleneck_class,
+            diagnosis,
+            counters: None,
+            hotspots: Vec::new(),
+            alloc_sites: Vec::new(),
+            notes: vec![
+                "macOS `sample` not found; install Xcode Command Line Tools for symbol hotspots."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let seq = PROF_SEQ.fetch_add(1, Ordering::Relaxed);
+    let out_path =
+        std::env::temp_dir().join(format!("oa_sample_{}_{}.txt", std::process::id(), seq));
+
+    let t0 = std::time::Instant::now();
+    let mut child = Command::new("sh")
+        .args(["-c", cmd])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn target for macOS sample: {e}"))?;
+
+    let pid_str = child.id().to_string();
+    let sample_duration_s = ((base.wall_ms / 1000.0).ceil() as u64)
+        .clamp(1, 15)
+        .to_string();
+    let _sample_status = Command::new("sample")
+        .args([
+            &pid_str,
+            &sample_duration_s,
+            "1",
+            "-file",
+            &out_path.to_string_lossy(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let _ = child.wait();
+    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let parsed = fs::read_to_string(&out_path)
+        .ok()
+        .and_then(|raw| parse_macos_sample(&raw, wall_ms, top_k).ok());
+    let _ = fs::remove_file(&out_path);
+
+    if let Some(mut rep) = parsed {
+        if !rep.hotspots.is_empty() {
+            rep.user_ms = base.user_ms;
+            rep.sys_ms = base.sys_ms;
+            rep.peak_rss_kb = base.peak_rss_kb;
+            return Ok(rep);
+        }
+    }
+
+    let (bottleneck_class, diagnosis) = classify_native_profile(&base, None, &[]);
+    Ok(ProfileReport {
+        profiler: "macos:rusage".to_string(),
+        wall_ms: base.wall_ms,
+        user_ms: base.user_ms,
+        sys_ms: base.sys_ms,
+        peak_rss_kb: base.peak_rss_kb,
+        peak_alloc_kb: None,
+        bottleneck_class,
+        diagnosis,
+        counters: None,
+        hotspots: Vec::new(),
+        alloc_sites: Vec::new(),
+        notes: vec![
+            "Command finished too fast for /usr/bin/sample to attach; increase workload duration (>200ms) for symbol-level hotspots."
+                .to_string(),
+        ],
+    })
+}
+
 /// Runs the best available profiler adapter for `cmd` inside `cwd`.
 pub fn run_profile(
     cmd: &str,
@@ -944,10 +1406,29 @@ pub fn run_profile(
         }
     }
 
+    if selected == "go"
+        || selected == "pprof"
+        || (selected == "auto" && detect_go_test_invocation(cmd).is_some())
+    {
+        if let Some((go_bin, test_args)) = detect_go_test_invocation(cmd) {
+            return profile_go(&go_bin, &test_args, cwd, top_k);
+        }
+        if selected == "go" || selected == "pprof" {
+            return Err("go profiler requires a direct 'go test ...' command".to_string());
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         if selected == "auto" || selected == "perf" || selected == "native" {
             return profile_linux_native(cmd, cwd, top_k);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if selected == "auto" || selected == "sample" || selected == "native" {
+            return profile_macos_native(cmd, cwd, top_k);
         }
     }
 

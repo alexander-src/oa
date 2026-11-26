@@ -20,7 +20,7 @@
 
 Coding agents are good at rewriting code and bad at proving it got faster. Left to run ad-hoc `time` commands, they guess at bottlenecks, keep changes inside run-to-run noise, drop edge-case handling, or quietly loosen assertions to make a benchmark pass.
 
-`oa` is a single Rust binary (1.3 MB, `#![forbid(unsafe_code)]`, 2 direct dependencies) that runs as both a local CLI and a stdio MCP server. It locks your tests and benchmark scripts with SHA-256 hashes, profiles the actual hot functions, checks exact output equivalence, and runs balanced interleaved A/B pairs against a detached git shadow worktree of your baseline before recommending a keep or revert.
+`oa` is a single Rust binary (1.4 MB, `#![forbid(unsafe_code)]`, 2 direct dependencies) that runs as both a local CLI and a stdio MCP server. It locks your tests and benchmark scripts with SHA-256 hashes, profiles Python, Node.js, Go, Linux `perf`, and macOS `sample`, verifies exact output equivalence, and runs balanced interleaved A/B pairs against a detached git shadow worktree of your baseline before recommending a keep or revert.
 
 ## Quick start
 
@@ -36,11 +36,11 @@ Or build from source with Cargo:
 cargo install --git https://github.com/alexander-src/oa.git
 ```
 
-Prebuilt binaries for Linux (`x86_64`), macOS (`arm64`), and Windows (`x86_64`) are also attached to [GitHub Releases](https://github.com/alexander-src/oa/releases).
+Prebuilt binaries are attached to [GitHub Releases](https://github.com/alexander-src/oa/releases). Run `oa doctor` after installing to check available profilers, RSS support, and detected coding agents.
 
 ### Connect your agent (MCP)
 
-Register `oa` as an MCP server and install its agent workflow skill in one command (auto-detects Claude Code, Antigravity, Cursor, Gemini CLI, and Codex):
+Register `oa` as an MCP server and install its optimization workflow skill in one command (auto-detects Claude Code, Antigravity, Cursor, Gemini CLI, and Codex):
 
 ```bash
 oa setup
@@ -62,14 +62,29 @@ oa profile --top 12
 oa evaluate --pairs 12
 
 # Keep verified win (updates refs/oa/best) or revert and log the dead end
-oa checkpoint --keep --hypothesis "cache TokenType ancestor sets"
+oa checkpoint --keep --hypothesis "cache per-render Table strings"
 oa checkpoint --revert --hypothesis "switch lexer to finditer" --dead-end "0.96x regression"
 
-# Export a PR-ready Markdown report with ledger, CIs, p-values, and dead ends
+# Check live session health, diff stat, and export a PR-ready Markdown report
+oa status
 oa report
 ```
 
-To reduce memory footprint instead of latency, pass `--metric rss` to `oa init` or `oa evaluate`. Want to try it immediately? Clone this repo and run `oa` on [examples/slow_log_parser](examples/slow_log_parser) (`--metric wall`) or [examples/ram_aggregator](examples/ram_aggregator) (`--metric rss`).
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/oa-terminal-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/oa-terminal-light.svg">
+    <img alt="Real oa evaluate and profile diff terminal output on Textualize/rich" src="docs/assets/oa-terminal-light.svg" width="880">
+  </picture>
+</p>
+
+Need a quick interleaved A/B comparison without initializing a session? Use `oa compare` on any two commands:
+
+```bash
+oa compare "python3 old.py" "python3 new.py" --pairs 15 --check-output
+```
+
+To reduce memory footprint instead of latency, pass `--metric rss` to `oa init`, `oa evaluate`, or `oa compare`. Want to try it immediately? Clone this repo and run `oa` on [examples/slow_log_parser](examples/slow_log_parser) (`--metric wall`) or [examples/ram_aggregator](examples/ram_aggregator) (`--metric rss`).
 
 ## Showcases
 
@@ -86,6 +101,13 @@ Every result below was measured on real code with locked test suites, byte-ident
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td><strong>Textualize/rich</strong><br/><sub>Python · 52k+ stars</sub></td>
+      <td>Wall time<br/><sub>+ Peak RSS</sub></td>
+      <td><strong>3.69x faster</strong> Table render (<code>1047.8&nbsp;→&nbsp;283.6 ms</code>)<br/><sub><strong>2.49x</strong> full CLI incl. cold Python start, <code>-20.3%</code> RAM</sub></td>
+      <td>954/954 pytest pass<br/><sub><code>p = 0.0000</code> · exact ANSI SHA-256</sub></td>
+      <td><a href="docs/showcases/rich.md">Report</a> · <a href="docs/showcases/rich.patch">Patch</a></td>
+    </tr>
     <tr>
       <td><strong>andialbrecht/sqlparse</strong><br/><sub>Python · ~4k stars · 30M+ PyPI/mo</sub></td>
       <td>Wall time<br/><sub>+ Peak RSS</sub></td>
@@ -148,8 +170,12 @@ On every `oa evaluate`, `oa` enforces four gates in order. First, Cheat Guard re
 | `oa_profile` | `oa profile` | Run profiler, return hotspots with source snippets, classify bottleneck, diff vs prior |
 | `oa_evaluate` | `oa evaluate` | Run Cheat Guard, test suite, equivalence gate, and interleaved A/B statistics |
 | `oa_checkpoint` | `oa checkpoint` | Keep verified edit as `refs/oa/best` or revert working tree and log dead end |
+| `oa_status` | `oa status` | Inspect live session metric, lock health, cumulative gain, and diff stat vs baseline |
 | `oa_ledger` | `oa ledger` | Inspect experiment history, Pareto frontier IDs, and recorded dead ends |
 | `oa_report` | `oa report` | Generate a PR-ready Markdown or JSON report |
+| `oa_compare` | `oa compare` | Standalone interleaved A/B comparison of any two commands (no session needed) |
+| - | `oa doctor` | Inspect local profilers, RSS sampling, CPU pinning, and connected agents |
+| - | `oa setup` | Register `oa` MCP server and `SKILL.md` for detected coding agents |
 
 ### Supported profilers
 
@@ -157,14 +183,16 @@ On every `oa evaluate`, `oa` enforces four gates in order. First, Cheat Guard re
 | --- | --- | --- |
 | Python | `cProfile` + `tracemalloc` | Top self/cumulative functions, call counts, source lines, peak traced allocations |
 | Node.js | V8 `--cpu-prof` | Parsed `.cpuprofile` hit shares, call counts, and source snippets |
-| Native Linux (Rust/C/C++/Go) | `perf stat` + `perf record` (auto `:u` rootless fallback) | IPC, branch miss rate, cycles, symbol-level hotspots |
+| Go | `go test -cpuprofile` + `pprof` | Flat/cumulative CPU ms and percentages, `.go` file:line, source snippets, GC/lock classification |
+| Linux native (Rust/C/C++) | `perf stat` + `perf record` (auto `:u` rootless fallback) | IPC, branch miss rate, cycles, symbol-level hotspots |
+| macOS native (Rust/C/C++) | `/usr/bin/sample` (1 ms stack sampler) | Top-of-stack symbol sample counts, alloc/lock classification, `rusage` fallback |
 | Any other binary / OS | `rusage` + timing fallback | Wall latency, peak RSS, and bottleneck classification |
 
 ## Limitations
 
 - `oa` benchmarks commands you can run from a shell; interactive GUI apps and live networked services need a deterministic harness command first.
-- Hardware performance counters (`perf`) are Linux-only today; macOS (`sample`/`xctrace`) and Go `pprof` adapters are tracked as open issues ([#1](https://github.com/alexander-src/oa/issues/1), [#2](https://github.com/alexander-src/oa/issues/2)).
 - Peak RSS sampling (`--metric rss`) uses `/usr/bin/time` or Python `resource.getrusage` on Linux and macOS; Windows peak RSS support is tracked in [#3](https://github.com/alexander-src/oa/issues/3).
+- macOS `/usr/bin/sample` needs workloads longer than ~200 ms to capture stack frames; shorter commands fall back cleanly to `macos:rusage`.
 - Cheat Guard prevents modifying locked files and tests, though it cannot stop a benchmark command that does not actually exercise the target code.
 
 ## FAQ
@@ -190,13 +218,13 @@ Thermal throttling, background daemons, and CPU frequency scaling easily shift s
 <details>
 <summary><strong>Can I optimize memory usage instead of runtime?</strong></summary>
 <br/>
-Yes. Pass <code>--metric rss</code> to <code>oa init</code> or <code>oa evaluate</code>. The interleaved A/B pairs, Mann-Whitney U test, confidence interval, and report then optimize Peak Resident Set Size (KiB) while still running the test suite and exact SHA-256 output gate. See <a href="docs/showcases/ram-aggregator.md">docs/showcases/ram-aggregator.md</a>.
+Yes. Pass <code>--metric rss</code> to <code>oa init</code>, <code>oa evaluate</code>, or <code>oa compare</code>. The interleaved A/B pairs, Mann-Whitney U test, confidence interval, and report then optimize Peak Resident Set Size (KiB) while still running the test suite and exact SHA-256 output gate. See <a href="docs/showcases/ram-aggregator.md">docs/showcases/ram-aggregator.md</a>.
 </details>
 
 <details>
-<summary><strong>How do I contribute a new profiler adapter?</strong></summary>
+<summary><strong>How do I contribute a new profiler adapter or feature?</strong></summary>
 <br/>
-Profiler backends live in <a href="src/profiler.rs"><code>src/profiler.rs</code></a>. See <a href="CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> and the open <code>good first issue</code> tickets for Go <code>pprof</code>, macOS <code>sample</code>, and Windows peak RSS.
+Profiler backends live in <a href="src/profiler.rs"><code>src/profiler.rs</code></a>. See <a href="CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> and the open <code>good first issue</code> tickets.
 </details>
 
 ## License

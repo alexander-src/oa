@@ -294,6 +294,10 @@ pub fn list_tracked_files(root: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
+pub fn diff_stat_refs(root: &Path, from_ref: &str, to_ref: &str) -> String {
+    git_cmd(root, &["diff", "--stat", from_ref, to_ref]).unwrap_or_default()
+}
+
 /// Ensures `.oa/` is excluded via `.git/info/exclude` without dirtying tracked `.gitignore`.
 pub fn ensure_oa_git_excluded(root: &Path) -> Result<(), String> {
     let rel = git_cmd(root, &["rev-parse", "--git-path", "info/exclude"])?;

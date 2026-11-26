@@ -41,4 +41,5 @@ jobs:
         run: |
           ./target/release/oa --version
           ./target/release/oa --help
+          ./target/release/oa doctor
         shell: bash

@@ -86,3 +86,59 @@ fn parses_v8_cpuprofile_hotspots() {
     assert_eq!(rep.hotspots[1].function, "parsePayload");
     assert!(rep.hotspots[1].cum_pct > 99.0);
 }
+
+#[test]
+fn parses_go_pprof_top_hotspots() {
+    use oa::profiler::parse_go_pprof_top;
+    use std::path::Path;
+
+    let sample = "\
+File: app.test
+Type: cpu
+Time: Nov 26, 2026 at 11:00am (UTC)
+Duration: 420ms, Total samples = 380ms (90.48%)
+Showing nodes accounting for 360ms, 94.74% of 380ms total
+      flat  flat%   sum%        cum   cum%
+     210ms 55.26% 55.26%      260ms 68.42%  main.parseRecord parser.go:42
+     110ms 28.95% 84.21%      110ms 28.95%  runtime.mallocgc
+      40ms 10.53% 94.74%      380ms   100%  main.BenchmarkParse parser_test.go:18
+";
+    let rep = parse_go_pprof_top(sample, 420.0, Path::new("/tmp"), 5).expect("parse go pprof");
+    assert_eq!(rep.profiler, "go:pprof");
+    assert_eq!(rep.bottleneck_class, "CPU_ALGORITHMIC");
+    assert_eq!(rep.hotspots.len(), 3);
+    assert_eq!(rep.hotspots[0].function, "main.parseRecord");
+    assert_eq!(rep.hotspots[0].file, "parser.go");
+    assert_eq!(rep.hotspots[0].line, 42);
+    assert!(rep.hotspots[0].in_project);
+    assert!(!rep.hotspots[1].in_project);
+}
+
+#[test]
+fn parses_macos_sample_hotspots() {
+    use oa::profiler::parse_macos_sample;
+
+    let sample = "\
+Sampling process 1234 for 2 seconds with 1 millisecond of run time between samples
+Call graph:
+    200 Thread_1234: Main Thread
+
+Total number in stack (recursive counted multiple, when >=5):
+
+Sort by top of stack, same collapsed (when >= 5):
+        parse_hot_loop  (in oa_bench)        150
+        _platform_memmove$VARIANT$Haswell  (in libsystem_platform.dylib)        30
+        malloc_zone_malloc  (in libsystem_malloc.dylib)        20
+
+Binary Images:
+";
+    let rep = parse_macos_sample(sample, 200.0, 5).expect("parse macos sample");
+    assert_eq!(rep.profiler, "macos:sample");
+    assert_eq!(rep.bottleneck_class, "CPU_ALGORITHMIC");
+    assert_eq!(rep.hotspots.len(), 3);
+    assert_eq!(rep.hotspots[0].function, "parse_hot_loop");
+    assert_eq!(rep.hotspots[0].file, "oa_bench");
+    assert!((rep.hotspots[0].self_pct - 75.0).abs() < 0.01);
+    assert!(rep.hotspots[0].in_project);
+    assert!(!rep.hotspots[1].in_project);
+}

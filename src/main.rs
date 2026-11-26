@@ -4,12 +4,13 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
+use oa::doctor;
 use oa::guard::EquivalencePolicy;
 use oa::mcp;
 use oa::session::{
-    checkpoint_session, evaluate_session, get_ledger, init_session, profile_session,
-    render_markdown_report, CheckpointAction, CheckpointParams, EvalVerdict, EvaluateParams,
-    InitParams, MetricTarget, ProfileParams,
+    checkpoint_session, compare_commands, evaluate_session, get_ledger, init_session,
+    profile_session, render_markdown_report, session_status, CheckpointAction, CheckpointParams,
+    CompareParams, EvalVerdict, EvaluateParams, InitParams, MetricTarget, ProfileParams,
 };
 use oa::setup;
 
@@ -24,8 +25,11 @@ COMMANDS:
   profile     Profile current code, classify bottleneck, and optionally diff hotspots
   evaluate    Run Cheat Guard, tests, equivalence check, and interleaved A/B benchmark (alias: bench)
   checkpoint  Keep a verified optimization or revert to best and log a dead end
+  status      Inspect live session health, Cheat Guard locks, cumulative gain, and diff stat
   ledger      Inspect the experiment ledger, Pareto frontier, and dead ends
   report      Generate a PR-ready Markdown or JSON optimization report
+  compare     Standalone interleaved A/B comparison of any two commands (no session required)
+  doctor      Inspect local profilers (Python, Node, Go, perf, sample), RSS, and agent configs
   setup       Register the oa MCP server and SKILL.md for Claude Code, Antigravity, Cursor, Codex, Gemini CLI
   mcp         Run the stdio JSON-RPC 2.0 MCP server
 
@@ -38,7 +42,7 @@ fn print_subcommand_help(cmd: &str) {
             "USAGE:\n  oa init --bench <CMD> [OPTIONS]\n\nOPTIONS:\n  --bench <CMD>          Benchmark command to optimize (required)\n  --test <CMD>           Test suite command required before keeping changes\n  --build <CMD>          Build command run before profiling/evaluating\n  --profile-cmd <CMD>    Optional command for profiling (defaults to --bench)\n  --metric <wall|rss>    Primary metric: wall (latency ms, default) or rss (peak memory KiB)\n  --output-file <PATH>   Output file path whose SHA-256 must match baseline (repeatable)\n  --lock <PATH>          Extra file locked by Cheat Guard (repeatable)\n  --no-auto-lock         Disable automatic locking of tracked test/bench files\n  --ignore-line <SUBSTR> Ignore lines containing substring during equivalence check (repeatable)\n  --oracle <CMD>         External oracle command used instead of SHA-256 equivalence\n  --min-speedup <RATIO>  Minimum 95% CI lower bound to accept (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha threshold (default 0.01)\n  --warmup <N>           Warmup runs/pairs (default 2)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --pin-core <ID>        Pin benchmark runs to Linux CPU core via taskset\n  --allow-dirty          Allow starting on a dirty working tree\n  --path <DIR>           Target repository directory\n  --json                 Emit raw JSON output"
         ),
         "profile" => println!(
-            "USAGE:\n  oa profile [OPTIONS]\n\nOPTIONS:\n  --mode <auto|python|node|perf|native>  Profiler backend (default auto)\n  --top <N>                              Max hotspots (default 10)\n  --diff-from <baseline|best>            Compare hotspot self-time against baseline or best\n  --skip-build                           Skip build_cmd before profiling\n  --path <DIR>                           Target repository directory\n  --json                                 Emit raw JSON output"
+            "USAGE:\n  oa profile [OPTIONS]\n\nOPTIONS:\n  --mode <auto|python|node|go|perf|sample|native>  Profiler backend (default auto)\n  --top <N>                                        Max hotspots (default 10)\n  --diff-from <baseline|best>                      Compare hotspot self-time against baseline or best\n  --skip-build                                     Skip build_cmd before profiling\n  --path <DIR>                                     Target repository directory\n  --json                                           Emit raw JSON output"
         ),
         "evaluate" | "bench" => println!(
             "USAGE:\n  oa evaluate [OPTIONS]\n\nOPTIONS:\n  --against <best|baseline>  Reference worktree to interleave against (default best)\n  --metric <wall|rss>        Override metric (wall latency ms or rss peak KiB)\n  --pairs <N>                Override interleaved A/B pairs\n  --warmup <N>               Override warmup pairs\n  --min-speedup <RATIO>      Override min speedup threshold\n  --alpha <P>                Override Mann-Whitney alpha\n  --path <DIR>               Target repository directory\n  --json                     Emit raw JSON output"
@@ -52,11 +56,20 @@ fn print_subcommand_help(cmd: &str) {
         "report" => println!(
             "USAGE:\n  oa report [--format md|json] [--out <FILE>] [--path <DIR>]"
         ),
+        "status" => println!(
+            "USAGE:\n  oa status [--path <DIR>] [--json]"
+        ),
+        "compare" => println!(
+            "USAGE:\n  oa compare <CMD_A> <CMD_B> [OPTIONS]\n\nOPTIONS:\n  --metric <wall|rss>    Metric to compare: wall (ms, default) or rss (peak KiB)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --warmup <N>           Warmup pairs (default 2)\n  --min-speedup <RATIO>  Minimum 95% CI lower bound (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha (default 0.01)\n  --pin-core <ID>        Pin runs to Linux CPU core via taskset\n  --check-output         Fail if stdout SHA-256 differs between CMD_A and CMD_B\n  --path <DIR>           Working directory\n  --json                 Emit raw JSON output"
+        ),
+        "doctor" => println!(
+            "USAGE:\n  oa doctor [--json]"
+        ),
         "setup" => println!(
             "USAGE:\n  oa setup [--agent all|claude|antigravity|cursor|gemini|codex] [--dry-run] [--json]"
         ),
         "mcp" => println!(
-            "USAGE:\n  oa mcp\n\nRuns the stdio JSON-RPC 2.0 MCP server (exposes oa_init, oa_profile, oa_evaluate, oa_checkpoint, oa_ledger, oa_report)."
+            "USAGE:\n  oa mcp\n\nRuns the stdio JSON-RPC 2.0 MCP server (exposes oa_init, oa_profile, oa_evaluate, oa_checkpoint, oa_status, oa_ledger, oa_report, oa_compare)."
         ),
         _ => print!("{HELP}"),
     }
@@ -563,6 +576,241 @@ fn run_cli() -> Result<ExitCode, String> {
                 println!("Wrote report to {file}");
             } else {
                 print!("{content}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "status" => {
+            let mut path = None;
+            let mut as_json = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--path" => path = Some(next_val(rest, &mut i, "--path")?),
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown option '{other}' for status")),
+                }
+                i += 1;
+            }
+            let st = session_status(path.as_deref())?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&st).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("oa session: {}", st.repo_root);
+                println!("  Metric    : {:?}", st.metric);
+                println!(
+                    "  Commits   : {} -> {}",
+                    &st.baseline_commit[..10.min(st.baseline_commit.len())],
+                    &st.best_commit[..10.min(st.best_commit.len())]
+                );
+                println!(
+                    "  Wall time : {:.2} ms -> {:.2} ms",
+                    st.baseline_median_ms, st.best_median_ms
+                );
+                if let (Some(b_rss), Some(best_rss)) =
+                    (st.baseline_peak_rss_kb, st.best_peak_rss_kb)
+                {
+                    let pct = if b_rss > 0 {
+                        ((best_rss as f64 - b_rss as f64) / b_rss as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!("  Peak RSS  : {b_rss} KiB -> {best_rss} KiB ({pct:+.1}%)");
+                }
+                println!(
+                    "  Gain      : {:.2}x cumulative ({} kept, {} reverted, Pareto {:?})",
+                    st.cumulative_gain, st.kept_count, st.reverted_count, st.pareto_frontier_ids
+                );
+                println!(
+                    "  Locks     : {} file(s) ({})",
+                    st.locked_files_count,
+                    if st.cheat_guard_ok { "OK" } else { "VIOLATION" }
+                );
+                for v in &st.cheat_violations {
+                    println!("    ! {v}");
+                }
+                if !st.modified_vs_best.is_empty() {
+                    println!("  Dirty     : {}", st.modified_vs_best.join(", "));
+                }
+                if !st.diff_stat_vs_baseline.trim().is_empty() {
+                    println!("  Diff vs baseline:");
+                    for line in st.diff_stat_vs_baseline.lines() {
+                        println!("    {line}");
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "compare" => {
+            let mut positional = Vec::new();
+            let mut metric = MetricTarget::Wall;
+            let mut pairs = 10usize;
+            let mut warmup = 2usize;
+            let mut min_speedup = 1.03;
+            let mut alpha = 0.01;
+            let mut pin_core = None;
+            let mut check_output = false;
+            let mut path = None;
+            let mut as_json = false;
+
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--metric" => {
+                        let v = next_val(rest, &mut i, "--metric")?;
+                        metric = MetricTarget::parse_str(&v)?;
+                    }
+                    "--pairs" => {
+                        let v = next_val(rest, &mut i, "--pairs")?;
+                        pairs = v
+                            .parse()
+                            .map_err(|_| format!("invalid --pairs value '{v}'"))?;
+                    }
+                    "--warmup" => {
+                        let v = next_val(rest, &mut i, "--warmup")?;
+                        warmup = v
+                            .parse()
+                            .map_err(|_| format!("invalid --warmup value '{v}'"))?;
+                    }
+                    "--min-speedup" => {
+                        let v = next_val(rest, &mut i, "--min-speedup")?;
+                        min_speedup = v
+                            .parse()
+                            .map_err(|_| format!("invalid --min-speedup value '{v}'"))?;
+                    }
+                    "--alpha" => {
+                        let v = next_val(rest, &mut i, "--alpha")?;
+                        alpha = v
+                            .parse()
+                            .map_err(|_| format!("invalid --alpha value '{v}'"))?;
+                    }
+                    "--pin-core" => {
+                        let v = next_val(rest, &mut i, "--pin-core")?;
+                        pin_core = Some(
+                            v.parse()
+                                .map_err(|_| format!("invalid --pin-core value '{v}'"))?,
+                        );
+                    }
+                    "--check-output" => check_output = true,
+                    "--path" => path = Some(next_val(rest, &mut i, "--path")?),
+                    "--json" => as_json = true,
+                    other if other.starts_with('-') => {
+                        return Err(format!("unknown option '{other}' for compare"));
+                    }
+                    pos => positional.push(pos.to_string()),
+                }
+                i += 1;
+            }
+
+            if positional.len() != 2 {
+                return Err(
+                    "compare requires exactly two commands: oa compare <CMD_A> <CMD_B>".to_string(),
+                );
+            }
+
+            let res = compare_commands(CompareParams {
+                path,
+                cmd_a: positional[0].clone(),
+                cmd_b: positional[1].clone(),
+                metric,
+                pairs,
+                warmup,
+                min_speedup,
+                alpha,
+                pin_core,
+                check_output,
+            })?;
+
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&res).map_err(|e| e.to_string())?
+                );
+            } else {
+                let unit = match res.metric {
+                    MetricTarget::Wall => "ms",
+                    MetricTarget::Rss => "KiB",
+                };
+                println!("Verdict : {:?} (metric {:?})", res.verdict, res.metric);
+                println!(
+                    "Cmd A   : {:.2} {unit} median (p95 {:.2} {unit}, MAD {:.2} {unit}, n={})  [{}]",
+                    res.stats.baseline.median_ms,
+                    res.stats.baseline.p95_ms,
+                    res.stats.baseline.mad_ms,
+                    res.stats.baseline.count,
+                    res.cmd_a
+                );
+                println!(
+                    "Cmd B   : {:.2} {unit} median (p95 {:.2} {unit}, MAD {:.2} {unit}, n={})  [{}]",
+                    res.stats.candidate.median_ms,
+                    res.stats.candidate.p95_ms,
+                    res.stats.candidate.mad_ms,
+                    res.stats.candidate.count,
+                    res.cmd_b
+                );
+                println!(
+                    "Gain    : {:.2}x paired (95% CI [{:.2}x, {:.2}x], Mann-Whitney p={:.4})",
+                    res.stats.paired_ratio_median,
+                    res.stats.ci95_low,
+                    res.stats.ci95_high,
+                    res.stats.mann_whitney_p
+                );
+                if let (Some(ra), Some(rb)) = (res.peak_rss_a_kb, res.peak_rss_b_kb) {
+                    let pct = if ra > 0 {
+                        ((rb as f64 - ra as f64) / ra as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    println!("PeakRSS : {ra} KiB -> {rb} KiB ({pct:+.1}%)");
+                }
+                println!(
+                    "Output  : {} (A={}.. B={}..)",
+                    if res.outputs_identical {
+                        "identical SHA-256"
+                    } else {
+                        "differs"
+                    },
+                    &res.stdout_sha256_a[..16],
+                    &res.stdout_sha256_b[..16]
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "doctor" => {
+            let mut as_json = false;
+            for arg in rest {
+                match arg.as_str() {
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown option '{other}' for doctor")),
+                }
+            }
+            let rep = doctor::run_doctor();
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "oa {} doctor ({} {} | {}, {} CPUs)",
+                    rep.version,
+                    rep.host.os,
+                    rep.host.arch,
+                    rep.host.cpu_model,
+                    rep.host.logical_cpus
+                );
+                println!("\nTooling & profilers:");
+                for c in &rep.checks {
+                    let mark = if c.available { "ok" } else { "--" };
+                    println!("  [{mark}] {:<28} {}", c.name, c.detail);
+                }
+                println!("\nCoding agents:");
+                for a in &rep.agents {
+                    let mark = if a.available { "ok" } else { "--" };
+                    println!("  [{mark}] {:<14} {}", a.name, a.detail);
+                }
             }
             Ok(ExitCode::SUCCESS)
         }

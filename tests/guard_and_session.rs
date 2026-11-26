@@ -282,6 +282,42 @@ if __name__ == "__main__":
     assert!(md.contains("# oa Optimization Report"));
     assert!(md.contains("replace O(N^2) list scan with set"));
     assert!(md.contains("oa evaluate --against baseline"));
+
+    // 7. Live session_status and doctor self-check.
+    let st = oa::session::session_status(Some(&repo.path_str())).expect("session status");
+    assert!(st.cheat_guard_ok);
+    assert_eq!(st.kept_count, 1);
+    assert_eq!(st.reverted_count, 2);
+    assert!(st.cumulative_gain > 1.5);
+    assert!(st.diff_stat_vs_baseline.contains("work.py"));
+
+    let doc = oa::doctor::run_doctor();
+    assert!(!doc.checks.is_empty());
+    assert!(doc.checks.iter().any(|c| c.name == "git" && c.available));
+}
+
+#[test]
+fn standalone_compare_detects_speedup_and_equivalence() {
+    use oa::session::{compare_commands, CompareParams, MetricTarget};
+    use oa::stats::BenchVerdict;
+
+    let py = python_bin();
+    let res = compare_commands(CompareParams {
+        path: None,
+        cmd_a: format!("{py} -c \"print(sum(i*i for i in range(250000)))\""),
+        cmd_b: format!("{py} -c \"n=249999; print(n*(n+1)*(2*n+1)//6)\""),
+        metric: MetricTarget::Wall,
+        pairs: 6,
+        warmup: 1,
+        min_speedup: 1.05,
+        alpha: 0.05,
+        pin_core: None,
+        check_output: true,
+    })
+    .expect("standalone compare");
+    assert!(res.outputs_identical);
+    assert_eq!(res.verdict, BenchVerdict::Faster);
+    assert!(res.stats.paired_ratio_median > 1.1);
 }
 
 #[cfg(unix)]

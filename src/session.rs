@@ -1229,3 +1229,227 @@ pub fn render_markdown_report(path: Option<&str>) -> Result<String, String> {
     md.push_str("```bash\noa evaluate --against baseline\n```\n");
     Ok(md)
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatus {
+    pub repo_root: String,
+    pub metric: MetricTarget,
+    pub bench_cmd: String,
+    pub test_cmd: Option<String>,
+    pub baseline_commit: String,
+    pub best_commit: String,
+    pub baseline_median_ms: f64,
+    pub best_median_ms: f64,
+    pub baseline_peak_rss_kb: Option<u64>,
+    pub best_peak_rss_kb: Option<u64>,
+    pub cumulative_gain: f64,
+    pub locked_files_count: usize,
+    pub cheat_guard_ok: bool,
+    pub cheat_violations: Vec<String>,
+    pub modified_vs_best: Vec<String>,
+    pub kept_count: usize,
+    pub reverted_count: usize,
+    pub pareto_frontier_ids: Vec<u32>,
+    pub diff_stat_vs_baseline: String,
+}
+
+/// Returns live health, Cheat Guard status, progress, and diff summary of an active session.
+pub fn session_status(path: Option<&str>) -> Result<SessionStatus, String> {
+    let root = resolve_root(path)?;
+    let config: SessionConfig = read_json(&oa_path(&root, "config.json"))?;
+    let baseline: BaselineRecord = read_json(&oa_path(&root, "baseline.json"))?;
+    let locks: FileLocks = read_json(&oa_path(&root, "locks.json"))?;
+    let ledger = get_ledger(path)?;
+
+    let violations = guard::check_locks(&root, &locks);
+    let cheat_violations: Vec<String> = violations
+        .iter()
+        .map(|v| format!("{}: {}", v.path, v.reason))
+        .collect();
+    let modified_vs_best = git::changed_files_vs_ref(&root, REF_BEST)?;
+    let diff_stat_vs_baseline = git::diff_stat_refs(&root, REF_BASELINE, REF_BEST);
+
+    Ok(SessionStatus {
+        repo_root: root.to_string_lossy().to_string(),
+        metric: config.metric,
+        bench_cmd: config.bench_cmd.clone(),
+        test_cmd: config.test_cmd.clone(),
+        baseline_commit: config.baseline_commit.clone(),
+        best_commit: config.best_commit.clone(),
+        baseline_median_ms: baseline.timing.median_ms,
+        best_median_ms: config.best_median_ms,
+        baseline_peak_rss_kb: baseline.peak_rss_kb,
+        best_peak_rss_kb: config.best_peak_rss_kb,
+        cumulative_gain: cumulative_gain(&config, &baseline),
+        locked_files_count: locks.files.len(),
+        cheat_guard_ok: cheat_violations.is_empty(),
+        cheat_violations,
+        modified_vs_best,
+        kept_count: ledger.kept_count,
+        reverted_count: ledger.reverted_count,
+        pareto_frontier_ids: ledger.pareto_frontier_ids,
+        diff_stat_vs_baseline,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct CompareParams {
+    pub path: Option<String>,
+    pub cmd_a: String,
+    pub cmd_b: String,
+    pub metric: MetricTarget,
+    pub pairs: usize,
+    pub warmup: usize,
+    pub min_speedup: f64,
+    pub alpha: f64,
+    pub pin_core: Option<usize>,
+    pub check_output: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompareResult {
+    pub cmd_a: String,
+    pub cmd_b: String,
+    pub metric: MetricTarget,
+    pub verdict: stats::BenchVerdict,
+    pub stats: ComparisonStats,
+    pub peak_rss_a_kb: Option<u64>,
+    pub peak_rss_b_kb: Option<u64>,
+    pub stdout_sha256_a: String,
+    pub stdout_sha256_b: String,
+    pub outputs_identical: bool,
+}
+
+/// Standalone interleaved A/B comparison of any two shell commands (no `oa init` needed).
+pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> {
+    let cwd = match params.path {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?,
+    };
+    let pairs = params.pairs.max(3);
+    let warmup = params.warmup;
+    let measure_rss = params.metric == MetricTarget::Rss;
+
+    // Initial check + SHA-256 + Peak RSS measurement for both commands.
+    let probe_a = runner::run_command(&params.cmd_a, &cwd, params.pin_core, true)?;
+    if probe_a.exit_code != 0 {
+        return Err(format!(
+            "command A exited {}: {}",
+            probe_a.exit_code,
+            String::from_utf8_lossy(&probe_a.stderr)
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ));
+    }
+    let probe_b = runner::run_command(&params.cmd_b, &cwd, params.pin_core, true)?;
+    if probe_b.exit_code != 0 {
+        return Err(format!(
+            "command B exited {}: {}",
+            probe_b.exit_code,
+            String::from_utf8_lossy(&probe_b.stderr)
+                .chars()
+                .take(300)
+                .collect::<String>()
+        ));
+    }
+
+    let sha_a = crate::sha256::sha256_hex(&probe_a.stdout);
+    let sha_b = crate::sha256::sha256_hex(&probe_b.stdout);
+    let outputs_identical = sha_a == sha_b;
+    if params.check_output && !outputs_identical {
+        return Err(format!(
+            "stdout SHA-256 mismatch: A={}.. vs B={}..",
+            &sha_a[..16],
+            &sha_b[..16]
+        ));
+    }
+
+    for i in 0..warmup {
+        if i % 2 == 0 {
+            let _ = runner::run_command(&params.cmd_a, &cwd, params.pin_core, false)?;
+            let _ = runner::run_command(&params.cmd_b, &cwd, params.pin_core, false)?;
+        } else {
+            let _ = runner::run_command(&params.cmd_b, &cwd, params.pin_core, false)?;
+            let _ = runner::run_command(&params.cmd_a, &cwd, params.pin_core, false)?;
+        }
+    }
+
+    let mut samples_a = Vec::with_capacity(pairs);
+    let mut samples_b = Vec::with_capacity(pairs);
+    let mut rss_a_samples = Vec::new();
+    let mut rss_b_samples = Vec::new();
+    if let Some(r) = probe_a.peak_rss_kb {
+        rss_a_samples.push(r);
+    }
+    if let Some(r) = probe_b.peak_rss_kb {
+        rss_b_samples.push(r);
+    }
+
+    for i in 0..pairs {
+        let (out_a, out_b) = if i % 2 == 0 {
+            let a = runner::run_command(&params.cmd_a, &cwd, params.pin_core, measure_rss)?;
+            let b = runner::run_command(&params.cmd_b, &cwd, params.pin_core, measure_rss)?;
+            (a, b)
+        } else {
+            let b = runner::run_command(&params.cmd_b, &cwd, params.pin_core, measure_rss)?;
+            let a = runner::run_command(&params.cmd_a, &cwd, params.pin_core, measure_rss)?;
+            (a, b)
+        };
+        if out_a.exit_code != 0 {
+            return Err(format!("command A failed on pair {}", i + 1));
+        }
+        if out_b.exit_code != 0 {
+            return Err(format!("command B failed on pair {}", i + 1));
+        }
+        if let Some(r) = out_a.peak_rss_kb {
+            rss_a_samples.push(r);
+        }
+        if let Some(r) = out_b.peak_rss_kb {
+            rss_b_samples.push(r);
+        }
+        match params.metric {
+            MetricTarget::Wall => {
+                samples_a.push(out_a.wall_ms);
+                samples_b.push(out_b.wall_ms);
+            }
+            MetricTarget::Rss => {
+                let ra = out_a.peak_rss_kb.ok_or_else(|| {
+                    "peak RSS measurement unavailable on this platform".to_string()
+                })?;
+                let rb = out_b.peak_rss_kb.ok_or_else(|| {
+                    "peak RSS measurement unavailable on this platform".to_string()
+                })?;
+                samples_a.push(ra as f64);
+                samples_b.push(rb as f64);
+            }
+        }
+    }
+
+    let cmp = stats::compare_samples(&samples_a, &samples_b, params.min_speedup, params.alpha);
+    let verdict = cmp.verdict;
+    let peak_rss_a_kb = median_u64(&rss_a_samples);
+    let peak_rss_b_kb = median_u64(&rss_b_samples);
+
+    Ok(CompareResult {
+        cmd_a: params.cmd_a,
+        cmd_b: params.cmd_b,
+        metric: params.metric,
+        verdict,
+        stats: cmp,
+        peak_rss_a_kb,
+        peak_rss_b_kb,
+        stdout_sha256_a: sha_a,
+        stdout_sha256_b: sha_b,
+        outputs_identical,
+    })
+}
+
+fn median_u64(vals: &[u64]) -> Option<u64> {
+    if vals.is_empty() {
+        return None;
+    }
+    let mut s = vals.to_vec();
+    s.sort_unstable();
+    Some(s[s.len() / 2])
+}

@@ -1,0 +1,603 @@
+diff --git a/rich/_emoji_replace.py b/rich/_emoji_replace.py
+index 2557db9..b6f970b 100644
+--- a/rich/_emoji_replace.py
++++ b/rich/_emoji_replace.py
+@@ -4,6 +4,8 @@ from typing import Callable, Match
+ _ReStringMatch = Match[str]  # regex match object
+ _ReSubCallable = Callable[[_ReStringMatch], str]  # Callable invoked by re.sub
+ _EmojiSubMethod = Callable[[_ReSubCallable, str], str]  # Sub method of a compiled re
++_VARIANTS = {"text": "\ufe0e", "emoji": "\ufe0f"}
++_EMOJI_MAP: dict[str, str] | None = None
+ 
+ 
+ def _emoji_replace(
+@@ -12,12 +14,18 @@ def _emoji_replace(
+     _emoji_sub: _EmojiSubMethod = re.compile(r"(:(\S*?)(?:(?:\-)(emoji|text))?:)").sub,
+ ) -> str:
+     """Replace emoji code in text."""
+-    from ._emoji_codes import EMOJI
++    if ":" not in text:
++        return text
+ 
+-    get_emoji = EMOJI.__getitem__
+-    variants = {"text": "\ufe0e", "emoji": "\ufe0f"}
+-    get_variant = variants.get
+-    default_variant_code = variants.get(default_variant, "") if default_variant else ""
++    global _EMOJI_MAP
++    if _EMOJI_MAP is None:
++        from ._emoji_codes import EMOJI
++
++        _EMOJI_MAP = EMOJI
++
++    get_emoji = _EMOJI_MAP.__getitem__
++    get_variant = _VARIANTS.get
++    default_variant_code = _VARIANTS.get(default_variant, "") if default_variant else ""
+ 
+     def do_replace(match: Match[str]) -> str:
+         emoji_code, emoji_name, variant = match.groups()
+diff --git a/rich/cells.py b/rich/cells.py
+index ec30b52..71e2d64 100644
+--- a/rich/cells.py
++++ b/rich/cells.py
+@@ -105,6 +105,8 @@ def cell_len(text: str, unicode_version: str = "auto") -> int:
+     Returns:
+         Length of string in terminal cells.
+     """
++    if text.isascii() and text.isprintable():
++        return len(text)
+     if len(text) < 512:
+         return cached_cell_len(text, unicode_version)
+     return _cell_len(text, unicode_version)
+diff --git a/rich/table.py b/rich/table.py
+index 696bfcd..630c763 100644
+--- a/rich/table.py
++++ b/rich/table.py
+@@ -2,6 +2,7 @@ from dataclasses import dataclass, field, replace
+ from typing import TYPE_CHECKING, Iterable, NamedTuple, Sequence
+ 
+ from . import box, errors
++from .cells import cell_len
+ from ._loop import loop_first_last, loop_last
+ from ._pick import pick_bool
+ from ._ratio import ratio_distribute, ratio_reduce
+@@ -474,9 +475,29 @@ class Table(JupyterMixin):
+             max_width = self.width
+ 
+         extra_width = self._extra_width
++        str_cache: dict[tuple[str, bool | None], Text] = {}
++        column_cells_cache: list[list[_Cell]] = [
++            list(
++                self._get_cells(
++                    console,
++                    column_index,
++                    column,
++                    _str_cache=str_cache,
++                    _options=options,
++                    _table_highlight=self.highlight,
++                )
++            )
++            for column_index, column in enumerate(self.columns)
++        ]
++        measure_cache: dict[int, Measurement] = {}
+ 
+         widths = self._calculate_column_widths(
+-            console, options.update_width(max_width - extra_width)
++            console,
++            options.update_width(max_width - extra_width),
++            _str_cache=str_cache,
++            _table_highlight=self.highlight,
++            _column_cells_cache=column_cells_cache,
++            _measure_cache=measure_cache,
+         )
+         table_width = sum(widths) + extra_width
+ 
+@@ -502,7 +523,13 @@ class Table(JupyterMixin):
+                 style=Style.pick_first(self.title_style, "table.title"),
+                 justify=self.title_justify,
+             )
+-        yield from self._render(console, render_options, widths)
++        yield from self._render(
++            console,
++            render_options,
++            widths,
++            _str_cache=str_cache,
++            _column_cells_cache=column_cells_cache,
++        )
+         if self.caption:
+             yield from render_annotation(
+                 self.caption,
+@@ -511,13 +538,32 @@ class Table(JupyterMixin):
+             )
+ 
+     def _calculate_column_widths(
+-        self, console: "Console", options: "ConsoleOptions"
++        self,
++        console: "Console",
++        options: "ConsoleOptions",
++        _str_cache: dict[tuple[str, bool | None], Text] | None = None,
++        _table_highlight: bool | None = None,
++        _column_cells_cache: list[list[_Cell]] | None = None,
++        _measure_cache: dict[int, Measurement] | None = None,
+     ) -> list[int]:
+         """Calculate the widths of each column, including padding, not including borders."""
+         max_width = options.max_width
+         columns = self.columns
+         width_ranges = [
+-            self._measure_column(console, options, column) for column in columns
++            self._measure_column(
++                console,
++                options,
++                column,
++                _str_cache=_str_cache,
++                _table_highlight=_table_highlight,
++                _cached_cells=(
++                    _column_cells_cache[column._index]
++                    if _column_cells_cache is not None
++                    else None
++                ),
++                _measure_cache=_measure_cache,
++            )
++            for column in columns
+         ]
+         widths = [_range.maximum or 1 for _range in width_ranges]
+ 
+@@ -557,7 +603,19 @@ class Table(JupyterMixin):
+                 table_width = sum(widths)
+ 
+             width_ranges = [
+-                self._measure_column(console, options.update_width(width), column)
++                self._measure_column(
++                    console,
++                    options.update_width(width),
++                    column,
++                    _str_cache=_str_cache,
++                    _table_highlight=_table_highlight,
++                    _cached_cells=(
++                        _column_cells_cache[column._index]
++                        if _column_cells_cache is not None
++                        else None
++                    ),
++                    _measure_cache=_measure_cache,
++                )
+                 for width, column in zip(widths, columns)
+             ]
+             widths = [_range.maximum or 0 for _range in width_ranges]
+@@ -615,7 +673,13 @@ class Table(JupyterMixin):
+         return widths
+ 
+     def _get_cells(
+-        self, console: "Console", column_index: int, column: Column
++        self,
++        console: "Console",
++        column_index: int,
++        column: Column,
++        _str_cache: dict[tuple[str, bool | None], Text] | None = None,
++        _options: "ConsoleOptions | None" = None,
++        _table_highlight: bool | None = None,
+     ) -> Iterable[_Cell]:
+         """Get all the cells with padding and optional header."""
+ 
+@@ -657,19 +721,46 @@ class Table(JupyterMixin):
+         raw_cells: list[tuple[StyleType, "RenderableType"]] = []
+         _append = raw_cells.append
+         get_style = console.get_style
++        if _str_cache is not None and _options is not None:
++            hl = (
++                column.highlight
++                if column.highlight is not None
++                else (_table_highlight if _table_highlight is not None else _options.highlight)
++            )
++            mk = _options.markup
++            render_str = console.render_str
++
++            def resolve(item: "RenderableType") -> "RenderableType":
++                if type(item) is str:
++                    key = (item, hl)
++                    cached = _str_cache.get(key)
++                    if cached is None:
++                        cached = render_str(item, markup=mk, highlight=hl)
++                        _str_cache[key] = cached
++                    return cached
++                return item
++        else:
++            resolve = None
++
+         if self.show_header:
+             header_style = get_style(self.header_style or "") + get_style(
+                 column.header_style
+             )
+-            _append((header_style, column.header))
++            hdr = resolve(column.header) if resolve is not None else column.header
++            _append((header_style, hdr))
+         cell_style = get_style(column.style or "")
+-        for cell in column.cells:
+-            _append((cell_style, cell))
++        if resolve is not None:
++            for cell in column.cells:
++                _append((cell_style, resolve(cell)))
++        else:
++            for cell in column.cells:
++                _append((cell_style, cell))
+         if self.show_footer:
+             footer_style = get_style(self.footer_style or "") + get_style(
+                 column.footer_style
+             )
+-            _append((footer_style, column.footer))
++            ftr = resolve(column.footer) if resolve is not None else column.footer
++            _append((footer_style, ftr))
+ 
+         if any_padding:
+             _Padding = Padding
+@@ -708,6 +799,10 @@ class Table(JupyterMixin):
+         console: "Console",
+         options: "ConsoleOptions",
+         column: Column,
++        _str_cache: dict[tuple[str, bool | None], Text] | None = None,
++        _table_highlight: bool | None = None,
++        _cached_cells: list[_Cell] | None = None,
++        _measure_cache: dict[int, Measurement] | None = None,
+     ) -> Measurement:
+         """Get the minimum and maximum width of the column."""
+ 
+@@ -727,8 +822,54 @@ class Table(JupyterMixin):
+         append_min = min_widths.append
+         append_max = max_widths.append
+         get_render_width = Measurement.get
+-        for cell in self._get_cells(console, column._index, column):
+-            _min, _max = get_render_width(console, options, cell.renderable)
++        _Padding = Padding
++        _Text = Text
++        cell_iter = (
++            _cached_cells
++            if _cached_cells is not None
++            else self._get_cells(
++                console,
++                column._index,
++                column,
++                _str_cache=_str_cache,
++                _options=options,
++                _table_highlight=_table_highlight,
++            )
++        )
++        for cell in cell_iter:
++            rend = cell.renderable
++            if _measure_cache is not None:
++                if type(rend) is _Padding and type(rend.renderable) is _Text:
++                    extra_w = rend.left + rend.right
++                    if max_width - extra_w < 1:
++                        _min, _max = max_width, max_width
++                    else:
++                        tid = id(rend.renderable)
++                        tm = _measure_cache.get(tid)
++                        if tm is None:
++                            tm = rend.renderable.__rich_measure__(console, options).normalize()
++                            _measure_cache[tid] = tm
++                        _min = tm.minimum + extra_w
++                        _max = tm.maximum + extra_w
++                        if _max > max_width:
++                            _max = max_width
++                        if _min > _max:
++                            _min = _max
++                    append_min(_min)
++                    append_max(_max)
++                    continue
++                if type(rend) is _Text:
++                    tid = id(rend)
++                    tm = _measure_cache.get(tid)
++                    if tm is None:
++                        tm = rend.__rich_measure__(console, options).normalize()
++                        _measure_cache[tid] = tm
++                    _max = tm.maximum if tm.maximum <= max_width else max_width
++                    _min = tm.minimum if tm.minimum <= _max else _max
++                    append_min(_min)
++                    append_max(_max)
++                    continue
++            _min, _max = get_render_width(console, options, rend)
+             append_min(_min)
+             append_max(_max)
+ 
+@@ -743,17 +884,31 @@ class Table(JupyterMixin):
+         return measurement
+ 
+     def _render(
+-        self, console: "Console", options: "ConsoleOptions", widths: list[int]
++        self,
++        console: "Console",
++        options: "ConsoleOptions",
++        widths: list[int],
++        _str_cache: dict[tuple[str, bool | None], Text] | None = None,
++        _column_cells_cache: list[list[_Cell]] | None = None,
+     ) -> "RenderResult":
+         table_style = console.get_style(self.style or "")
+ 
+         border_style = table_style + console.get_style(self.border_style or "")
+-        _column_cells = (
+-            self._get_cells(console, column_index, column)
+-            for column_index, column in enumerate(self.columns)
+-        )
+-
+-        row_cells: list[tuple[_Cell, ...]] = list(zip(*_column_cells))
++        if _column_cells_cache is not None:
++            row_cells: list[tuple[_Cell, ...]] = list(zip(*_column_cells_cache))
++        else:
++            _column_cells = (
++                self._get_cells(
++                    console,
++                    column_index,
++                    column,
++                    _str_cache=_str_cache,
++                    _options=options,
++                    _table_highlight=self.highlight,
++                )
++                for column_index, column in enumerate(self.columns)
++            )
++            row_cells = list(zip(*_column_cells))
+         _box = (
+             self.box.substitute(
+                 options, safe=pick_bool(self.safe_box, console.safe_box)
+@@ -799,6 +954,25 @@ class Table(JupyterMixin):
+ 
+         get_row_style = self.get_row_style
+         get_style = console.get_style
++        render_lines = console.render_lines
++        _Padding = Padding
++        _Style = Style
++        col_render_options = [
++            options.update(
++                width=width,
++                justify=column.justify,
++                no_wrap=column.no_wrap,
++                overflow=column.overflow,
++                height=None,
++                highlight=column.highlight,
++            )
++            for width, column in zip(widths, columns)
++        ]
++        inner_options_cache: dict[tuple[int, int], ConsoleOptions] = {}
++        pad_seg_cache: dict[tuple[int, Style], Segment] = {}
++        rendered_text_cache: dict[tuple[int, int, int, Style], list[list[Segment]]] = {}
++        _Text = Text
++        _cell_len = cell_len
+ 
+         for index, (first, last, row_cell) in enumerate(loop_first_last(row_cells)):
+             header_row = first and show_header
+@@ -811,29 +985,146 @@ class Table(JupyterMixin):
+             max_height = 1
+             cells: list[list[list[Segment]]] = []
+             if header_row or footer_row:
+-                row_style = Style.null()
++                row_style = _Style.null()
+             else:
+                 row_style = get_style(
+                     get_row_style(console, index - 1 if show_header else index)
+                 )
+-            for width, cell, column in zip(widths, row_cell, columns):
+-                render_options = options.update(
+-                    width=width,
+-                    justify=column.justify,
+-                    no_wrap=column.no_wrap,
+-                    overflow=column.overflow,
+-                    height=None,
+-                    highlight=column.highlight,
+-                )
+-                lines = console.render_lines(
+-                    cell.renderable,
+-                    render_options,
+-                    style=get_style(cell.style) + row_style,
+-                )
+-                max_height = max(max_height, len(lines))
++            has_row_style = bool(row_style)
++            cell_styles: list[Style] = []
++            for col_idx, (width, cell, render_options) in enumerate(
++                zip(widths, row_cell, col_render_options)
++            ):
++                base_style = cell.style if isinstance(cell.style, _Style) else get_style(cell.style)
++                combined_style = base_style + row_style if has_row_style else base_style
++                cell_styles.append(combined_style)
++                renderable = cell.renderable
++                if (
++                    type(renderable) is _Padding
++                    and renderable.expand
++                    and renderable.style == "none"
++                    and width > renderable.left + renderable.right
++                ):
++                    inner_w = width - renderable.left - renderable.right
++                    inner_rend = renderable.renderable
++                    left_n = renderable.left
++                    right_n = renderable.right
++                    if (
++                        type(inner_rend) is _Text
++                        and not inner_rend._spans
++                        and not inner_rend.style
++                        and not renderable.top
++                        and not renderable.bottom
++                        and "\n" not in inner_rend.plain
++                        and "\t" not in inner_rend.plain
++                    ):
++                        plain = inner_rend.plain
++                        plen = _cell_len(plain)
++                        if plen <= inner_w:
++                            justify = inner_rend.justify or render_options.justify or "default"
++                            if justify in ("default", "left", "right", "center"):
++                                if justify == "default" or (justify == "left" and plen == inner_w):
++                                    inner_segs = (
++                                        [_Segment(plain, combined_style), _Segment(" " * (inner_w - plen), combined_style)]
++                                        if plen < inner_w
++                                        else [_Segment(plain, combined_style)]
++                                    )
++                                elif justify == "left":
++                                    inner_segs = [_Segment(plain + (" " * (inner_w - plen)), combined_style)]
++                                elif justify == "right":
++                                    inner_segs = [_Segment((" " * (inner_w - plen)) + plain, combined_style)]
++                                else:
++                                    excess = inner_w - plen
++                                    lpad = excess // 2
++                                    inner_segs = [_Segment((" " * lpad) + plain + (" " * (excess - lpad)), combined_style)]
++                                if left_n:
++                                    lk = (left_n, combined_style)
++                                    lseg = pad_seg_cache.get(lk)
++                                    if lseg is None:
++                                        lseg = _Segment(" " * left_n, combined_style)
++                                        pad_seg_cache[lk] = lseg
++                                    inner_segs.insert(0, lseg)
++                                if right_n:
++                                    rk = (right_n, combined_style)
++                                    rseg = pad_seg_cache.get(rk)
++                                    if rseg is None:
++                                        rseg = _Segment(" " * right_n, combined_style)
++                                        pad_seg_cache[rk] = rseg
++                                    inner_segs.append(rseg)
++                                cells.append([inner_segs])
++                                continue
++
++                    rkey = (
++                        (id(inner_rend), col_idx, inner_w, combined_style)
++                        if (type(inner_rend) is _Text and not renderable.top and not renderable.bottom)
++                        else None
++                    )
++                    cached_lines = rendered_text_cache.get(rkey) if rkey is not None else None
++                    if cached_lines is not None:
++                        lines = cached_lines
++                        if len(lines) > max_height:
++                            max_height = len(lines)
++                        cells.append(lines)
++                        continue
++
++                    ikey = (col_idx, inner_w)
++                    inner_opts = inner_options_cache.get(ikey)
++                    if inner_opts is None:
++                        inner_opts = render_options.update_width(inner_w)
++                        inner_options_cache[ikey] = inner_opts
++                    lines = render_lines(
++                        inner_rend,
++                        inner_opts,
++                        style=combined_style,
++                        pad=True,
++                    )
++                    if left_n or right_n:
++                        if left_n:
++                            lk = (left_n, combined_style)
++                            left_seg = pad_seg_cache.get(lk)
++                            if left_seg is None:
++                                left_seg = _Segment(" " * left_n, combined_style)
++                                pad_seg_cache[lk] = left_seg
++                        else:
++                            left_seg = None
++                        if right_n:
++                            rk = (right_n, combined_style)
++                            right_seg = pad_seg_cache.get(rk)
++                            if right_seg is None:
++                                right_seg = _Segment(" " * right_n, combined_style)
++                                pad_seg_cache[rk] = right_seg
++                        else:
++                            right_seg = None
++                        if left_seg is not None and right_seg is not None:
++                            lines = [[left_seg, *ln, right_seg] for ln in lines]
++                        elif left_seg is not None:
++                            lines = [[left_seg, *ln] for ln in lines]
++                        else:
++                            assert right_seg is not None
++                            lines = [[*ln, right_seg] for ln in lines]
++                    if renderable.top or renderable.bottom:
++                        bk = (width, combined_style)
++                        blank_seg = pad_seg_cache.get(bk)
++                        if blank_seg is None:
++                            blank_seg = _Segment(" " * width, combined_style)
++                            pad_seg_cache[bk] = blank_seg
++                        if renderable.top:
++                            lines = [[blank_seg] for _ in range(renderable.top)] + lines
++                        if renderable.bottom:
++                            lines = lines + [[blank_seg] for _ in range(renderable.bottom)]
++                    elif rkey is not None:
++                        rendered_text_cache[rkey] = lines
++                else:
++                    lines = render_lines(
++                        renderable,
++                        render_options,
++                        style=combined_style,
++                    )
++                if len(lines) > max_height:
++                    max_height = len(lines)
+                 cells.append(lines)
+ 
+-            row_height = max(len(cell) for cell in cells)
++            row_height = max_height
+ 
+             def align_cell(
+                 cell: list[list[Segment]],
+@@ -853,17 +1144,19 @@ class Table(JupyterMixin):
+                 return _Segment.align_bottom(cell, width, row_height, style)
+ 
+             cells[:] = [
+-                _Segment.set_shape(
++                cell
++                if len(cell) == max_height
++                else _Segment.set_shape(
+                     align_cell(
+                         cell,
+                         _cell.vertical,
+                         width,
+-                        get_style(_cell.style) + row_style,
++                        cstyle,
+                     ),
+                     width,
+                     max_height,
+                 )
+-                for width, _cell, cell, column in zip(widths, row_cell, cells, columns)
++                for width, _cell, cell, cstyle in zip(widths, row_cell, cells, cell_styles)
+             ]
+ 
+             if _box:
+diff --git a/rich/text.py b/rich/text.py
+index 02575df..98d9891 100644
+--- a/rich/text.py
++++ b/rich/text.py
+@@ -681,6 +681,38 @@ class Text(JupyterMixin):
+         justify = self.justify or options.justify or DEFAULT_JUSTIFY
+         overflow = self.overflow or options.overflow or DEFAULT_OVERFLOW
+ 
++        plain = self.plain
++        if "\n" not in plain and "\t" not in plain:
++            width = options.max_width
++            plain_len = cell_len(plain)
++            if plain_len <= width:
++                if not self.style and not self._spans:
++                    if justify == "default" or (justify == "left" and plain_len == width):
++                        yield Segment(plain)
++                        if self.end:
++                            yield Segment(self.end)
++                        return
++                    if justify == "left":
++                        yield Segment(plain + " " * (width - plain_len))
++                        if self.end:
++                            yield Segment(self.end)
++                        return
++                    if justify == "right":
++                        yield Segment(" " * (width - plain_len) + plain)
++                        if self.end:
++                            yield Segment(self.end)
++                        return
++                    if justify == "center":
++                        excess = width - plain_len
++                        left = excess // 2
++                        yield Segment(" " * left + plain + " " * (excess - left))
++                        if self.end:
++                            yield Segment(self.end)
++                        return
++                elif not self.style and justify == "default":
++                    yield from self.render(console, end=self.end)
++                    return
++
+         lines = self.wrap(
+             console,
+             options.max_width,
+@@ -689,6 +721,9 @@ class Text(JupyterMixin):
+             tab_size=tab_size or 8,
+             no_wrap=pick_bool(self.no_wrap, options.no_wrap, False),
+         )
++        if len(lines) == 1 and not lines[0].style:
++            yield from lines[0].render(console, end=self.end)
++            return
+         all_lines = Text("\n").join(lines)
+         yield from all_lines.render(console, end=self.end)
+ 
