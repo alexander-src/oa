@@ -4,7 +4,9 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::runner::{collect_host_info, command_exists, HostInfo};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::runner::command_exists;
+use crate::runner::{collect_host_info, HostInfo};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckItem {
