@@ -1,102 +1,93 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="400" viewBox="0 0 880 400" role="img" aria-label="Verified benchmark gains produced with oa">
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="504" viewBox="0 0 880 504" role="img" aria-label="Verified multi-language speedups and peak RSS reductions measured with oa">
   <style>
-    .bg { fill: #0d1117; stroke: #30363d; stroke-width: 1; }
-    .title { font: 600 15px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #f0f6fc; }
-    .sub { font: 400 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #8b949e; }
-    .row-name { font: 600 13px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #e6edf3; }
-    .row-meta { font: 400 11px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #8b949e; }
-    .bar-base { fill: #21262d; }
-    .bar-fast { fill: #2ea043; }
-    .bar-rss { fill: #58a6ff; }
-    .gain { font: 700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #3fb950; }
-    .gain-rss { font: 700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #79c0ff; }
-    .nums { font: 400 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #8b949e; }
-    .divider { stroke: #21262d; stroke-width: 1; }
-    .foot { font: 400 11px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #8b949e; }
-    .legend { font: 500 11px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #8b949e; }
+    .title { font: 600 15px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #e6edf3; }
+    .hdr-right { font: 400 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #8b949e; }
+    .legend { font: 400 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #8b949e; }
+    .repo { font: 600 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #e6edf3; }
+    .sub { font: 400 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #8b949e; }
+    .gain-wall { font: 700 13.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #3fb950; }
+    .gain-rss { font: 700 13.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #58a6ff; }
+    .num { font: 500 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #c9d1d9; }
+    .meta { font: 400 10.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #8b949e; }
+    .foot { font: 400 11px -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #8b949e; }
   </style>
 
-  <rect x="1" y="1" width="878" height="398" rx="12" class="bg"/>
+  <rect x="1" y="1" width="878" height="502" rx="12" fill="#0d1117" stroke="#30363d" stroke-width="1.2"/>
 
-  <text x="28" y="34" class="title">Verified gains measured with oa</text>
-  <text x="852" y="34" text-anchor="end" class="sub">interleaved A/B · Mann-Whitney U · exact SHA-256</text>
+  <text x="28" y="34" class="title">Verified gains measured with oa (Python · C · Node.js · Rust)</text>
+  <text x="852" y="34" text-anchor="end" class="hdr-right">interleaved A/B · Mann-Whitney U · exact SHA-256</text>
+  <line x1="28" y1="48" x2="852" y2="48" stroke="#21262d" stroke-width="1"/>
 
-  <line x1="28" y1="50" x2="852" y2="50" class="divider"/>
+  <rect x="290" y="60" width="11" height="8" rx="2" fill="#30363d"/>
+  <text x="307" y="68" class="legend">Baseline (100%)</text>
+  <rect x="415" y="60" width="11" height="8" rx="2" fill="#3fb950"/>
+  <text x="432" y="68" class="legend">After oa (wall time)</text>
+  <rect x="556" y="60" width="11" height="8" rx="2" fill="#58a6ff"/>
+  <text x="573" y="68" class="legend">After oa (peak RSS)</text>
 
-  <!-- Legend -->
-  <rect x="266" y="62" width="12" height="8" rx="2" class="bar-base"/>
-  <text x="284" y="70" class="legend">Baseline (100%)</text>
-  <rect x="386" y="62" width="12" height="8" rx="2" class="bar-fast"/>
-  <text x="404" y="70" class="legend">After oa (wall time)</text>
-  <rect x="528" y="62" width="12" height="8" rx="2" class="bar-rss"/>
-  <text x="546" y="70" class="legend">After oa (peak RSS)</text>
+  <!-- Row 1: sqlparse 10.5x -->
+  <text x="28" y="102" class="repo">andialbrecht/sqlparse</text>
+  <text x="28" y="118" class="sub">Python · bench_grouping · 537/537 tests</text>
+  <rect x="290" y="92" width="275" height="10" rx="3" fill="#21262d"/>
+  <rect x="290" y="106" width="26" height="10" rx="3" fill="#3fb950"/>
+  <text x="642" y="108" text-anchor="end" class="gain-wall">10.5x</text>
+  <text x="852" y="102" text-anchor="end" class="num">68.1 ms -&gt; 6.5 ms</text>
+  <text x="852" y="118" text-anchor="end" class="meta">4.3x to 10.5x upstream · 2.55x E2E</text>
 
-  <!-- Row 1: sqlparse bench_grouping 10.5x (9.5%) -->
-  <g transform="translate(0, 88)">
-    <text x="28" y="14" class="row-name">sqlparse · bench_grouping</text>
-    <text x="28" y="30" class="row-meta">upstream suite, n=2000 · 537/537 tests</text>
-    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
-    <rect x="266" y="20" width="32" height="10" rx="4" class="bar-fast"/>
-    <text x="622" y="16" class="gain">10.5x</text>
-    <text x="852" y="16" text-anchor="end" class="nums">68.1 ms -&gt; 6.5 ms</text>
-    <text x="852" y="31" text-anchor="end" class="row-meta">4.3x to 10.5x across upstream suite</text>
-  </g>
+  <!-- Row 2: ram_aggregator 8.34x RSS -->
+  <text x="28" y="156" class="repo">examples/ram_aggregator</text>
+  <text x="28" y="172" class="sub">Python · --metric rss · bundled demo</text>
+  <rect x="290" y="146" width="275" height="10" rx="3" fill="#21262d"/>
+  <rect x="290" y="160" width="33" height="10" rx="3" fill="#58a6ff"/>
+  <text x="642" y="162" text-anchor="end" class="gain-rss">8.34x</text>
+  <text x="852" y="156" text-anchor="end" class="num">160.0 -&gt; 19.2 MiB</text>
+  <text x="852" y="172" text-anchor="end" class="meta">-88.0% peak RSS · p = 0.0002</text>
 
-  <!-- Row 2: slow_log_parser 9.13x (10.9%) -->
-  <g transform="translate(0, 136)">
-    <text x="28" y="14" class="row-name">examples/slow_log_parser</text>
-    <text x="28" y="30" class="row-meta">bundled demo · wall latency</text>
-    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
-    <rect x="266" y="20" width="37" height="10" rx="4" class="bar-fast"/>
-    <text x="622" y="16" class="gain">9.13x</text>
-    <text x="852" y="16" text-anchor="end" class="nums">512.7 ms -&gt; 55.7 ms</text>
-    <text x="852" y="31" text-anchor="end" class="row-meta">p = 0.0002 · exact SHA-256</text>
-  </g>
+  <!-- Row 3: Textualize/rich 3.69x -->
+  <text x="28" y="210" class="repo">Textualize/rich</text>
+  <text x="28" y="226" class="sub">Python · 52k stars · 954/954 tests</text>
+  <rect x="290" y="200" width="275" height="10" rx="3" fill="#21262d"/>
+  <rect x="290" y="214" width="75" height="10" rx="3" fill="#3fb950"/>
+  <text x="642" y="216" text-anchor="end" class="gain-wall">3.69x</text>
+  <text x="852" y="210" text-anchor="end" class="num">1047.8 -&gt; 283.6 ms</text>
+  <text x="852" y="226" text-anchor="end" class="meta">2.49x CLI · -20.3% RSS · p = 0.0000</text>
 
-  <!-- Row 3: ram_aggregator 8.34x (12.0%) -->
-  <g transform="translate(0, 184)">
-    <text x="28" y="14" class="row-name">examples/ram_aggregator</text>
-    <text x="28" y="30" class="row-meta">bundled demo · --metric rss</text>
-    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
-    <rect x="266" y="20" width="41" height="10" rx="4" class="bar-rss"/>
-    <text x="622" y="16" class="gain-rss">8.34x</text>
-    <text x="852" y="16" text-anchor="end" class="nums">160.0 -&gt; 19.2 MiB</text>
-    <text x="852" y="31" text-anchor="end" class="row-meta">-88.0% peak RSS · p = 0.0002</text>
-  </g>
+  <!-- Row 4: Python-Markdown 1.92x -->
+  <text x="28" y="264" class="repo">Python-Markdown/markdown</text>
+  <text x="28" y="280" class="sub">Python · docs corpus · 1,230/1,230 tests</text>
+  <rect x="290" y="254" width="275" height="10" rx="3" fill="#21262d"/>
+  <rect x="290" y="268" width="143" height="10" rx="3" fill="#3fb950"/>
+  <text x="642" y="270" text-anchor="end" class="gain-wall">1.92x</text>
+  <text x="852" y="264" text-anchor="end" class="num">497.3 -&gt; 258.8 ms</text>
+  <text x="852" y="280" text-anchor="end" class="meta">1.53x CLI · p = 0.0000</text>
 
-  <!-- Row 4: Textualize/rich 3.69x (27.1%) -->
-  <g transform="translate(0, 232)">
-    <text x="28" y="14" class="row-name">Textualize/rich (52k stars)</text>
-    <text x="28" y="30" class="row-meta">400-row Table render · 954/954 tests</text>
-    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
-    <rect x="266" y="20" width="92" height="10" rx="4" class="bar-fast"/>
-    <text x="622" y="16" class="gain">3.69x</text>
-    <text x="852" y="16" text-anchor="end" class="nums">1047.8 -&gt; 283.6 ms</text>
-    <text x="852" y="31" text-anchor="end" class="row-meta">2.49x CLI · -20.3% peak RSS · p = 0.0000</text>
-  </g>
+  <!-- Row 5: DaveGamble/cJSON 1.89x -->
+  <text x="28" y="318" class="repo">DaveGamble/cJSON</text>
+  <text x="28" y="334" class="sub">C (-O3) · 11.5k stars · linux:perf · 19 CTest</text>
+  <rect x="290" y="308" width="275" height="10" rx="3" fill="#21262d"/>
+  <rect x="290" y="322" width="146" height="10" rx="3" fill="#3fb950"/>
+  <text x="642" y="324" text-anchor="end" class="gain-wall">1.89x</text>
+  <text x="852" y="318" text-anchor="end" class="num">104.2 -&gt; 55.6 ms</text>
+  <text x="852" y="334" text-anchor="end" class="meta">-39.7% insns · -55.7% br-miss · 5.0 IPC</text>
 
-  <!-- Row 5: sqlparse format 2.55x (39.3%) -->
-  <g transform="translate(0, 280)">
-    <text x="28" y="14" class="row-name">andialbrecht/sqlparse</text>
-    <text x="28" y="30" class="row-meta">sqlparse.format · 537/537 tests</text>
-    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
-    <rect x="266" y="20" width="133" height="10" rx="4" class="bar-fast"/>
-    <text x="622" y="16" class="gain">2.55x</text>
-    <text x="852" y="16" text-anchor="end" class="nums">253.9 ms -&gt; 99.8 ms</text>
-    <text x="852" y="31" text-anchor="end" class="row-meta">p = 0.0000 · -7.9% peak RSS</text>
-  </g>
+  <!-- Row 6: nodeca/js-yaml 1.77x -->
+  <text x="28" y="372" class="repo">nodeca/js-yaml</text>
+  <text x="28" y="388" class="sub">TS / Node.js · 80M/wk · v8-cpu-prof · 1,633 tests</text>
+  <rect x="290" y="362" width="275" height="10" rx="3" fill="#21262d"/>
+  <rect x="290" y="376" width="155" height="10" rx="3" fill="#3fb950"/>
+  <text x="642" y="378" text-anchor="end" class="gain-wall">1.77x</text>
+  <text x="852" y="372" text-anchor="end" class="num">78.3 -&gt; 44.2 ms</text>
+  <text x="852" y="388" text-anchor="end" class="meta">1.37x CLI · -32.8% RSS · p = 0.0000</text>
 
-  <!-- Row 6: Python-Markdown 1.92x convert (52.0%) -->
-  <g transform="translate(0, 328)">
-    <text x="28" y="14" class="row-name">Python-Markdown/markdown</text>
-    <text x="28" y="30" class="row-meta">docs corpus convert · 1,230/1,230 tests</text>
-    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
-    <rect x="266" y="20" width="177" height="10" rx="4" class="bar-fast"/>
-    <text x="622" y="16" class="gain">1.92x</text>
-    <text x="852" y="16" text-anchor="end" class="nums">497.3 ms -&gt; 258.8 ms</text>
-    <text x="852" y="31" text-anchor="end" class="row-meta">1.53x full CLI · p = 0.0000</text>
-  </g>
+  <!-- Row 7: brave/adblock-rust 1.05x -->
+  <text x="28" y="426" class="repo">brave/adblock-rust</text>
+  <text x="28" y="442" class="sub">Rust · 134k rules · linux:perf · 246 tests</text>
+  <rect x="290" y="416" width="275" height="10" rx="3" fill="#21262d"/>
+  <rect x="290" y="430" width="262" height="10" rx="3" fill="#3fb950"/>
+  <text x="642" y="432" text-anchor="end" class="gain-wall">1.05x</text>
+  <text x="852" y="426" text-anchor="end" class="num">142.7 -&gt; 136.1 ms</text>
+  <text x="852" y="442" text-anchor="end" class="meta">4 bad edits blocked · 3.05 IPC · p = 0.0002</text>
 
-  <line x1="28" y1="374" x2="852" y2="374" class="divider"/>
-  <text x="28" y="390" class="foot">Shorter bars are better. Full patches, benchmark scripts, and rejected dead ends live under docs/showcases/.</text>
+  <line x1="28" y1="464" x2="852" y2="464" stroke="#21262d" stroke-width="1"/>
+  <text x="28" y="486" class="foot">Shorter bars are better. Full patches, perf counters, and rejected dead ends live under docs/showcases/.</text>
 </svg>

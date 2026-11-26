@@ -166,6 +166,8 @@ pub struct SessionConfig {
     pub best_commit: String,
     pub best_median_ms: f64,
     pub best_peak_rss_kb: Option<u64>,
+    #[serde(default)]
+    pub best_cumulative_gain: Option<f64>,
     pub pre_session_ref: Option<String>,
 }
 
@@ -252,6 +254,8 @@ pub struct EvalRecord {
     pub candidate_peak_rss_kb: Option<u64>,
     pub reference_peak_rss_kb: Option<u64>,
     pub changed_files: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,6 +320,11 @@ pub struct LedgerResponse {
 }
 
 fn cumulative_gain(config: &SessionConfig, baseline: &BaselineRecord) -> f64 {
+    if let Some(paired) = config.best_cumulative_gain {
+        if paired.is_finite() && paired > 0.0 {
+            return paired;
+        }
+    }
     match config.metric {
         MetricTarget::Wall => {
             if config.best_median_ms > 1e-9 {
@@ -518,6 +527,7 @@ pub fn init_session(params: InitParams) -> Result<InitReport, String> {
         best_commit: baseline_commit.clone(),
         best_median_ms: timing.median_ms,
         best_peak_rss_kb: snap_outcome.peak_rss_kb,
+        best_cumulative_gain: Some(1.0),
         pre_session_ref,
     };
 
@@ -642,6 +652,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
             candidate_peak_rss_kb: None,
             reference_peak_rss_kb: None,
             changed_files,
+            warnings: Vec::new(),
         };
         write_json(&oa_path(&root, "last_eval.json"), &rec)?;
         return Ok(rec);
@@ -672,6 +683,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
                 candidate_peak_rss_kb: None,
                 reference_peak_rss_kb: None,
                 changed_files,
+                warnings: Vec::new(),
             };
             write_json(&oa_path(&root, "last_eval.json"), &rec)?;
             return Ok(rec);
@@ -714,6 +726,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
                 candidate_peak_rss_kb: None,
                 reference_peak_rss_kb: None,
                 changed_files,
+                warnings: Vec::new(),
             };
             write_json(&oa_path(&root, "last_eval.json"), &rec)?;
             return Ok(rec);
@@ -751,6 +764,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
             candidate_peak_rss_kb,
             reference_peak_rss_kb: None,
             changed_files,
+            warnings: Vec::new(),
         };
         write_json(&oa_path(&root, "last_eval.json"), &rec)?;
         return Ok(rec);
@@ -830,12 +844,11 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
             (Some(b), Some(c)) if c > 0 => b as f64 / c as f64,
             _ => cmp.paired_ratio_median,
         }
-    } else if cmp.candidate.median_ms > 1e-9 {
-        baseline.timing.median_ms / cmp.candidate.median_ms
     } else {
-        1.0
+        cumulative_gain(&config, &baseline) * cmp.paired_ratio_median
     };
 
+    let warnings = collect_noise_warnings(&cmp, metric);
     let rec = EvalRecord {
         evaluated_at_unix: now_unix(),
         tree_fingerprint,
@@ -853,6 +866,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
         candidate_peak_rss_kb,
         reference_peak_rss_kb,
         changed_files,
+        warnings,
     };
 
     write_json(&oa_path(&root, "last_eval.json"), &rec)?;
@@ -943,6 +957,9 @@ pub fn checkpoint_session(params: CheckpointParams) -> Result<CheckpointResponse
             }
             if eval.candidate_peak_rss_kb.is_some() {
                 config.best_peak_rss_kb = eval.candidate_peak_rss_kb;
+            }
+            if let Some(vs_base) = eval.speedup_vs_baseline {
+                config.best_cumulative_gain = Some(vs_base);
             }
             write_json(&oa_path(&root, "config.json"), &config)?;
 
@@ -1226,8 +1243,189 @@ pub fn render_markdown_report(path: Option<&str>) -> Result<String, String> {
     }
 
     md.push_str("## Reproduce\n\n");
-    md.push_str("```bash\noa evaluate --against baseline\n```\n");
+    md.push_str("```bash\noa verify\noa evaluate --against baseline\n```\n");
     Ok(md)
+}
+
+/// Renders a dark or light SVG chart of the current optimization session.
+pub fn render_svg_report(
+    path: Option<&str>,
+    theme: crate::svg::SvgTheme,
+) -> Result<String, String> {
+    let root = resolve_root(path)?;
+    let config: SessionConfig = read_json(&oa_path(&root, "config.json"))?;
+    let baseline: BaselineRecord = read_json(&oa_path(&root, "baseline.json"))?;
+    let locks: FileLocks = read_json(&oa_path(&root, "locks.json"))?;
+    let ledger = get_ledger(path)?;
+
+    let repo_name = root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+
+    let (baseline_value, best_value) = match config.metric {
+        MetricTarget::Wall => (ledger.baseline_median_ms, ledger.best_median_ms),
+        MetricTarget::Rss => (
+            baseline.peak_rss_kb.unwrap_or(0) as f64,
+            config
+                .best_peak_rss_kb
+                .or(baseline.peak_rss_kb)
+                .unwrap_or(0) as f64,
+        ),
+    };
+
+    let mut steps = Vec::new();
+    for e in ledger.entries.iter().filter(|e| e.action == "KEPT") {
+        let val = match config.metric {
+            MetricTarget::Wall => e.candidate_median_ms.unwrap_or(ledger.best_median_ms),
+            MetricTarget::Rss => e
+                .candidate_peak_rss_kb
+                .map(|v| v as f64)
+                .or(e.candidate_median_ms)
+                .unwrap_or(best_value),
+        };
+        let gain = if val > 1e-9 && baseline_value > 1e-9 {
+            baseline_value / val
+        } else {
+            e.speedup_vs_baseline.unwrap_or(1.0)
+        };
+        let subtitle = if e.changed_files.is_empty() {
+            format!("#{} kept", e.id)
+        } else {
+            format!("#{} {}", e.id, e.changed_files.join(", "))
+        };
+        steps.push(crate::svg::SvgStep {
+            label: e.hypothesis.clone(),
+            subtitle,
+            value: val,
+            gain,
+            p_value: e.mann_whitney_p,
+        });
+    }
+
+    let data = crate::svg::SvgChartData {
+        repo_name,
+        metric: config.metric,
+        baseline_value,
+        best_value,
+        cumulative_gain: ledger.cumulative_speedup,
+        rss_before_kb: baseline.peak_rss_kb,
+        rss_after_kb: config.best_peak_rss_kb,
+        sha256_prefix: baseline.output_snapshot.stdout_sha256[..16].to_string(),
+        locked_files: locks.files.len(),
+        kept_count: ledger.kept_count,
+        reverted_count: ledger.reverted_count,
+        steps,
+    };
+
+    Ok(crate::svg::render_session_svg(&data, theme))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VerifyParams {
+    pub path: Option<String>,
+    pub metric: Option<MetricTarget>,
+    pub pairs: Option<usize>,
+    pub warmup: Option<usize>,
+    pub min_speedup: Option<f64>,
+    pub alpha: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyReport {
+    pub passed: bool,
+    pub badge: String,
+    pub locked_files_count: usize,
+    pub cheat_guard_ok: bool,
+    pub evaluation: EvalRecord,
+}
+
+/// Runs a fresh end-to-end verification of HEAD against `refs/oa/baseline` (CI / PR gate).
+pub fn verify_session(params: VerifyParams) -> Result<VerifyReport, String> {
+    let root = resolve_root(params.path.as_deref())?;
+    let locks: FileLocks = read_json(&oa_path(&root, "locks.json"))?;
+    let locked_files_count = locks.files.len();
+
+    let eval = evaluate_session(EvaluateParams {
+        path: params.path,
+        compare_against: Some("baseline".to_string()),
+        metric: params.metric,
+        pairs: Some(params.pairs.unwrap_or(15)),
+        warmup: params.warmup,
+        min_speedup: params.min_speedup,
+        alpha: params.alpha,
+    })?;
+
+    let cheat_guard_ok = eval.tamper_violations.is_empty();
+    let passed = eval.verdict == EvalVerdict::KeepRecommended && cheat_guard_ok;
+    if passed {
+        if let Ok(mut cfg) = read_json::<SessionConfig>(&oa_path(&root, "config.json")) {
+            if let Some(ref st) = eval.stats {
+                cfg.best_cumulative_gain = Some(st.paired_ratio_median);
+                if eval.metric == MetricTarget::Wall {
+                    cfg.best_median_ms = st.candidate.median_ms;
+                }
+            }
+            if eval.candidate_peak_rss_kb.is_some() {
+                cfg.best_peak_rss_kb = eval.candidate_peak_rss_kb;
+            }
+            let _ = write_json(&oa_path(&root, "config.json"), &cfg);
+        }
+    }
+
+    let badge = if passed {
+        let st = eval.stats.as_ref();
+        let metric_name = match eval.metric {
+            MetricTarget::Wall => "wall",
+            MetricTarget::Rss => "peak RSS",
+        };
+        let gain_part = st
+            .map(|s| {
+                format!(
+                    "{:.2}x {metric_name} (95% CI [{:.2}x, {:.2}x], p={:.4})",
+                    s.paired_ratio_median, s.ci95_low, s.ci95_high, s.mann_whitney_p
+                )
+            })
+            .unwrap_or_else(|| "verified".to_string());
+        let rss_part = match (eval.reference_peak_rss_kb, eval.candidate_peak_rss_kb) {
+            (Some(r), Some(c)) if r > 0 && eval.metric == MetricTarget::Wall => {
+                let pct = ((c as f64 - r as f64) / r as f64) * 100.0;
+                format!(", {pct:+.1}% peak RSS")
+            }
+            _ => String::new(),
+        };
+        format!(
+            "VERIFIED: {gain_part}{rss_part}, SHA-256 exact, {locked_files_count} locked file(s) intact"
+        )
+    } else {
+        format!("FAILED ({:?}): {}", eval.verdict, eval.reason)
+    };
+
+    Ok(VerifyReport {
+        passed,
+        badge,
+        locked_files_count,
+        cheat_guard_ok,
+        evaluation: eval,
+    })
+}
+
+fn collect_noise_warnings(cmp: &ComparisonStats, metric: MetricTarget) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if metric == MetricTarget::Wall && cmp.candidate.median_ms < 15.0 {
+        warnings.push(format!(
+            "candidate median is {:.2} ms (<15 ms); process spawn overhead may dilute ratios (increase inner workload iterations for cleaner signal)",
+            cmp.candidate.median_ms
+        ));
+    }
+    if cmp.baseline.cv_pct > 8.0 || cmp.candidate.cv_pct > 8.0 {
+        warnings.push(format!(
+            "elevated run-to-run variance detected (ref CV {:.1}%, cand CV {:.1}%); consider --pin-core or more --pairs",
+            cmp.baseline.cv_pct, cmp.candidate.cv_pct
+        ));
+    }
+    warnings
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1318,6 +1516,8 @@ pub struct CompareResult {
     pub stdout_sha256_a: String,
     pub stdout_sha256_b: String,
     pub outputs_identical: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// Standalone interleaved A/B comparison of any two shell commands (no `oa init` needed).
@@ -1428,6 +1628,7 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
 
     let cmp = stats::compare_samples(&samples_a, &samples_b, params.min_speedup, params.alpha);
     let verdict = cmp.verdict;
+    let warnings = collect_noise_warnings(&cmp, params.metric);
     let peak_rss_a_kb = median_u64(&rss_a_samples);
     let peak_rss_b_kb = median_u64(&rss_b_samples);
 
@@ -1442,7 +1643,56 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
         stdout_sha256_a: sha_a,
         stdout_sha256_b: sha_b,
         outputs_identical,
+        warnings,
     })
+}
+
+/// Formats a standalone `oa compare` result as a GitHub-flavored Markdown table.
+pub fn render_compare_markdown(res: &CompareResult) -> String {
+    let unit = res.metric.unit();
+    let rss_row = match (res.peak_rss_a_kb, res.peak_rss_b_kb) {
+        (Some(a), Some(b)) if a > 0 => {
+            let pct = ((b as f64 - a as f64) / a as f64) * 100.0;
+            format!("| Peak RSS | {a} KiB | {b} KiB | {pct:+.1}% |\n")
+        }
+        _ => String::new(),
+    };
+    let eq_status = if res.outputs_identical {
+        format!("identical (`{}`)", &res.stdout_sha256_a[..16])
+    } else {
+        format!(
+            "differs (`{}` vs `{}`)",
+            &res.stdout_sha256_a[..16],
+            &res.stdout_sha256_b[..16]
+        )
+    };
+    format!(
+        "### oa compare (`{:?}`)\n\n\
+         - **Cmd A:** `{}`\n\
+         - **Cmd B:** `{}`\n\
+         - **Output SHA-256:** {}\n\n\
+         | Metric | Cmd A | Cmd B | Result |\n\
+         | --- | ---: | ---: | ---: |\n\
+         | Median ({unit}) | {:.2} | {:.2} | **{:.2}x** |\n\
+         | p95 / MAD ({unit}) | {:.2} / {:.2} | {:.2} / {:.2} | 95% CI [{:.2}x, {:.2}x] |\n\
+         {rss_row}\
+         | Significance | n={} pairs | Mann-Whitney U | `p = {:.4}` |\n",
+        res.verdict,
+        res.cmd_a,
+        res.cmd_b,
+        eq_status,
+        res.stats.baseline.median_ms,
+        res.stats.candidate.median_ms,
+        res.stats.paired_ratio_median,
+        res.stats.baseline.p95_ms,
+        res.stats.baseline.mad_ms,
+        res.stats.candidate.p95_ms,
+        res.stats.candidate.mad_ms,
+        res.stats.ci95_low,
+        res.stats.ci95_high,
+        res.stats.baseline.count,
+        res.stats.mann_whitney_p,
+    )
 }
 
 fn median_u64(vals: &[u64]) -> Option<u64> {

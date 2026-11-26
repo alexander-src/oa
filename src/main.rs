@@ -4,15 +4,18 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
+use oa::demo;
 use oa::doctor;
 use oa::guard::EquivalencePolicy;
 use oa::mcp;
 use oa::session::{
     checkpoint_session, compare_commands, evaluate_session, get_ledger, init_session,
-    profile_session, render_markdown_report, session_status, CheckpointAction, CheckpointParams,
-    CompareParams, EvalVerdict, EvaluateParams, InitParams, MetricTarget, ProfileParams,
+    profile_session, render_compare_markdown, render_markdown_report, render_svg_report,
+    session_status, verify_session, CheckpointAction, CheckpointParams, CompareParams, EvalVerdict,
+    EvaluateParams, InitParams, MetricTarget, ProfileParams, VerifyParams,
 };
 use oa::setup;
+use oa::svg::SvgTheme;
 
 const HELP: &str = "\
 oa - Optimize Anything: cross-language profiling, equivalence-gated benchmarking, and MCP harness
@@ -25,10 +28,12 @@ COMMANDS:
   profile     Profile current code, classify bottleneck, and optionally diff hotspots
   evaluate    Run Cheat Guard, tests, equivalence check, and interleaved A/B benchmark (alias: bench)
   checkpoint  Keep a verified optimization or revert to best and log a dead end
+  verify      Fresh end-to-end verification of HEAD vs baseline (CI / PR gate, non-zero exit on fail)
   status      Inspect live session health, Cheat Guard locks, cumulative gain, and diff stat
   ledger      Inspect the experiment ledger, Pareto frontier, and dead ends
-  report      Generate a PR-ready Markdown or JSON optimization report
+  report      Generate a PR-ready Markdown, JSON, or dark/light SVG chart report
   compare     Standalone interleaved A/B comparison of any two commands (no session required)
+  demo        Run a 4-second self-contained live demo (Cheat Guard, Equivalence Gate, verified speedup)
   doctor      Inspect local profilers (Python, Node, Go, perf, sample), RSS, and agent configs
   setup       Register the oa MCP server and SKILL.md for Claude Code, Antigravity, Cursor, Codex, Gemini CLI
   mcp         Run the stdio JSON-RPC 2.0 MCP server
@@ -54,13 +59,19 @@ fn print_subcommand_help(cmd: &str) {
             "USAGE:\n  oa ledger [--path <DIR>] [--json]"
         ),
         "report" => println!(
-            "USAGE:\n  oa report [--format md|json] [--out <FILE>] [--path <DIR>]"
+            "USAGE:\n  oa report [--format md|json|svg] [--theme dark|light] [--out <FILE>] [--path <DIR>]"
+        ),
+        "verify" => println!(
+            "USAGE:\n  oa verify [OPTIONS]\n\nOPTIONS:\n  --metric <wall|rss>    Override metric (wall latency ms or rss peak KiB)\n  --pairs <N>            Interleaved A/B pairs vs baseline (default 15)\n  --warmup <N>           Warmup pairs\n  --min-speedup <RATIO>  Override minimum 95% CI lower bound\n  --alpha <P>            Override Mann-Whitney alpha\n  --path <DIR>           Target repository directory\n  --json                 Emit raw JSON output"
         ),
         "status" => println!(
             "USAGE:\n  oa status [--path <DIR>] [--json]"
         ),
         "compare" => println!(
-            "USAGE:\n  oa compare <CMD_A> <CMD_B> [OPTIONS]\n\nOPTIONS:\n  --metric <wall|rss>    Metric to compare: wall (ms, default) or rss (peak KiB)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --warmup <N>           Warmup pairs (default 2)\n  --min-speedup <RATIO>  Minimum 95% CI lower bound (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha (default 0.01)\n  --pin-core <ID>        Pin runs to Linux CPU core via taskset\n  --check-output         Fail if stdout SHA-256 differs between CMD_A and CMD_B\n  --path <DIR>           Working directory\n  --json                 Emit raw JSON output"
+            "USAGE:\n  oa compare <CMD_A> <CMD_B> [OPTIONS]\n\nOPTIONS:\n  --metric <wall|rss>    Metric to compare: wall (ms, default) or rss (peak KiB)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --warmup <N>           Warmup pairs (default 2)\n  --min-speedup <RATIO>  Minimum 95% CI lower bound (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha (default 0.01)\n  --pin-core <ID>        Pin runs to Linux CPU core via taskset\n  --check-output         Fail if stdout SHA-256 differs between CMD_A and CMD_B\n  --markdown             Emit a paste-ready GitHub Markdown comparison table\n  --path <DIR>           Working directory\n  --json                 Emit raw JSON output"
+        ),
+        "demo" => println!(
+            "USAGE:\n  oa demo [--json]\n\nRuns a self-contained 4-second demo in a temporary git repository and cleans up on exit."
         ),
         "doctor" => println!(
             "USAGE:\n  oa doctor [--json]"
@@ -69,7 +80,7 @@ fn print_subcommand_help(cmd: &str) {
             "USAGE:\n  oa setup [--agent all|claude|antigravity|cursor|gemini|codex] [--dry-run] [--json]"
         ),
         "mcp" => println!(
-            "USAGE:\n  oa mcp\n\nRuns the stdio JSON-RPC 2.0 MCP server (exposes oa_init, oa_profile, oa_evaluate, oa_checkpoint, oa_status, oa_ledger, oa_report, oa_compare)."
+            "USAGE:\n  oa mcp\n\nRuns the stdio JSON-RPC 2.0 MCP server (exposes oa_init, oa_profile, oa_evaluate, oa_checkpoint, oa_verify, oa_status, oa_ledger, oa_report, oa_compare)."
         ),
         _ => print!("{HELP}"),
     }
@@ -453,6 +464,9 @@ fn run_cli() -> Result<ExitCode, String> {
                 if let Some(vs_base) = rec.speedup_vs_baseline {
                     println!("Cumul. : {:.2}x vs baseline", vs_base);
                 }
+                for w in &rec.warnings {
+                    println!("Warning: {w}");
+                }
             }
             if matches!(
                 rec.verdict,
@@ -550,12 +564,21 @@ fn run_cli() -> Result<ExitCode, String> {
         }
         "report" => {
             let mut format = "md".to_string();
+            let mut theme = SvgTheme::Dark;
             let mut out_path = None;
             let mut path = None;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
                     "--format" => format = next_val(rest, &mut i, "--format")?,
+                    "--theme" => {
+                        let v = next_val(rest, &mut i, "--theme")?;
+                        theme = SvgTheme::parse_str(&v)?;
+                    }
+                    "--svg" => {
+                        format = "svg".to_string();
+                        out_path = Some(next_val(rest, &mut i, "--svg")?);
+                    }
                     "--out" => out_path = Some(next_val(rest, &mut i, "--out")?),
                     "--path" => path = Some(next_val(rest, &mut i, "--path")?),
                     other => return Err(format!("unknown option '{other}' for report")),
@@ -566,6 +589,8 @@ fn run_cli() -> Result<ExitCode, String> {
             let content = if format.eq_ignore_ascii_case("json") {
                 let res = get_ledger(path.as_deref())?;
                 serde_json::to_string_pretty(&res).map_err(|e| e.to_string())?
+            } else if format.eq_ignore_ascii_case("svg") {
+                render_svg_report(path.as_deref(), theme)?
             } else {
                 render_markdown_report(path.as_deref())?
             };
@@ -578,6 +603,83 @@ fn run_cli() -> Result<ExitCode, String> {
                 print!("{content}");
             }
             Ok(ExitCode::SUCCESS)
+        }
+        "verify" => {
+            let mut metric = None;
+            let mut pairs = None;
+            let mut warmup = None;
+            let mut min_speedup = None;
+            let mut alpha = None;
+            let mut path = None;
+            let mut as_json = false;
+
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--metric" => {
+                        let v = next_val(rest, &mut i, "--metric")?;
+                        metric = Some(MetricTarget::parse_str(&v)?);
+                    }
+                    "--pairs" => {
+                        let v = next_val(rest, &mut i, "--pairs")?;
+                        pairs = Some(
+                            v.parse()
+                                .map_err(|_| format!("invalid --pairs value '{v}'"))?,
+                        );
+                    }
+                    "--warmup" => {
+                        let v = next_val(rest, &mut i, "--warmup")?;
+                        warmup = Some(
+                            v.parse()
+                                .map_err(|_| format!("invalid --warmup value '{v}'"))?,
+                        );
+                    }
+                    "--min-speedup" => {
+                        let v = next_val(rest, &mut i, "--min-speedup")?;
+                        min_speedup = Some(
+                            v.parse()
+                                .map_err(|_| format!("invalid --min-speedup value '{v}'"))?,
+                        );
+                    }
+                    "--alpha" => {
+                        let v = next_val(rest, &mut i, "--alpha")?;
+                        alpha = Some(
+                            v.parse()
+                                .map_err(|_| format!("invalid --alpha value '{v}'"))?,
+                        );
+                    }
+                    "--path" => path = Some(next_val(rest, &mut i, "--path")?),
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown option '{other}' for verify")),
+                }
+                i += 1;
+            }
+
+            let rep = verify_session(VerifyParams {
+                path,
+                metric,
+                pairs,
+                warmup,
+                min_speedup,
+                alpha,
+            })?;
+
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("{}", rep.badge);
+                for w in &rep.evaluation.warnings {
+                    println!("Warning: {w}");
+                }
+            }
+            if rep.passed {
+                Ok(ExitCode::SUCCESS)
+            } else {
+                Ok(ExitCode::from(2))
+            }
         }
         "status" => {
             let mut path = None;
@@ -652,6 +754,7 @@ fn run_cli() -> Result<ExitCode, String> {
             let mut alpha = 0.01;
             let mut pin_core = None;
             let mut check_output = false;
+            let mut as_markdown = false;
             let mut path = None;
             let mut as_json = false;
 
@@ -694,6 +797,7 @@ fn run_cli() -> Result<ExitCode, String> {
                         );
                     }
                     "--check-output" => check_output = true,
+                    "--markdown" | "--md" => as_markdown = true,
                     "--path" => path = Some(next_val(rest, &mut i, "--path")?),
                     "--json" => as_json = true,
                     other if other.starts_with('-') => {
@@ -728,6 +832,8 @@ fn run_cli() -> Result<ExitCode, String> {
                     "{}",
                     serde_json::to_string_pretty(&res).map_err(|e| e.to_string())?
                 );
+            } else if as_markdown {
+                print!("{}", render_compare_markdown(&res));
             } else {
                 let unit = match res.metric {
                     MetricTarget::Wall => "ms",
@@ -774,6 +880,26 @@ fn run_cli() -> Result<ExitCode, String> {
                     },
                     &res.stdout_sha256_a[..16],
                     &res.stdout_sha256_b[..16]
+                );
+                for w in &res.warnings {
+                    println!("Warning : {w}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "demo" => {
+            let mut as_json = false;
+            for arg in rest {
+                match arg.as_str() {
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown option '{other}' for demo")),
+                }
+            }
+            let res = demo::run_demo(as_json)?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&res).map_err(|e| e.to_string())?
                 );
             }
             Ok(ExitCode::SUCCESS)

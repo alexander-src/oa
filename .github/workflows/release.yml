@@ -11,8 +11,6 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    timeout-minutes: 10
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -20,10 +18,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             asset: oa-linux-x86_64.tar.gz
-            bin: oa
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            asset: oa-macos-arm64.tar.gz
             bin: oa
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -60,7 +54,6 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: build
-    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -80,3 +73,50 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+
+  build-macos:
+    name: Build aarch64-apple-darwin
+    runs-on: macos-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build release binary
+        run: cargo build --release --target aarch64-apple-darwin
+      - name: Package macOS archive
+        run: |
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/oa dist/
+          cp README.md LICENSE SKILL.md dist/
+          tar -czf oa-macos-arm64.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oa-macos-arm64.tar.gz
+          path: oa-macos-arm64.tar.gz
+
+  attach-macos:
+    name: Attach macOS binary to Release
+    needs: [publish, build-macos]
+    if: ${{ needs.publish.result == 'success' && needs.build-macos.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Refresh SHA256SUMS with macOS archive
+        working-directory: artifacts
+        run: |
+          ls -lh
+          test -f oa-macos-arm64.tar.gz
+          sha256sum oa-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Upload macOS asset and updated checksums
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/oa-macos-arm64.tar.gz
+            artifacts/SHA256SUMS.txt

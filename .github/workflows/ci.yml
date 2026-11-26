@@ -42,4 +42,5 @@ jobs:
           ./target/release/oa --version
           ./target/release/oa --help
           ./target/release/oa doctor
+          ./target/release/oa demo
         shell: bash

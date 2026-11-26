@@ -5,9 +5,11 @@ use serde_json::{json, Value};
 use crate::guard::EquivalencePolicy;
 use crate::session::{
     checkpoint_session, compare_commands, evaluate_session, get_ledger, init_session,
-    profile_session, render_markdown_report, session_status, CheckpointAction, CheckpointParams,
-    CompareParams, EvaluateParams, InitParams, MetricTarget, ProfileParams,
+    profile_session, render_markdown_report, render_svg_report, session_status, verify_session,
+    CheckpointAction, CheckpointParams, CompareParams, EvaluateParams, InitParams, MetricTarget,
+    ProfileParams, VerifyParams,
 };
+use crate::svg::SvgTheme;
 
 #[derive(Clone, Copy)]
 enum Framing {
@@ -166,12 +168,13 @@ fn tool_schemas() -> Value {
         },
         {
             "name": "oa_report",
-            "description": "Generate a PR-ready Markdown or JSON optimization report with host specs, verified SHA-256 equivalence, experiment table, and reproduce command.",
+            "description": "Generate a PR-ready Markdown, JSON, or shareable dark/light SVG optimization report with host specs, verified SHA-256 equivalence, experiment table, and reproduce command.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "format": { "type": "string", "enum": ["markdown", "json"] }
+                    "format": { "type": "string", "enum": ["markdown", "json", "svg"] },
+                    "theme": { "type": "string", "enum": ["dark", "light"], "description": "SVG color theme when format is 'svg' (default dark)." }
                 }
             }
         },
@@ -203,6 +206,21 @@ fn tool_schemas() -> Value {
                     "check_output": { "type": "boolean", "description": "Fail if stdout SHA-256 differs between cmd_a and cmd_b." }
                 },
                 "required": ["cmd_a", "cmd_b"]
+            }
+        },
+        {
+            "name": "oa_verify",
+            "description": "Run a fresh end-to-end verification of HEAD against refs/oa/baseline (Cheat Guard locks, tests, SHA-256 equivalence, and 15 interleaved A/B pairs) and return a pass/fail verification badge.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "metric": { "type": "string", "enum": ["wall", "rss"] },
+                    "pairs": { "type": "integer", "description": "Interleaved A/B pairs (default 15)." },
+                    "warmup": { "type": "integer" },
+                    "min_speedup": { "type": "number" },
+                    "alpha": { "type": "number" }
+                }
             }
         }
     ])
@@ -358,6 +376,12 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
             if format.eq_ignore_ascii_case("json") {
                 let res = get_ledger(path.as_deref())?;
                 serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+            } else if format.eq_ignore_ascii_case("svg") {
+                let theme = match str_arg(args, "theme") {
+                    Some(t) => SvgTheme::parse_str(&t)?,
+                    None => SvgTheme::Dark,
+                };
+                render_svg_report(path.as_deref(), theme)
             } else {
                 render_markdown_report(path.as_deref())
             }
@@ -406,6 +430,28 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                     .unwrap_or(false),
             };
             let res = compare_commands(params)?;
+            serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
+        }
+        "oa_verify" => {
+            let metric = match str_arg(args, "metric") {
+                Some(m) => Some(MetricTarget::parse_str(&m)?),
+                None => None,
+            };
+            let params = VerifyParams {
+                path: str_arg(args, "path"),
+                metric,
+                pairs: args
+                    .get("pairs")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize),
+                warmup: args
+                    .get("warmup")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize),
+                min_speedup: args.get("min_speedup").and_then(|v| v.as_f64()),
+                alpha: args.get("alpha").and_then(|v| v.as_f64()),
+            };
+            let res = verify_session(params)?;
             serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown tool '{other}'")),

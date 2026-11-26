@@ -1,6 +1,6 @@
 [package]
 name = "oa"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 description = "Optimize Anything: cross-language profiling, equivalence-gated interleaved benchmarking, and autonomous performance loops for coding agents"

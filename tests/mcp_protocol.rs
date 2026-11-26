@@ -126,7 +126,8 @@ fn mcp_ndjson_roundtrip_and_tools() {
             "oa_ledger",
             "oa_report",
             "oa_status",
-            "oa_compare"
+            "oa_compare",
+            "oa_verify"
         ]
     );
 

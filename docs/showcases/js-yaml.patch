@@ -1,0 +1,1549 @@
+diff --git a/src/load.ts b/src/load.ts
+index ed13684..348ec61 100644
+--- a/src/load.ts
++++ b/src/load.ts
+@@ -1,12 +1,12 @@
+ import { YAMLException } from './common/exception.ts'
+ import { pick } from './common/object.ts'
+ import {
+-  constructFromEvents,
++  constructFromTape,
+   DEFAULT_CONSTRUCTOR_OPTIONS,
+   type ConstructorOptions
+ } from './parser/constructor.ts'
+ import {
+-  parseEvents,
++  parseToTape,
+   DEFAULT_PARSER_OPTIONS,
+   type ParserOptions
+ } from './parser/parser.ts'
+@@ -32,8 +32,8 @@ function loadDocuments (input: string, options: LoadOptions = {}) {
+   const CONSTRUCTOR_OPT_KEYS = Object.keys(DEFAULT_CONSTRUCTOR_OPTIONS) as
+     (keyof typeof DEFAULT_CONSTRUCTOR_OPTIONS)[]
+ 
+-  const events = parseEvents(source, pick(opts, PARSER_OPT_KEYS))
+-  return constructFromEvents(events, { ...pick(opts, CONSTRUCTOR_OPT_KEYS), source })
++  const tape = parseToTape(source, pick(opts, PARSER_OPT_KEYS))
++  return constructFromTape(tape, { ...pick(opts, CONSTRUCTOR_OPT_KEYS), source })
+ }
+ 
+ /**
+diff --git a/src/parser/constructor.ts b/src/parser/constructor.ts
+index 5bfa791..8eed285 100644
+--- a/src/parser/constructor.ts
++++ b/src/parser/constructor.ts
+@@ -1,12 +1,28 @@
+ import {
+   EVENT_ID,
+   SCALAR_STYLE,
++  CHOMPING_MODE,
+   type Event,
+   type TagHandlers,
+   type MappingEvent,
+   type ScalarEvent,
++  type ScalarStyle,
++  type ChompingMode,
++  type CollectionStyle,
+   type SequenceEvent
+ } from './events.ts'
++import {
++  TAPE_DOCUMENT,
++  TAPE_SEQ_FAST,
++  TAPE_SEQ_FULL,
++  TAPE_MAP_FAST,
++  TAPE_MAP_FULL,
++  TAPE_SCALAR_FAST,
++  TAPE_SCALAR_FULL,
++  TAPE_ALIAS,
++  TAPE_POP,
++  type EventTape
++} from './tape.ts'
+ import { getScalarValue } from './parser_scalar.ts'
+ import { CORE_SCHEMA, type Schema } from '../schema.ts'
+ import {
+@@ -127,6 +143,7 @@ interface ConstructorState extends Required<ConstructorOptions> {
+   // Mapping tag each sequence element was built with, keyed by the element
+   // itself. Needed by `<<` merge, which sees only the finished element values.
+   nodeTags: Map<unknown, MappingTagDefinition<any, any>>
++  hasMergeTag: boolean
+   tagHandlers: TagHandlers
+   totalMergeKeys: number
+   aliasCount: number
+@@ -320,7 +337,7 @@ function addValue (state: ConstructorState, value: unknown, tag: AnyTag) {
+   } else if (frame.kind === 'sequence') {
+     // Any element may later be folded in by a `<<` merge, which by then has no
+     // way to tell what built it.
+-    if (isMappingTag(tag)) state.nodeTags.set(value, tag)
++    if (state.hasMergeTag && isMappingTag(tag)) state.nodeTags.set(value, tag)
+     const err = frame.tag.addItem(frame.value, value, frame.index++)
+     if (err) throwError(state, err)
+   } else if (frame.hasKey) {
+@@ -363,9 +380,9 @@ function storeAnchor (
+  * @category Events
+  */
+ function constructFromEvents (events: Event[], options: ConstructorOptions): unknown[] {
++  const resolved = { ...DEFAULT_CONSTRUCTOR_OPTIONS, ...options }
+   const state: ConstructorState = {
+-    ...DEFAULT_CONSTRUCTOR_OPTIONS,
+-    ...options,
++    ...resolved,
+     events,
+     documents: [],
+     eventIndex: 0,
+@@ -373,6 +390,7 @@ function constructFromEvents (events: Event[], options: ConstructorOptions): unk
+     frames: [],
+     anchors: new Map(),
+     nodeTags: new Map(),
++    hasMergeTag: resolved.schema.hasMergeTag,
+     tagHandlers: Object.create(null),
+     totalMergeKeys: 0,
+     aliasCount: 0
+@@ -482,8 +500,292 @@ function constructFromEvents (events: Event[], options: ConstructorOptions): unk
+   return state.documents
+ }
+ 
++function constructFromTape (tape: EventTape, options: ConstructorOptions): unknown[] {
++  const resolved = { ...DEFAULT_CONSTRUCTOR_OPTIONS, ...options }
++  const schema = resolved.schema
++  const hasMergeTag = schema.hasMergeTag
++  const defaultSeqTag = schema.defaultSequenceTag
++  const defaultMapTag = schema.defaultMappingTag
++  const defaultStrTag = schema.defaultScalarTag
++  const source = resolved.source
++
++  const state: ConstructorState = {
++    ...resolved,
++    events: [],
++    documents: [],
++    eventIndex: 0,
++    position: 0,
++    frames: [],
++    anchors: new Map(),
++    nodeTags: new Map(),
++    hasMergeTag,
++    tagHandlers: Object.create(null),
++    totalMergeKeys: 0,
++    aliasCount: 0
++  }
++
++  const scratchScalar: ScalarEvent = {
++    type: EVENT_ID.SCALAR,
++    valueStart: NO_RANGE,
++    valueEnd: NO_RANGE,
++    anchorStart: NO_RANGE,
++    anchorEnd: NO_RANGE,
++    tagStart: NO_RANGE,
++    tagEnd: NO_RANGE,
++    style: SCALAR_STYLE.PLAIN,
++    chomping: CHOMPING_MODE.CLIP,
++    indent: -1,
++    fast: false
++  }
++  const scratchSeq: SequenceEvent = {
++    type: EVENT_ID.SEQUENCE,
++    start: 0,
++    anchorStart: NO_RANGE,
++    anchorEnd: NO_RANGE,
++    tagStart: NO_RANGE,
++    tagEnd: NO_RANGE,
++    style: 1
++  }
++  const scratchMap: MappingEvent = {
++    type: EVENT_ID.MAPPING,
++    start: 0,
++    anchorStart: NO_RANGE,
++    anchorEnd: NO_RANGE,
++    tagStart: NO_RANGE,
++    tagEnd: NO_RANGE,
++    style: 1
++  }
++
++  const data = tape.data
++  const length = tape.length
++  const docs = tape.docs
++  let i = 0
++
++  while (i < length) {
++    const header = data[i++]
++    const kind = header & 0x0F
++
++    switch (kind) {
++      case TAPE_SCALAR_FAST: {
++        const valueStart = data[i++]
++        const valueEnd = data[i++]
++        const style = ((header >>> 4) & 0x0F) as ScalarStyle
++        const fast = ((header >>> 8) & 1) === 1
++        state.position = valueStart !== NO_RANGE ? valueStart : 0
++
++        let raw: string
++        if (valueStart === NO_RANGE) {
++          raw = ''
++        } else if (fast) {
++          raw = source.slice(valueStart, valueEnd)
++        } else {
++          scratchScalar.valueStart = valueStart
++          scratchScalar.valueEnd = valueEnd
++          scratchScalar.anchorStart = NO_RANGE
++          scratchScalar.anchorEnd = NO_RANGE
++          scratchScalar.tagStart = NO_RANGE
++          scratchScalar.tagEnd = NO_RANGE
++          scratchScalar.style = style
++          scratchScalar.chomping = CHOMPING_MODE.CLIP
++          scratchScalar.indent = -1
++          scratchScalar.fast = false
++          raw = getScalarValue(source, scratchScalar)
++        }
++
++        if (!hasMergeTag) {
++          const value = style === SCALAR_STYLE.PLAIN
++            ? schema.resolveImplicitScalarValue(raw)
++            : defaultStrTag.resolve(raw, false, defaultStrTag.tagName)
++          addValue(state, value, defaultStrTag)
++        } else if (style === SCALAR_STYLE.PLAIN) {
++          const { value, tag } = schema.resolveImplicitScalarTag(raw)
++          addValue(state, value, tag)
++        } else {
++          addValue(state, defaultStrTag.resolve(raw, false, defaultStrTag.tagName), defaultStrTag)
++        }
++        break
++      }
++
++      case TAPE_POP: {
++        state.position = 0
++        const frame = state.frames.pop()!
++
++        if (frame.kind === 'mapping' && frame.hasKey) {
++          state.position = frame.keyPosition
++          throwError(state, 'incomplete mapping pair in event stream')
++        }
++
++        if (frame.kind === 'document') {
++          state.documents.push(frame.value)
++        } else {
++          const value = frame.tag.carrierIsResult
++            ? frame.value
++            : finalizeCollection(state, frame.position, frame.tag, frame.value)
++          if (frame.anchor) {
++            frame.anchor.value = value
++            frame.anchor.isValueFinal = true
++          }
++          addValue(state, value, frame.tag)
++        }
++        break
++      }
++
++      case TAPE_MAP_FAST: {
++        const start = data[i++]
++        state.position = start
++        const tag = defaultMapTag ?? schema.lookupMappingTag('tag:yaml.org,2002:map')
++        if (!tag) throwError(state, 'unknown mapping tag !<tag:yaml.org,2002:map>')
++        const value = tag.create('tag:yaml.org,2002:map')
++        state.frames.push({
++          kind: 'mapping',
++          position: start,
++          value,
++          tag,
++          anchor: null,
++          key: undefined,
++          keyPosition: start,
++          hasKey: false,
++          keyIsMerge: false,
++          overridable: null
++        })
++        break
++      }
++
++      case TAPE_SEQ_FAST: {
++        const start = data[i++]
++        state.position = start
++        const tag = defaultSeqTag ?? schema.lookupSequenceTag('tag:yaml.org,2002:seq')
++        if (!tag) throwError(state, 'unknown sequence tag !<tag:yaml.org,2002:seq>')
++        const value = tag.create('tag:yaml.org,2002:seq')
++        state.frames.push({
++          kind: 'sequence',
++          position: start,
++          value,
++          tag,
++          anchor: null,
++          index: 0
++        })
++        break
++      }
++
++      case TAPE_SCALAR_FULL: {
++        scratchScalar.valueStart = data[i++]
++        scratchScalar.valueEnd = data[i++]
++        scratchScalar.anchorStart = data[i++]
++        scratchScalar.anchorEnd = data[i++]
++        scratchScalar.tagStart = data[i++]
++        scratchScalar.tagEnd = data[i++]
++        scratchScalar.style = data[i++] as ScalarStyle
++        scratchScalar.chomping = data[i++] as ChompingMode
++        scratchScalar.indent = data[i++]
++        scratchScalar.fast = data[i++] === 1
++        state.position = scratchScalar.tagStart !== NO_RANGE
++          ? scratchScalar.tagStart
++          : (scratchScalar.anchorStart !== NO_RANGE
++              ? scratchScalar.anchorStart
++              : (scratchScalar.valueStart !== NO_RANGE ? scratchScalar.valueStart : 0))
++
++        const { value, tag } = constructScalar(state, scratchScalar)
++        storeAnchor(state, scratchScalar, value, tag, true)
++        addValue(state, value, tag)
++        break
++      }
++
++      case TAPE_SEQ_FULL: {
++        scratchSeq.start = data[i++]
++        scratchSeq.anchorStart = data[i++]
++        scratchSeq.anchorEnd = data[i++]
++        scratchSeq.tagStart = data[i++]
++        scratchSeq.tagEnd = data[i++]
++        scratchSeq.style = data[i++] as CollectionStyle
++        state.position = scratchSeq.tagStart !== NO_RANGE
++          ? scratchSeq.tagStart
++          : (scratchSeq.anchorStart !== NO_RANGE ? scratchSeq.anchorStart : scratchSeq.start)
++
++        const tagName = collectionTagName(state, scratchSeq, 'tag:yaml.org,2002:seq')
++        const tag = schema.lookupSequenceTag(tagName)
++        if (!tag) throwError(state, `unknown sequence tag !<${tagName}>`)
++        const value = tag.create(tagName)
++        const anchor = storeAnchor(state, scratchSeq, value, tag, tag.carrierIsResult)
++        state.frames.push({
++          kind: 'sequence', position: state.position, value, tag, anchor, index: 0
++        })
++        break
++      }
++
++      case TAPE_MAP_FULL: {
++        scratchMap.start = data[i++]
++        scratchMap.anchorStart = data[i++]
++        scratchMap.anchorEnd = data[i++]
++        scratchMap.tagStart = data[i++]
++        scratchMap.tagEnd = data[i++]
++        scratchMap.style = data[i++] as CollectionStyle
++        state.position = scratchMap.tagStart !== NO_RANGE
++          ? scratchMap.tagStart
++          : (scratchMap.anchorStart !== NO_RANGE ? scratchMap.anchorStart : scratchMap.start)
++
++        const tagName = collectionTagName(state, scratchMap, 'tag:yaml.org,2002:map')
++        const tag = schema.lookupMappingTag(tagName)
++        if (!tag) throwError(state, `unknown mapping tag !<${tagName}>`)
++        const value = tag.create(tagName)
++        const anchor = storeAnchor(state, scratchMap, value, tag, tag.carrierIsResult)
++        state.frames.push({
++          kind: 'mapping',
++          position: state.position,
++          value,
++          tag,
++          anchor,
++          key: undefined,
++          keyPosition: state.position,
++          hasKey: false,
++          keyIsMerge: false,
++          overridable: null
++        })
++        break
++      }
++
++      case TAPE_ALIAS: {
++        const anchorStart = data[i++]
++        const anchorEnd = data[i++]
++        state.position = anchorStart !== NO_RANGE ? anchorStart : 0
++        if (state.maxAliases !== -1 && ++state.aliasCount > state.maxAliases) {
++          throwError(state, `aliases exceeded maxAliases (${state.maxAliases})`)
++        }
++
++        const name = source.slice(anchorStart, anchorEnd)
++        const anchor = state.anchors.get(name)
++        if (!anchor) {
++          throwError(state, `unidentified alias "${name}"`)
++        }
++        if (!anchor.isValueFinal) {
++          throwError(state, `recursive alias "${name}" is not supported for tag ${anchor.tag.tagName} because it uses finalize()`)
++        }
++        addValue(state, anchor.value, anchor.tag)
++        break
++      }
++
++      case TAPE_DOCUMENT: {
++        const doc = docs[data[i++]]
++        state.position = 0
++        state.anchors = new Map()
++        if (hasMergeTag) state.nodeTags = new Map()
++        state.aliasCount = 0
++        state.tagHandlers = Object.create(null)
++        for (const directive of doc.directives) {
++          if (directive.kind === 'tag') state.tagHandlers[directive.handle] = directive.prefix
++        }
++        state.frames.push({ kind: 'document', position: 0, value: undefined, hasValue: false })
++        break
++      }
++    }
++  }
++
++  return state.documents
++}
++
+ export {
+   constructFromEvents,
++  constructFromTape,
+   DEFAULT_CONSTRUCTOR_OPTIONS,
+   type ConstructorOptions
+ }
+diff --git a/src/parser/parser.ts b/src/parser/parser.ts
+index 1d79161..a3973b6 100644
+--- a/src/parser/parser.ts
++++ b/src/parser/parser.ts
+@@ -1,5 +1,4 @@
+ import {
+-  EVENT_ID,
+   SCALAR_STYLE,
+   COLLECTION_STYLE,
+   CHOMPING_MODE,
+@@ -8,13 +7,48 @@ import {
+   type CollectionStyle,
+   type ChompingMode,
+   type DocumentDirective,
++  type DocumentEvent,
+   type TagHandlers
+ } from './events.ts'
++import {
++  TAPE_DOCUMENT,
++  TAPE_SEQ_FAST,
++  TAPE_SEQ_FULL,
++  TAPE_MAP_FAST,
++  TAPE_MAP_FULL,
++  TAPE_SCALAR_FAST,
++  TAPE_SCALAR_FULL,
++  TAPE_ALIAS,
++  TAPE_POP,
++  materializeEvents,
++  type EventTape
++} from './tape.ts'
+ import { YAMLException } from '../common/exception.ts'
+ 
+ const NO_RANGE = -1
+ const HAS_OWN = Object.prototype.hasOwnProperty
+ 
++const EMPTY_PROPS: NodeProperties = {
++  anchorStart: NO_RANGE,
++  anchorEnd: NO_RANGE,
++  tagStart: NO_RANGE,
++  tagEnd: NO_RANGE
++}
++
++const PLAIN_STOP_BLOCK = new Uint8Array(128)
++for (let c = 0; c < 0x20; c++) PLAIN_STOP_BLOCK[c] = 1
++PLAIN_STOP_BLOCK[0x20] = 1
++PLAIN_STOP_BLOCK[0x23] = 1 // #
++PLAIN_STOP_BLOCK[0x3A] = 1 // :
++PLAIN_STOP_BLOCK[0x7F] = 1
++
++const PLAIN_STOP_FLOW = new Uint8Array(PLAIN_STOP_BLOCK)
++PLAIN_STOP_FLOW[0x2C] = 1 // ,
++PLAIN_STOP_FLOW[0x5B] = 1 // [
++PLAIN_STOP_FLOW[0x5D] = 1 // ]
++PLAIN_STOP_FLOW[0x7B] = 1 // {
++PLAIN_STOP_FLOW[0x7D] = 1 // }
++
+ const CONTEXT_FLOW_IN = 1
+ const CONTEXT_FLOW_OUT = 2
+ const CONTEXT_BLOCK_IN = 3
+@@ -92,7 +126,18 @@ interface ParserState extends Required<ParserOptions> {
+   depth: number
+   directives: DocumentDirective[]
+   tagHandlers: TagHandlers
+-  events: Event[]
++  tape: Int32Array
++  tapeLen: number
++  docs: DocumentEvent[]
++}
++
++function growTape (state: ParserState, extra: number) {
++  const needed = state.tapeLen + extra
++  let cap = state.tape.length
++  while (cap < needed) cap *= 2
++  const next = new Int32Array(cap)
++  next.set(state.tape)
++  state.tape = next
+ }
+ 
+ function addDocumentEvent (
+@@ -100,12 +145,20 @@ function addDocumentEvent (
+   explicitStart: boolean,
+   explicitEnd: boolean
+ ) {
+-  state.events.push({
+-    type: EVENT_ID.DOCUMENT,
++  const docIdx = state.docs.length
++  state.docs.push({
++    type: 1,
+     explicitStart,
+     explicitEnd,
+     directives: state.directives
+   })
++  if (state.tapeLen + 2 > state.tape.length) growTape(state, 2)
++  const t = state.tape
++  let p = state.tapeLen
++  t[p++] = TAPE_DOCUMENT
++  t[p++] = docIdx
++  state.tapeLen = p
++  return docIdx
+ }
+ 
+ function addSequenceEvent (
+@@ -117,15 +170,26 @@ function addSequenceEvent (
+   tagEnd: number,
+   style: CollectionStyle
+ ) {
+-  state.events.push({
+-    type: EVENT_ID.SEQUENCE,
+-    start,
+-    anchorStart,
+-    anchorEnd,
+-    tagStart,
+-    tagEnd,
+-    style
+-  })
++  if (anchorStart === NO_RANGE && tagStart === NO_RANGE) {
++    if (state.tapeLen + 2 > state.tape.length) growTape(state, 2)
++    const t = state.tape
++    let p = state.tapeLen
++    t[p++] = TAPE_SEQ_FAST | (style << 4)
++    t[p++] = start
++    state.tapeLen = p
++  } else {
++    if (state.tapeLen + 7 > state.tape.length) growTape(state, 7)
++    const t = state.tape
++    let p = state.tapeLen
++    t[p++] = TAPE_SEQ_FULL
++    t[p++] = start
++    t[p++] = anchorStart
++    t[p++] = anchorEnd
++    t[p++] = tagStart
++    t[p++] = tagEnd
++    t[p++] = style
++    state.tapeLen = p
++  }
+ }
+ 
+ function addMappingEvent (
+@@ -137,27 +201,65 @@ function addMappingEvent (
+   tagEnd: number,
+   style: CollectionStyle
+ ) {
+-  state.events.push({
+-    type: EVENT_ID.MAPPING,
+-    start,
+-    anchorStart,
+-    anchorEnd,
+-    tagStart,
+-    tagEnd,
+-    style
+-  })
++  if (anchorStart === NO_RANGE && tagStart === NO_RANGE) {
++    if (state.tapeLen + 2 > state.tape.length) growTape(state, 2)
++    const t = state.tape
++    let p = state.tapeLen
++    t[p++] = TAPE_MAP_FAST | (style << 4)
++    t[p++] = start
++    state.tapeLen = p
++  } else {
++    if (state.tapeLen + 7 > state.tape.length) growTape(state, 7)
++    const t = state.tape
++    let p = state.tapeLen
++    t[p++] = TAPE_MAP_FULL
++    t[p++] = start
++    t[p++] = anchorStart
++    t[p++] = anchorEnd
++    t[p++] = tagStart
++    t[p++] = tagEnd
++    t[p++] = style
++    state.tapeLen = p
++  }
++}
++
++function insertMappingAt (
++  state: ParserState,
++  idx: number,
++  start: number,
++  props: NodeProperties,
++  style: CollectionStyle
++) {
++  if (props.anchorStart === NO_RANGE && props.tagStart === NO_RANGE) {
++    if (state.tapeLen + 2 > state.tape.length) growTape(state, 2)
++    const t = state.tape
++    t.copyWithin(idx + 2, idx, state.tapeLen)
++    t[idx] = TAPE_MAP_FAST | (style << 4)
++    t[idx + 1] = start
++    state.tapeLen += 2
++  } else {
++    if (state.tapeLen + 7 > state.tape.length) growTape(state, 7)
++    const t = state.tape
++    t.copyWithin(idx + 7, idx, state.tapeLen)
++    t[idx] = TAPE_MAP_FULL
++    t[idx + 1] = start
++    t[idx + 2] = props.anchorStart
++    t[idx + 3] = props.anchorEnd
++    t[idx + 4] = props.tagStart
++    t[idx + 5] = props.tagEnd
++    t[idx + 6] = style
++    state.tapeLen += 7
++  }
++}
++
++function isMappingAt (state: ParserState, idx: number) {
++  if (idx >= state.tapeLen) return false
++  const kind = state.tape[idx] & 0x0F
++  return kind === TAPE_MAP_FAST || kind === TAPE_MAP_FULL
+ }
+ 
+ function insertFlowPairMappingEvent (state: ParserState, snapshot: ParserSnapshot) {
+-  state.events.splice(snapshot.eventsLength, 0, {
+-    type: EVENT_ID.MAPPING,
+-    start: snapshot.position,
+-    anchorStart: NO_RANGE,
+-    anchorEnd: NO_RANGE,
+-    tagStart: NO_RANGE,
+-    tagEnd: NO_RANGE,
+-    style: COLLECTION_STYLE.FLOW
+-  })
++  insertMappingAt(state, snapshot.eventsLength, snapshot.position, EMPTY_PROPS, COLLECTION_STYLE.FLOW)
+ }
+ 
+ function addScalarEvent (
+@@ -173,19 +275,31 @@ function addScalarEvent (
+   indent = -1,
+   fast = false
+ ) {
+-  state.events.push({
+-    type: EVENT_ID.SCALAR,
+-    valueStart,
+-    valueEnd,
+-    anchorStart,
+-    anchorEnd,
+-    tagStart,
+-    tagEnd,
+-    style,
+-    chomping,
+-    indent,
+-    fast
+-  })
++  if (anchorStart === NO_RANGE && tagStart === NO_RANGE && chomping === CHOMPING_MODE.CLIP && indent === -1) {
++    if (state.tapeLen + 3 > state.tape.length) growTape(state, 3)
++    const t = state.tape
++    let p = state.tapeLen
++    t[p++] = TAPE_SCALAR_FAST | (style << 4) | (fast ? 0x100 : 0)
++    t[p++] = valueStart
++    t[p++] = valueEnd
++    state.tapeLen = p
++  } else {
++    if (state.tapeLen + 11 > state.tape.length) growTape(state, 11)
++    const t = state.tape
++    let p = state.tapeLen
++    t[p++] = TAPE_SCALAR_FULL
++    t[p++] = valueStart
++    t[p++] = valueEnd
++    t[p++] = anchorStart
++    t[p++] = anchorEnd
++    t[p++] = tagStart
++    t[p++] = tagEnd
++    t[p++] = style
++    t[p++] = chomping
++    t[p++] = indent
++    t[p++] = fast ? 1 : 0
++    state.tapeLen = p
++  }
+ }
+ 
+ function addAliasEvent (
+@@ -193,28 +307,28 @@ function addAliasEvent (
+   anchorStart: number,
+   anchorEnd: number
+ ) {
+-  state.events.push({
+-    type: EVENT_ID.ALIAS,
+-    anchorStart,
+-    anchorEnd
+-  })
++  if (state.tapeLen + 3 > state.tape.length) growTape(state, 3)
++  const t = state.tape
++  let p = state.tapeLen
++  t[p++] = TAPE_ALIAS
++  t[p++] = anchorStart
++  t[p++] = anchorEnd
++  state.tapeLen = p
+ }
+ 
+ function addPopEvent (state: ParserState) {
+-  state.events.push({ type: EVENT_ID.POP })
++  if (state.tapeLen + 1 > state.tape.length) growTape(state, 1)
++  state.tape[state.tapeLen++] = TAPE_POP
+ }
+ 
+ function addEmptyScalarEvent (state: ParserState) {
+-  addScalarEvent(
+-    state,
+-    NO_RANGE,
+-    NO_RANGE,
+-    NO_RANGE,
+-    NO_RANGE,
+-    NO_RANGE,
+-    NO_RANGE,
+-    SCALAR_STYLE.PLAIN
+-  )
++  if (state.tapeLen + 3 > state.tape.length) growTape(state, 3)
++  const t = state.tape
++  let p = state.tapeLen
++  t[p++] = TAPE_SCALAR_FAST | (SCALAR_STYLE.PLAIN << 4)
++  t[p++] = NO_RANGE
++  t[p++] = NO_RANGE
++  state.tapeLen = p
+ }
+ 
+ function emptyProperties (): NodeProperties {
+@@ -233,7 +347,7 @@ function snapshotState (state: ParserState): ParserSnapshot {
+     lineStart: state.lineStart,
+     lineIndent: state.lineIndent,
+     firstTabInLine: state.firstTabInLine,
+-    eventsLength: state.events.length
++    eventsLength: state.tapeLen
+   }
+ }
+ 
+@@ -243,7 +357,7 @@ function restoreState (state: ParserState, snapshot: ParserSnapshot) {
+   state.lineStart = snapshot.lineStart
+   state.lineIndent = snapshot.lineIndent
+   state.firstTabInLine = snapshot.firstTabInLine
+-  state.events.length = snapshot.eventsLength
++  state.tapeLen = snapshot.eventsLength
+ }
+ 
+ function throwError (state: ParserState, message: string): never {
+@@ -331,38 +445,50 @@ function consumeLineBreak (state: ParserState) {
+ }
+ 
+ function skipSeparationSpace (state: ParserState, allowComments: boolean) {
++  const input = state.input
++  let pos = state.position
+   let lineBreaks = 0
+-  let ch = state.input.charCodeAt(state.position)
+-  let hasSeparation = state.position === state.lineStart ||
+-    isWsOrEol(state.input.charCodeAt(state.position - 1))
++  let ch = input.charCodeAt(pos)
++  let hasSeparation = pos === state.lineStart ||
++    isWsOrEol(input.charCodeAt(pos - 1))
+ 
+   while (ch !== 0) {
+-    while (isWhiteSpace(ch)) {
++    while (ch === 0x20/* Space */ || ch === 0x09/* Tab */) {
+       hasSeparation = true
+       if (ch === 0x09/* Tab */ && state.firstTabInLine === -1) {
+-        state.firstTabInLine = state.position
++        state.firstTabInLine = pos
+       }
+-      ch = state.input.charCodeAt(++state.position)
++      ch = input.charCodeAt(++pos)
+     }
+ 
+     if (allowComments && hasSeparation && ch === 0x23/* # */) {
+-      do { ch = state.input.charCodeAt(++state.position) }
+-      while (!isEol(ch) && ch !== 0)
++      do { ch = input.charCodeAt(++pos) }
++      while (ch !== 0x0A && ch !== 0x0D && ch !== 0)
+     }
+ 
+-    if (!isEol(ch)) break
++    if (ch !== 0x0A && ch !== 0x0D) break
+ 
+-    consumeLineBreak(state)
++    if (ch === 0x0A) {
++      pos++
++    } else {
++      pos++
++      if (input.charCodeAt(pos) === 0x0A) pos++
++    }
++    state.line++
++    state.lineStart = pos
++    state.firstTabInLine = -1
+     lineBreaks++
+     hasSeparation = true
+-    ch = state.input.charCodeAt(state.position)
+ 
++    const indentStart = pos
++    ch = input.charCodeAt(pos)
+     while (ch === 0x20/* Space */) {
+-      state.lineIndent++
+-      ch = state.input.charCodeAt(++state.position)
++      ch = input.charCodeAt(++pos)
+     }
++    state.lineIndent = pos - indentStart
+   }
+ 
++  state.position = pos
+   return lineBreaks
+ }
+ 
+@@ -573,27 +699,40 @@ function readSingleQuotedScalar (state: ParserState, nodeIndent: number, props:
+ }
+ 
+ function readDoubleQuotedScalar (state: ParserState, nodeIndent: number, props: NodeProperties) {
+-  if (state.input.charCodeAt(state.position) !== 0x22/* " */) return false
++  const input = state.input
++  let pos = state.position
++  if (input.charCodeAt(pos) !== 0x22/* " */) return false
+ 
+-  state.position++
+-  const start = state.position
+-  // A double-quoted scalar is sliceable verbatim when it has no \ escapes and
+-  // no folded line breaks (see getScalarValue fast path).
++  pos++
++  const start = pos
+   let simple = true
++  let ch = input.charCodeAt(pos)
+ 
+-  while (state.input.charCodeAt(state.position) !== 0) {
+-    const ch = state.input.charCodeAt(state.position)
++  while (ch !== 0) {
++    if (pos === state.lineStart && testDocumentSeparator(state, pos)) {
++      state.position = pos
++      throwError(state, 'unexpected end of the document within a double quoted scalar')
++    }
++
++    if (ch >= 0x20 && ch !== 0x22/* " */ && ch !== 0x5C/* \ */) {
++      ch = input.charCodeAt(++pos)
++      while (ch >= 0x20 && ch !== 0x22/* " */ && ch !== 0x5C/* \ */) {
++        ch = input.charCodeAt(++pos)
++      }
++      continue
++    }
+ 
+     if (ch === 0x22/* " */) {
+-      const end = state.position
+-      state.position++
++      const end = pos
++      state.position = pos + 1
+       addScalarEvent(state, start, end, props.anchorStart, props.anchorEnd, props.tagStart, props.tagEnd, SCALAR_STYLE.DOUBLE_QUOTED, CHOMPING_MODE.CLIP, -1, simple)
+       return true
+     }
+ 
++    state.position = pos
+     if (ch === 0x5C/* \ */) {
+       simple = false
+-      const escaped = state.input.charCodeAt(++state.position)
++      const escaped = input.charCodeAt(++state.position)
+ 
+       if (isEol(escaped)) {
+         readFlowScalarBreak(state, nodeIndent)
+@@ -606,7 +745,7 @@ function readDoubleQuotedScalar (state: ParserState, nodeIndent: number, props:
+ 
+         while (hexLength-- > 0) {
+           state.position++
+-          if (fromHexCode(state.input.charCodeAt(state.position)) < 0) {
++          if (fromHexCode(input.charCodeAt(state.position)) < 0) {
+             throwError(state, 'expected hexadecimal character')
+           }
+         }
+@@ -615,15 +754,16 @@ function readDoubleQuotedScalar (state: ParserState, nodeIndent: number, props:
+     } else if (isEol(ch)) {
+       simple = false
+       readFlowScalarBreak(state, nodeIndent)
+-    } else if (state.position === state.lineStart && testDocumentSeparator(state)) {
+-      throwError(state, 'unexpected end of the document within a double quoted scalar')
+     } else if (ch !== 0x09/* Tab */ && ch < 0x20) {
+       throwError(state, 'expected valid JSON character')
+     } else {
+       state.position++
+     }
++    pos = state.position
++    ch = input.charCodeAt(pos)
+   }
+ 
++  state.position = pos
+   throwError(state, 'unexpected end of the stream within a double quoted scalar')
+ }
+ 
+@@ -792,54 +932,88 @@ function canStartPlainScalar (state: ParserState, nodeContext: NodeContext) {
+ function readPlainScalar (state: ParserState, nodeIndent: number, nodeContext: NodeContext, props: NodeProperties) {
+   if (!canStartPlainScalar(state, nodeContext)) return false
+ 
++  const input = state.input
+   const start = state.position
+-  let end = state.position
+-  let ch = state.input.charCodeAt(state.position)
++  let pos = start
++  let end = start
++  let ch = input.charCodeAt(pos)
+   const inFlow = nodeContext === CONTEXT_FLOW_IN
+-  // A single-line plain scalar is sliceable verbatim: the parser already trims
+-  // trailing whitespace from the range, so no folding is needed (see
+-  // getScalarValue fast path). Folded line breaks make it non-simple.
++  const stopTable = inFlow ? PLAIN_STOP_FLOW : PLAIN_STOP_BLOCK
+   let multiline = false
++  let needsPrintCheck = false
+ 
+   while (ch !== 0) {
+-    if (testDocumentBoundary(state)) break
++    if (pos === state.lineStart) {
++      state.position = pos
++      if (testDocumentBoundary(state)) break
++    }
++
++    // Fast path: advance over runs of printable ASCII plain-scalar characters.
++    if (ch < 128 && stopTable[ch] === 0) {
++      end = ++pos
++      ch = input.charCodeAt(pos)
++      while (ch < 128 && stopTable[ch] === 0) {
++        end = ++pos
++        ch = input.charCodeAt(pos)
++      }
++      if (ch === 0) break
++    }
++
++    if (ch >= 128) {
++      needsPrintCheck = true
++      end = ++pos
++      ch = input.charCodeAt(pos)
++      continue
++    }
++
++    if (ch === 0x20/* Space */ || ch === 0x09/* Tab */) {
++      ch = input.charCodeAt(++pos)
++      continue
++    }
+ 
+     if (ch === 0x3A/* : */) {
+-      const following = state.input.charCodeAt(state.position + 1)
++      const following = input.charCodeAt(pos + 1)
+       if (isWsOrEolOrEnd(following) || (inFlow && isFlowIndicator(following))) break
++      end = ++pos
++      ch = following
+     } else if (ch === 0x23/* # */) {
+-      const preceding = state.input.charCodeAt(state.position - 1)
++      const preceding = input.charCodeAt(pos - 1)
+       if (isWsOrEol(preceding)) break
++      end = ++pos
++      ch = input.charCodeAt(pos)
+     } else if (inFlow && isFlowIndicator(ch)) {
+       break
+-    } else if (isEol(ch)) {
+-      const savedPosition = state.position
++    } else if (ch === 0x0A || ch === 0x0D) {
+       const savedLine = state.line
+       const savedLineStart = state.lineStart
+       const savedLineIndent = state.lineIndent
++      state.position = pos
+ 
+       skipSeparationSpace(state, false)
+ 
+       if (state.lineIndent >= nodeIndent) {
+         multiline = true
+-        ch = state.input.charCodeAt(state.position)
++        pos = state.position
++        ch = input.charCodeAt(pos)
+         continue
+       }
+ 
+-      state.position = savedPosition
++      state.position = pos
+       state.line = savedLine
+       state.lineStart = savedLineStart
+       state.lineIndent = savedLineIndent
+       break
++    } else {
++      if (ch < 0x20 || ch === 0x7F) needsPrintCheck = true
++      end = ++pos
++      ch = input.charCodeAt(pos)
+     }
+-
+-    if (!isWhiteSpace(ch)) end = state.position + 1
+-    ch = state.input.charCodeAt(++state.position)
+   }
+ 
++  state.position = pos
+   if (end === start) return false
+ 
+-  checkPrintable(state, start, end)
++  if (needsPrintCheck) checkPrintable(state, start, end)
+   addScalarEvent(state, start, end, props.anchorStart, props.anchorEnd, props.tagStart, props.tagEnd, SCALAR_STYLE.PLAIN, CHOMPING_MODE.CLIP, -1, !multiline)
+   return true
+ }
+@@ -1079,7 +1253,8 @@ function readBlockMapping (state: ParserState, nodeIndent: number, flowIndent: n
+         atExplicitKey = false
+       }
+ 
+-      const beforeKey = snapshotState(state)
++      const needSnapshot = !mappingOpened || props.anchorStart !== NO_RANGE || props.tagStart !== NO_RANGE
++      const beforeKey = needSnapshot ? snapshotState(state) : null
+ 
+       if (!parseNode(state, flowIndent, CONTEXT_FLOW_OUT, false, true)) {
+         break
+@@ -1102,15 +1277,7 @@ function readBlockMapping (state: ParserState, nodeIndent: number, flowIndent: n
+           if (!mappingOpened) {
+             // The key is already parsed; insert the MAPPING event before its
+             // events instead of rolling back and re-reading the key.
+-            state.events.splice(beforeKey.eventsLength, 0, {
+-              type: EVENT_ID.MAPPING,
+-              start: beforeKey.position,
+-              anchorStart: props.anchorStart,
+-              anchorEnd: props.anchorEnd,
+-              tagStart: props.tagStart,
+-              tagEnd: props.tagEnd,
+-              style: COLLECTION_STYLE.BLOCK
+-            })
++            insertMappingAt(state, beforeKey!.eventsLength, beforeKey!.position, props, COLLECTION_STYLE.BLOCK)
+             mappingOpened = true
+           }
+ 
+@@ -1123,7 +1290,7 @@ function readBlockMapping (state: ParserState, nodeIndent: number, flowIndent: n
+           // Not a mapping. If outer properties are pending, roll back so the
+           // caller re-reads this node with them attached (events are append-only).
+           if (props.anchorStart !== NO_RANGE || props.tagStart !== NO_RANGE) {
+-            restoreState(state, beforeKey)
++            restoreState(state, beforeKey!)
+             return false
+           }
+           return true
+@@ -1132,7 +1299,7 @@ function readBlockMapping (state: ParserState, nodeIndent: number, flowIndent: n
+         throwError(state, 'can not read a block mapping entry; a multiline key may not be an implicit key')
+       } else {
+         if (props.anchorStart !== NO_RANGE || props.tagStart !== NO_RANGE) {
+-          restoreState(state, beforeKey)
++          restoreState(state, beforeKey!)
+           return false
+         }
+         return true
+@@ -1184,7 +1351,7 @@ function parseNode (
+   let atNewLine = false
+   let hasContent = false
+   let propertyStart: ParserSnapshot | null = null
+-  const props = emptyProperties()
++  let props: NodeProperties = EMPTY_PROPS
+ 
+   let allowBlockScalars = nodeContext === CONTEXT_BLOCK_OUT || nodeContext === CONTEXT_BLOCK_IN
+   let allowBlockCollections = allowBlockScalars
+@@ -1203,58 +1370,63 @@ function parseNode (
+   }
+ 
+   if (indentStatus === 1) {
+-    while (true) {
+-      const ch = state.input.charCodeAt(state.position)
+-      const propertyState = snapshotState(state)
+-
+-      if (atNewLine &&
+-          indentStatus !== 1 &&
+-          (ch === 0x21/* ! */ || ch === 0x26/* & */)) {
+-        break
+-      }
++    let ch = state.input.charCodeAt(state.position)
++    if (ch === 0x21/* ! */ || ch === 0x26/* & */) {
++      props = emptyProperties()
++      while (true) {
++        ch = state.input.charCodeAt(state.position)
++        if (ch !== 0x21/* ! */ && ch !== 0x26/* & */) break
++        const propertyState = snapshotState(state)
+ 
+-      if (atNewLine &&
+-          allowBlockStyles &&
+-          (props.tagStart !== NO_RANGE || props.anchorStart !== NO_RANGE) &&
+-          (ch === 0x21/* ! */ || ch === 0x26/* & */)) {
+-        const fallbackState = snapshotState(state)
+-        const flowIndent = parentIndent + 1
+-        const mappingIndent = state.position - state.lineStart
+-
+-        if (readBlockMapping(state, mappingIndent, flowIndent, props) &&
+-            state.events[fallbackState.eventsLength]?.type === EVENT_ID.MAPPING) {
+-          state.depth--
+-          return true
++        if (atNewLine &&
++            indentStatus !== 1 &&
++            (ch === 0x21/* ! */ || ch === 0x26/* & */)) {
++          break
+         }
+ 
+-        restoreState(state, fallbackState)
+-      }
++        if (atNewLine &&
++            allowBlockStyles &&
++            (props.tagStart !== NO_RANGE || props.anchorStart !== NO_RANGE) &&
++            (ch === 0x21/* ! */ || ch === 0x26/* & */)) {
++          const fallbackState = snapshotState(state)
++          const flowIndent = parentIndent + 1
++          const mappingIndent = state.position - state.lineStart
+ 
+-      if (atNewLine &&
+-          ((ch === 0x21/* ! */ && props.tagStart !== NO_RANGE) ||
+-           (ch === 0x26/* & */ && props.anchorStart !== NO_RANGE))) {
+-        break
+-      }
++          if (readBlockMapping(state, mappingIndent, flowIndent, props) &&
++              isMappingAt(state, fallbackState.eventsLength)) {
++            state.depth--
++            return true
++          }
+ 
+-      if (!readTagProperty(state, props, nodeContext === CONTEXT_FLOW_IN) && !readAnchorProperty(state, props)) {
+-        break
+-      }
++          restoreState(state, fallbackState)
++        }
++
++        if (atNewLine &&
++            ((ch === 0x21/* ! */ && props.tagStart !== NO_RANGE) ||
++             (ch === 0x26/* & */ && props.anchorStart !== NO_RANGE))) {
++          break
++        }
++
++        if (!readTagProperty(state, props, nodeContext === CONTEXT_FLOW_IN) && !readAnchorProperty(state, props)) {
++          break
++        }
+ 
+-      if (propertyStart === null) propertyStart = propertyState
++        if (propertyStart === null) propertyStart = propertyState
+ 
+-      if (skipSeparationSpace(state, true)) {
+-        atNewLine = true
+-        allowBlockCollections = allowBlockStyles
++        if (skipSeparationSpace(state, true)) {
++          atNewLine = true
++          allowBlockCollections = allowBlockStyles
+ 
+-        if (state.lineIndent > parentIndent) {
+-          indentStatus = 1
+-        } else if (state.lineIndent === parentIndent) {
+-          indentStatus = 0
++          if (state.lineIndent > parentIndent) {
++            indentStatus = 1
++          } else if (state.lineIndent === parentIndent) {
++            indentStatus = 0
++          } else {
++            indentStatus = -1
++          }
+         } else {
+-          indentStatus = -1
++          allowBlockCollections = false
+         }
+-      } else {
+-        allowBlockCollections = false
+       }
+     }
+   }
+@@ -1286,7 +1458,7 @@ function parseNode (
+           restoreState(state, propertyStart)
+ 
+           if (readBlockMapping(state, propertyIndent, flowIndent, emptyProperties()) &&
+-              state.events[fallbackState.eventsLength]?.type === EVENT_ID.MAPPING) {
++              isMappingAt(state, fallbackState.eventsLength)) {
+             hasContent = true
+           } else {
+             restoreState(state, fallbackState)
+@@ -1405,7 +1577,6 @@ function readDocument (state: ParserState) {
+     throwError(state, 'directives end mark is expected')
+   }
+ 
+-  const documentEventIndex = state.events.length
+   if (!explicitStart &&
+       state.position === state.lineStart &&
+       state.input.charCodeAt(state.position) === 0x2E/* . */ &&
+@@ -1415,7 +1586,7 @@ function readDocument (state: ParserState) {
+     return
+   }
+ 
+-  addDocumentEvent(state, explicitStart, false)
++  const docIdx = addDocumentEvent(state, explicitStart, false)
+   if (!parseNode(state, state.lineIndent - 1, CONTEXT_BLOCK_OUT, false, allowCompact, allowCompact)) {
+     addEmptyScalarEvent(state)
+   }
+@@ -1433,8 +1604,7 @@ function readDocument (state: ParserState) {
+     }
+   }
+ 
+-  const documentEvent = state.events[documentEventIndex]
+-  if (documentEvent?.type === EVENT_ID.DOCUMENT) documentEvent.explicitEnd = explicitEnd
++  state.docs[docIdx].explicitEnd = explicitEnd
+ 
+   addPopEvent(state)
+ 
+@@ -1445,13 +1615,14 @@ function readDocument (state: ParserState) {
+   }
+ }
+ 
+-/**
+- * Parses YAML into a flat event stream referencing source text by offsets.
+- *
+- * @category Events
+- */
+-function parseEvents (input: string, options: ParserOptions): Event[] {
++function parseToTape (input: string, options: ParserOptions): EventTape {
+   const length = input.length
++  const nullpos = input.indexOf('\0')
++  if (nullpos !== -1) {
++    YAMLException.throwAt(input, nullpos, 'null byte is not allowed in input', options.filename ?? DEFAULT_PARSER_OPTIONS.filename)
++  }
++
++  const initialCap = Math.max(256, Math.min(length >> 1, 1 << 21))
+   const state: ParserState = {
+     ...DEFAULT_PARSER_OPTIONS,
+     ...options,
+@@ -1465,12 +1636,11 @@ function parseEvents (input: string, options: ParserOptions): Event[] {
+     depth: 0,
+     directives: [],
+     tagHandlers: Object.create(null),
+-    events: []
++    tape: new Int32Array(initialCap),
++    tapeLen: 0,
++    docs: []
+   }
+ 
+-  const nullpos = input.indexOf('\0')
+-  if (nullpos !== -1) YAMLException.throwAt(input, nullpos, 'null byte is not allowed in input', state.filename)
+-
+   while (state.position < state.length) {
+     skipByteOrderMark(state)
+     skipSeparationSpace(state, true)
+@@ -1485,11 +1655,25 @@ function parseEvents (input: string, options: ParserOptions): Event[] {
+     }
+   }
+ 
+-  return state.events
++  return {
++    data: state.tape,
++    length: state.tapeLen,
++    docs: state.docs
++  }
++}
++
++/**
++ * Parses YAML into a flat event stream referencing source text by offsets.
++ *
++ * @category Events
++ */
++function parseEvents (input: string, options: ParserOptions): Event[] {
++  return materializeEvents(parseToTape(input, options))
+ }
+ 
+ export {
+   parseEvents,
++  parseToTape,
+   DEFAULT_PARSER_OPTIONS,
+   type ParserOptions
+ }
+diff --git a/src/parser/tape.ts b/src/parser/tape.ts
+new file mode 100644
+index 0000000..64b4a86
+--- /dev/null
++++ b/src/parser/tape.ts
+@@ -0,0 +1,153 @@
++import {
++  EVENT_ID,
++  CHOMPING_MODE,
++  type Event,
++  type ScalarStyle,
++  type CollectionStyle,
++  type ChompingMode,
++  type DocumentEvent
++} from './events.ts'
++
++const NO_RANGE = -1
++
++const TAPE_DOCUMENT = 1
++const TAPE_SEQ_FAST = 2
++const TAPE_SEQ_FULL = 3
++const TAPE_MAP_FAST = 4
++const TAPE_MAP_FULL = 5
++const TAPE_SCALAR_FAST = 6
++const TAPE_SCALAR_FULL = 7
++const TAPE_ALIAS = 8
++const TAPE_POP = 9
++
++interface EventTape {
++  data: Int32Array
++  length: number
++  docs: DocumentEvent[]
++}
++
++function materializeEvents (tape: EventTape): Event[] {
++  const { data, length, docs } = tape
++  const events: Event[] = []
++  let i = 0
++
++  while (i < length) {
++    const header = data[i++]
++    const kind = header & 0x0F
++
++    switch (kind) {
++      case TAPE_DOCUMENT: {
++        events.push(docs[data[i++]])
++        break
++      }
++      case TAPE_SEQ_FAST: {
++        events.push({
++          type: EVENT_ID.SEQUENCE,
++          start: data[i++],
++          anchorStart: NO_RANGE,
++          anchorEnd: NO_RANGE,
++          tagStart: NO_RANGE,
++          tagEnd: NO_RANGE,
++          style: ((header >>> 4) & 0x0F) as CollectionStyle
++        })
++        break
++      }
++      case TAPE_SEQ_FULL: {
++        events.push({
++          type: EVENT_ID.SEQUENCE,
++          start: data[i++],
++          anchorStart: data[i++],
++          anchorEnd: data[i++],
++          tagStart: data[i++],
++          tagEnd: data[i++],
++          style: data[i++] as CollectionStyle
++        })
++        break
++      }
++      case TAPE_MAP_FAST: {
++        events.push({
++          type: EVENT_ID.MAPPING,
++          start: data[i++],
++          anchorStart: NO_RANGE,
++          anchorEnd: NO_RANGE,
++          tagStart: NO_RANGE,
++          tagEnd: NO_RANGE,
++          style: ((header >>> 4) & 0x0F) as CollectionStyle
++        })
++        break
++      }
++      case TAPE_MAP_FULL: {
++        events.push({
++          type: EVENT_ID.MAPPING,
++          start: data[i++],
++          anchorStart: data[i++],
++          anchorEnd: data[i++],
++          tagStart: data[i++],
++          tagEnd: data[i++],
++          style: data[i++] as CollectionStyle
++        })
++        break
++      }
++      case TAPE_SCALAR_FAST: {
++        events.push({
++          type: EVENT_ID.SCALAR,
++          valueStart: data[i++],
++          valueEnd: data[i++],
++          anchorStart: NO_RANGE,
++          anchorEnd: NO_RANGE,
++          tagStart: NO_RANGE,
++          tagEnd: NO_RANGE,
++          style: ((header >>> 4) & 0x0F) as ScalarStyle,
++          chomping: CHOMPING_MODE.CLIP,
++          indent: -1,
++          fast: ((header >>> 8) & 1) === 1
++        })
++        break
++      }
++      case TAPE_SCALAR_FULL: {
++        events.push({
++          type: EVENT_ID.SCALAR,
++          valueStart: data[i++],
++          valueEnd: data[i++],
++          anchorStart: data[i++],
++          anchorEnd: data[i++],
++          tagStart: data[i++],
++          tagEnd: data[i++],
++          style: data[i++] as ScalarStyle,
++          chomping: data[i++] as ChompingMode,
++          indent: data[i++],
++          fast: data[i++] === 1
++        })
++        break
++      }
++      case TAPE_ALIAS: {
++        events.push({
++          type: EVENT_ID.ALIAS,
++          anchorStart: data[i++],
++          anchorEnd: data[i++]
++        })
++        break
++      }
++      case TAPE_POP: {
++        events.push({ type: EVENT_ID.POP })
++        break
++      }
++    }
++  }
++
++  return events
++}
++
++export {
++  TAPE_DOCUMENT,
++  TAPE_SEQ_FAST,
++  TAPE_SEQ_FULL,
++  TAPE_MAP_FAST,
++  TAPE_MAP_FULL,
++  TAPE_SCALAR_FAST,
++  TAPE_SCALAR_FULL,
++  TAPE_ALIAS,
++  TAPE_POP,
++  materializeEvents,
++  type EventTape
++}
+diff --git a/src/schema.ts b/src/schema.ts
+index 2305172..0e0ac20 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -97,8 +97,12 @@ class Schema {
+    * first character).
+    */
+   private readonly implicitScalarByFirstChar: ReadonlyMap<string, readonly ScalarTagDefinition[]>
++  private readonly implicitScalarByCharCode: readonly (readonly ScalarTagDefinition[] | undefined)[]
+   private readonly implicitScalarAnyFirstChar: readonly ScalarTagDefinition[]
+ 
++  /** @internal */
++  readonly hasMergeTag: boolean
++
+   /**
+    * The default scalar tag (`!!str`), resolved once so the composer's fallback
+    * for unresolved plain scalars avoids a keyed lookup per scalar.
+@@ -162,9 +166,15 @@ class Schema {
+     }
+ 
+     const implicitScalarByFirstChar = new Map<string, ScalarTagDefinition[]>()
++    const implicitScalarByCharCode: (readonly ScalarTagDefinition[] | undefined)[] = new Array(128)
+     for (const key of keys) {
+-      implicitScalarByFirstChar.set(key, implicitScalarTags.filter(tag =>
+-        tag.implicitFirstChars === null || tag.implicitFirstChars.indexOf(key) !== -1))
++      const bucket = implicitScalarTags.filter(tag =>
++        tag.implicitFirstChars === null || tag.implicitFirstChars.indexOf(key) !== -1)
++      implicitScalarByFirstChar.set(key, bucket)
++      if (key.length === 1) {
++        const code = key.charCodeAt(0)
++        if (code < 128) implicitScalarByCharCode[code] = bucket
++      }
+     }
+ 
+     const defaultScalarTag = exact.scalar['tag:yaml.org,2002:str']
+@@ -173,7 +183,9 @@ class Schema {
+     this.tags = compiledTags
+     this.implicitScalarTags = implicitScalarTags
+     this.implicitScalarByFirstChar = implicitScalarByFirstChar
++    this.implicitScalarByCharCode = implicitScalarByCharCode
+     this.implicitScalarAnyFirstChar = implicitScalarAnyFirstChar
++    this.hasMergeTag = Boolean(exact.scalar['tag:yaml.org,2002:merge'])
+     this.defaultScalarTag = defaultScalarTag
+     this.defaultSequenceTag = exact.sequence['tag:yaml.org,2002:seq']
+     this.defaultMappingTag = exact.mapping['tag:yaml.org,2002:map']
+@@ -219,10 +231,18 @@ class Schema {
+ 
+   /** @internal */
+   resolveImplicitScalarTag (source: string): { value: unknown, tag: ScalarTagDefinition } {
+-    const candidates = this.implicitScalarByFirstChar.get(source.charAt(0)) ??
+-      this.implicitScalarAnyFirstChar
++    let candidates: readonly ScalarTagDefinition[]
++    if (source.length === 0) {
++      candidates = this.implicitScalarByFirstChar.get('') ?? this.implicitScalarAnyFirstChar
++    } else {
++      const code = source.charCodeAt(0)
++      candidates = code < 128
++        ? (this.implicitScalarByCharCode[code] ?? this.implicitScalarAnyFirstChar)
++        : (this.implicitScalarByFirstChar.get(source.charAt(0)) ?? this.implicitScalarAnyFirstChar)
++    }
+ 
+-    for (const tag of candidates) {
++    for (let i = 0; i < candidates.length; i++) {
++      const tag = candidates[i]
+       const value = tag.resolve(source, false, tag.tagName)
+       if (value !== NOT_RESOLVED) return { value, tag }
+     }
+@@ -231,6 +251,28 @@ class Schema {
+     return { value: tag.resolve(source, false, tag.tagName), tag }
+   }
+ 
++  /** @internal */
++  resolveImplicitScalarValue (source: string): unknown {
++    let candidates: readonly ScalarTagDefinition[]
++    if (source.length === 0) {
++      candidates = this.implicitScalarByFirstChar.get('') ?? this.implicitScalarAnyFirstChar
++    } else {
++      const code = source.charCodeAt(0)
++      candidates = code < 128
++        ? (this.implicitScalarByCharCode[code] ?? this.implicitScalarAnyFirstChar)
++        : (this.implicitScalarByFirstChar.get(source.charAt(0)) ?? this.implicitScalarAnyFirstChar)
++    }
++
++    for (let i = 0; i < candidates.length; i++) {
++      const tag = candidates[i]
++      const value = tag.resolve(source, false, tag.tagName)
++      if (value !== NOT_RESOLVED) return value
++    }
++
++    const tag = this.defaultScalarTag
++    return tag.resolve(source, false, tag.tagName)
++  }
++
+   /**
+    * Creates a new schema with the specified tags added. If a tag already
+    * exists, it is replaced by the specified tag.
+diff --git a/src/tag/scalar/float_core.ts b/src/tag/scalar/float_core.ts
+index 566ae28..5be1c0a 100644
+--- a/src/tag/scalar/float_core.ts
++++ b/src/tag/scalar/float_core.ts
+@@ -18,6 +18,13 @@ const YAML_FLOAT_SPECIAL_PATTERN = new RegExp(
+   '|\\.(?:nan|NaN|NAN))$')
+ 
+ function resolveYamlFloat (source: string) {
++  const len = source.length
++  if (len === 0) return NOT_RESOLVED
++  // Quick reject for common non-floats (e.g. dates, semver, words starting with digit/sign).
++  const last = source.charCodeAt(len - 1)
++  if ((last < 0x30 || last > 0x39) && last !== 0x2E/* . */ && last !== 0x66/* f */ && last !== 0x46/* F */ && last !== 0x6E/* n */ && last !== 0x4E/* N */) {
++    return NOT_RESOLVED
++  }
+   if (!YAML_FLOAT_PATTERN.test(source)) return NOT_RESOLVED
+ 
+   let value = source.toLowerCase()
+diff --git a/src/tag/scalar/int_core.ts b/src/tag/scalar/int_core.ts
+index 53f5486..cc92f0c 100644
+--- a/src/tag/scalar/int_core.ts
++++ b/src/tag/scalar/int_core.ts
+@@ -38,6 +38,40 @@ function parseYamlInteger (source: string) {
+ }
+ 
+ function resolveYamlInteger (source: string, isExplicit: boolean) {
++  const len = source.length
++  if (len === 0) return NOT_RESOLVED
++
++  let i = 0
++  let neg = false
++  const c0 = source.charCodeAt(0)
++  if (c0 === 0x2D/* - */) {
++    neg = true
++    i = 1
++  } else if (c0 === 0x2B/* + */) {
++    i = 1
++  }
++
++  if (i < len && len - i <= 15) {
++    const first = source.charCodeAt(i)
++    if (first >= 0x30 && first <= 0x39) {
++      let val = first - 0x30
++      let j = i + 1
++      let allDigits = true
++      for (; j < len; j++) {
++        const d = source.charCodeAt(j) - 0x30
++        if (d < 0 || d > 9) {
++          allDigits = false
++          break
++        }
++        val = val * 10 + d
++      }
++      if (allDigits) {
++        return neg ? (val === 0 ? -0 : -val) : val
++      }
++      if (first !== 0x30 || j !== i + 1) return NOT_RESOLVED
++    }
++  }
++
+   if (isExplicit) {
+     if (!YAML_INTEGER_EXPLICIT_PATTERN.test(source)) return NOT_RESOLVED
+   } else if (!YAML_INTEGER_IMPLICIT_PATTERN.test(source)) {
