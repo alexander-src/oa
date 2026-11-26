@@ -82,8 +82,9 @@ fn detect_cpu_model() -> Option<String> {
 pub fn shell_command(cmd: &str, cwd: &Path) -> Command {
     #[cfg(target_os = "windows")]
     let mut c = {
+        use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
-        c.args(["/C", cmd]);
+        c.raw_arg("/S /C").raw_arg(format!("\"{cmd}\""));
         c
     };
     #[cfg(not(target_os = "windows"))]
