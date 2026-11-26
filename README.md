@@ -89,35 +89,35 @@ Every result below was measured on real code with locked test suites, byte-ident
     <tr>
       <td><strong>andialbrecht/sqlparse</strong><br/><sub>Python · ~4k stars · 30M+ PyPI/mo</sub></td>
       <td>Wall time<br/><sub>+ Peak RSS</sub></td>
-      <td><strong>2.55x faster</strong> (<code>253.9 ms -&gt; 99.8 ms</code>, <code>-7.9%</code> RAM)<br/><sub><strong>4.3x to 10.5x</strong> across upstream <code>benchmarks/*.py</code></sub></td>
+      <td><strong>2.55x faster</strong> (<code>253.9&nbsp;→&nbsp;99.8 ms</code>, <code>-7.9%</code> RAM)<br/><sub><strong>4.3x to 10.5x</strong> across upstream <code>benchmarks/*.py</code></sub></td>
       <td>537/537 pytest pass<br/><sub><code>p = 0.0000</code> · 1 regression caught</sub></td>
       <td><a href="docs/showcases/sqlparse.md">Report</a> · <a href="docs/showcases/sqlparse.patch">Patch</a></td>
     </tr>
     <tr>
       <td><strong>Python-Markdown/markdown</strong><br/><sub>Python · ~4.1k stars · powers MkDocs</sub></td>
       <td>Wall time</td>
-      <td><strong>1.92x faster</strong> convert (<code>497.3 ms -&gt; 258.8 ms</code>)<br/><sub><strong>1.53x</strong> full CLI incl. cold Python start</sub></td>
+      <td><strong>1.92x faster</strong> convert (<code>497.3&nbsp;→&nbsp;258.8 ms</code>)<br/><sub><strong>1.53x</strong> full CLI incl. cold Python start</sub></td>
       <td>1,230/1,230 tests pass<br/><sub><code>p = 0.0000</code> · O(N^2) TOC bug fixed</sub></td>
       <td><a href="docs/showcases/python-markdown.md">Report</a> · <a href="docs/showcases/python-markdown.patch">Patch</a></td>
     </tr>
     <tr>
       <td><strong>brave/adblock-rust</strong><br/><sub>Rust · 134,208 EasyList rules</sub></td>
       <td>Wall time<br/><sub>Linux <code>perf</code></sub></td>
-      <td><strong>1.05x faster</strong> (<code>142.7 ms -&gt; 136.1 ms</code>)<br/><sub>already 3.05 IPC native Rust</sub></td>
+      <td><strong>1.05x faster</strong> (<code>142.7&nbsp;→&nbsp;136.1 ms</code>)<br/><sub>already 3.05 IPC native Rust</sub></td>
       <td>246/246 cargo tests<br/><sub>2 regressions + 2 noise edits blocked</sub></td>
       <td><a href="docs/showcases/adblock-rust.md">Report</a> · <a href="docs/showcases/adblock-rust.patch">Patch</a></td>
     </tr>
     <tr>
       <td><strong>examples/ram_aggregator</strong><br/><sub>Bundled · reproducible in 15s</sub></td>
       <td>Peak RSS<br/><sub><code>--metric rss</code></sub></td>
-      <td><strong>8.34x less RAM</strong> (<code>160.0 -&gt; 19.2 MiB</code>, <code>-88.0%</code>)<br/><sub>plus 1.29x faster wall time</sub></td>
+      <td><strong>8.34x less RAM</strong> (<code>160.0&nbsp;→&nbsp;19.2 MiB</code>, <code>-88.0%</code>)<br/><sub>plus 1.29x faster wall time</sub></td>
       <td>2/2 locked tests<br/><sub><code>p = 0.0002</code> · exact SHA-256</sub></td>
       <td><a href="docs/showcases/ram-aggregator.md">Report</a> · <a href="examples/ram_aggregator/">Code</a></td>
     </tr>
     <tr>
       <td><strong>examples/slow_log_parser</strong><br/><sub>Bundled · reproducible in 15s</sub></td>
       <td>Wall time<br/><sub><code>--metric wall</code></sub></td>
-      <td><strong>9.13x faster</strong> (<code>512.7 ms -&gt; 55.7 ms</code>)</td>
+      <td><strong>9.13x faster</strong> (<code>512.7&nbsp;→&nbsp;55.7 ms</code>)</td>
       <td>Locked test suite<br/><sub><code>p = 0.0002</code> · Cheat Guard demo</sub></td>
       <td><a href="examples/slow_log_parser/">Code</a></td>
     </tr>
