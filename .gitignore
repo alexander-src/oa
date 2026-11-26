@@ -1,0 +1,9 @@
+/target
+/.oa
+**/*.rs.bk
+*.prof
+perf.data*
+callgrind.out.*
+__pycache__/
+*.pyc
+*.pyo

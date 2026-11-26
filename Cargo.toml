@@ -1,0 +1,20 @@
+[package]
+name = "oa"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Optimize Anything: cross-language profiling, equivalence-gated interleaved benchmarking, and autonomous performance loops for coding agents"
+license = "MIT"
+repository = "https://github.com/alexander-src/oa"
+homepage = "https://github.com/alexander-src/oa"
+keywords = ["benchmark", "profiler", "mcp", "optimization", "performance"]
+categories = ["command-line-utilities", "development-tools::profiling"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
