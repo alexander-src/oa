@@ -315,6 +315,22 @@ pub struct LedgerResponse {
     pub dead_ends: Vec<String>,
 }
 
+fn cumulative_gain(config: &SessionConfig, baseline: &BaselineRecord) -> f64 {
+    match config.metric {
+        MetricTarget::Wall => {
+            if config.best_median_ms > 1e-9 {
+                baseline.timing.median_ms / config.best_median_ms
+            } else {
+                1.0
+            }
+        }
+        MetricTarget::Rss => match (baseline.peak_rss_kb, config.best_peak_rss_kb) {
+            (Some(b), Some(best)) if best > 0 => b as f64 / best as f64,
+            _ => 1.0,
+        },
+    }
+}
+
 fn ensure_worktree_ready(
     root: &Path,
     name: &str,
@@ -956,11 +972,7 @@ pub fn checkpoint_session(params: CheckpointParams) -> Result<CheckpointResponse
             };
             append_ledger_entry(&root, &entry)?;
 
-            let cumulative = if config.best_median_ms > 1e-9 {
-                baseline.timing.median_ms / config.best_median_ms
-            } else {
-                1.0
-            };
+            let cumulative = cumulative_gain(&config, &baseline);
 
             Ok(CheckpointResponse {
                 entry,
@@ -1008,11 +1020,7 @@ pub fn checkpoint_session(params: CheckpointParams) -> Result<CheckpointResponse
             };
             append_ledger_entry(&root, &entry)?;
 
-            let cumulative = if config.best_median_ms > 1e-9 {
-                baseline.timing.median_ms / config.best_median_ms
-            } else {
-                1.0
-            };
+            let cumulative = cumulative_gain(&config, &baseline);
 
             Ok(CheckpointResponse {
                 entry,
@@ -1070,11 +1078,7 @@ pub fn get_ledger(path: Option<&str>) -> Result<LedgerResponse, String> {
         })
         .collect();
 
-    let cumulative_speedup = if config.best_median_ms > 1e-9 {
-        baseline.timing.median_ms / config.best_median_ms
-    } else {
-        1.0
-    };
+    let cumulative_speedup = cumulative_gain(&config, &baseline);
 
     Ok(LedgerResponse {
         repo_root: root.to_string_lossy().to_string(),
@@ -1128,20 +1132,40 @@ pub fn render_markdown_report(path: Option<&str>) -> Result<String, String> {
     md.push_str("## Summary\n\n");
     md.push_str("| Metric | Baseline | Best | Delta |\n");
     md.push_str("| --- | ---: | ---: | ---: |\n");
-    md.push_str(&format!(
-        "| Median wall time | {:.2} ms | {:.2} ms | **{:.2}x** |\n",
-        ledger.baseline_median_ms, ledger.best_median_ms, ledger.cumulative_speedup
-    ));
+    if config.metric == MetricTarget::Wall {
+        md.push_str(&format!(
+            "| Median wall time | {:.2} ms | {:.2} ms | **{:.2}x** |\n",
+            ledger.baseline_median_ms, ledger.best_median_ms, ledger.cumulative_speedup
+        ));
+    } else {
+        let wall_ratio = if ledger.best_median_ms > 1e-9 {
+            ledger.baseline_median_ms / ledger.best_median_ms
+        } else {
+            1.0
+        };
+        md.push_str(&format!(
+            "| Median wall time | {:.2} ms | {:.2} ms | {:.2}x |\n",
+            ledger.baseline_median_ms, ledger.best_median_ms, wall_ratio
+        ));
+    }
     if let (Some(b_rss), Some(best_rss)) = (baseline.peak_rss_kb, config.best_peak_rss_kb) {
         let delta_pct = if b_rss > 0 {
             ((best_rss as f64 - b_rss as f64) / b_rss as f64) * 100.0
         } else {
             0.0
         };
-        md.push_str(&format!(
-            "| Peak RSS | {} KiB | {} KiB | {:+.1}% |\n",
-            b_rss, best_rss, delta_pct
-        ));
+        if config.metric == MetricTarget::Rss && best_rss > 0 {
+            let ratio = b_rss as f64 / best_rss as f64;
+            md.push_str(&format!(
+                "| Peak RSS | {} KiB | {} KiB | **{:.2}x** ({:+.1}%) |\n",
+                b_rss, best_rss, ratio, delta_pct
+            ));
+        } else {
+            md.push_str(&format!(
+                "| Peak RSS | {} KiB | {} KiB | {:+.1}% |\n",
+                b_rss, best_rss, delta_pct
+            ));
+        }
     }
     md.push_str(&format!(
         "| Experiments | 0 | {} ({} kept, {} reverted) | Pareto IDs: {:?} |\n\n",
@@ -1155,9 +1179,13 @@ pub fn render_markdown_report(path: Option<&str>) -> Result<String, String> {
     if ledger.entries.is_empty() {
         md.push_str("No experiments recorded yet.\n\n");
     } else {
-        md.push_str(
-            "| # | Status | Hypothesis | Files | Speedup | 95% CI | p-value | Median ms |\n",
-        );
+        let (gain_col, med_col) = match config.metric {
+            MetricTarget::Wall => ("Speedup", "Median ms"),
+            MetricTarget::Rss => ("Reduction", "Median KiB"),
+        };
+        md.push_str(&format!(
+            "| # | Status | Hypothesis | Files | {gain_col} | 95% CI | p-value | {med_col} |\n"
+        ));
         md.push_str("| ---: | --- | --- | --- | ---: | --- | ---: | ---: |\n");
         for e in &ledger.entries {
             let files = if e.changed_files.is_empty() {

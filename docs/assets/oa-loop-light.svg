@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="186" viewBox="0 0 880 186" role="img" aria-label="oa verification loop architecture">
+  <style>
+    .bg { fill: #ffffff; stroke: #d0d7de; stroke-width: 1; }
+    .box { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1; }
+    .box-gate { fill: #dafbe1; stroke: #1a7f37; stroke-width: 1.2; }
+    .step { font: 600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #0969da; }
+    .step-gate { font: 600 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1a7f37; }
+    .label { font: 600 13px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .desc { font: 400 11px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; }
+    .arrow { stroke: #6e7781; stroke-width: 1.5; fill: none; }
+    .loop { stroke: #0969da; stroke-width: 1.3; stroke-dasharray: 4 3; fill: none; }
+    .loop-lbl { font: 500 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #0969da; }
+  </style>
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#6e7781"/>
+    </marker>
+    <marker id="ah-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#0969da"/>
+    </marker>
+  </defs>
+
+  <rect x="1" y="1" width="878" height="184" rx="12" class="bg"/>
+
+  <!-- Box 1: Init -->
+  <rect x="20" y="24" width="150" height="104" rx="8" class="box"/>
+  <text x="34" y="46" class="step">1. oa_init</text>
+  <text x="34" y="66" class="label">Lock baseline</text>
+  <text x="34" y="85" class="desc">Snapshot baseline ref</text>
+  <text x="34" y="100" class="desc">Lock tests (SHA-256)</text>
+  <text x="34" y="115" class="desc">Record reference output</text>
+
+  <line x1="170" y1="76" x2="192" y2="76" class="arrow" marker-end="url(#ah)"/>
+
+  <!-- Box 2: Profile -->
+  <rect x="194" y="24" width="150" height="104" rx="8" class="box"/>
+  <text x="208" y="46" class="step">2. oa_profile</text>
+  <text x="208" y="66" class="label">Find hotspots</text>
+  <text x="208" y="85" class="desc">cProfile + tracemalloc</text>
+  <text x="208" y="100" class="desc">Node V8 · Linux perf</text>
+  <text x="208" y="115" class="desc">Classify CPU / alloc / IO</text>
+
+  <line x1="344" y1="76" x2="366" y2="76" class="arrow" marker-end="url(#ah)"/>
+
+  <!-- Box 3: Edit -->
+  <rect x="368" y="24" width="136" height="104" rx="8" class="box"/>
+  <text x="382" y="46" class="step">3. agent edit</text>
+  <text x="382" y="66" class="label">Patch source</text>
+  <text x="382" y="85" class="desc">Targets top hotspot</text>
+  <text x="382" y="100" class="desc">Normal working tree</text>
+  <text x="382" y="115" class="desc">Tests stay read-only</text>
+
+  <line x1="504" y1="76" x2="526" y2="76" class="arrow" marker-end="url(#ah)"/>
+
+  <!-- Box 4: Evaluate -->
+  <rect x="528" y="24" width="166" height="104" rx="8" class="box-gate"/>
+  <text x="542" y="46" class="step-gate">4. oa_evaluate</text>
+  <text x="542" y="66" class="label">Verify &amp; A/B</text>
+  <text x="542" y="85" class="desc">Cheat Guard + test suite</text>
+  <text x="542" y="100" class="desc">Exact SHA-256 output gate</text>
+  <text x="542" y="115" class="desc">Interleaved A/B worktrees</text>
+
+  <line x1="694" y1="76" x2="716" y2="76" class="arrow" marker-end="url(#ah)"/>
+
+  <!-- Box 5: Checkpoint -->
+  <rect x="718" y="24" width="142" height="104" rx="8" class="box"/>
+  <text x="732" y="46" class="step">5. oa_checkpoint</text>
+  <text x="732" y="66" class="label">Keep or revert</text>
+  <text x="732" y="85" class="desc">Keep -&gt; refs/oa/best</text>
+  <text x="732" y="100" class="desc">Revert + log dead end</text>
+  <text x="732" y="115" class="desc">Export PR report</text>
+
+  <!-- Return loop arrow from Checkpoint back to Profile -->
+  <path d="M 789 128 L 789 158 L 269 158 L 269 132" class="loop" marker-end="url(#ah-blue)"/>
+  <text x="529" y="152" text-anchor="middle" class="loop-lbl">next hypothesis (dead ends stay visible in oa_ledger)</text>
+</svg>

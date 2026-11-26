@@ -1,0 +1,295 @@
+diff --git a/src/blocker.rs b/src/blocker.rs
+index 9d243ab..604a97a 100644
+--- a/src/blocker.rs
++++ b/src/blocker.rs
+@@ -198,12 +198,16 @@ impl Blocker {
+ 
+         // only check the rest of the rules if not previously matched
+         let filter = if important_filter.is_none() && !matched_rule {
+-            self.tagged_filters_all()
+-                .check(request, &self.tags_enabled, &mut regex_manager)
+-                .or_else(|| {
+-                    self.filters()
+-                        .check(request, get_no_tags(), &mut regex_manager)
+-                })
++            let tagged = if self.tags_enabled.is_empty() {
++                None
++            } else {
++                self.tagged_filters_all()
++                    .check(request, &self.tags_enabled, &mut regex_manager)
++            };
++            tagged.or_else(|| {
++                self.filters()
++                    .check(request, get_no_tags(), &mut regex_manager)
++            })
+         } else {
+             important_filter
+         };
+diff --git a/src/filters/fb_builder.rs b/src/filters/fb_builder.rs
+index e35b27a..d75deda 100644
+--- a/src/filters/fb_builder.rs
++++ b/src/filters/fb_builder.rs
+@@ -1,8 +1,10 @@
+ //! Builder for creating flatbuffer with serialized engine.
+ 
+ use std::collections::HashMap;
++use std::hash::BuildHasherDefault;
+ 
+ use flatbuffers::WIPOffset;
++use rustc_hash::FxHasher;
+ 
+ use crate::flatbuffers::containers::flat_serialize::FlatBuilder;
+ use crate::flatbuffers::unsafe_tools::VerifiedFlatbufferMemory;
+@@ -14,7 +16,7 @@ use super::flat::fb;
+ pub(crate) struct EngineFlatBuilder<'a> {
+     fb_builder: flatbuffers::FlatBufferBuilder<'a>,
+     unique_domains_hashes: Vec<Hash>,
+-    unique_domains_hashes_map: HashMap<Hash, u32>,
++    unique_domains_hashes_map: HashMap<Hash, u32, BuildHasherDefault<FxHasher>>,
+ }
+ 
+ impl<'a> EngineFlatBuilder<'a> {
+diff --git a/src/filters/fb_network.rs b/src/filters/fb_network.rs
+index c19943a..81cd9a7 100644
+--- a/src/filters/fb_network.rs
++++ b/src/filters/fb_network.rs
+@@ -168,10 +168,13 @@ impl<'a> FlatNetworkFilter<'a> {
+ 
+     #[inline(always)]
+     pub fn patterns(&self) -> FlatPatterns<'_> {
+-        FlatPatterns::new(
+-            self.fb_filter.single_pattern(),
+-            self.fb_filter.multi_patterns(),
+-        )
++        if let Some(single) = self.fb_filter.single_pattern() {
++            FlatPatterns::Single(single)
++        } else if let Some(multi) = self.fb_filter.multi_patterns() {
++            FlatPatterns::Multi(multi)
++        } else {
++            FlatPatterns::Empty
++        }
+     }
+ 
+     #[inline(always)]
+diff --git a/src/filters/filter_data_context.rs b/src/filters/filter_data_context.rs
+index 4b393a7..61db69c 100644
+--- a/src/filters/filter_data_context.rs
++++ b/src/filters/filter_data_context.rs
+@@ -1,6 +1,10 @@
+ use crate::flatbuffers::unsafe_tools::VerifiedFlatbufferMemory;
+ use crate::utils::Hash;
++use rustc_hash::FxHasher;
+ use std::collections::HashMap;
++use std::hash::BuildHasherDefault;
++
++pub(crate) type DomainHashMap = HashMap<Hash, u32, BuildHasherDefault<FxHasher>>;
+ 
+ #[cfg(feature = "single-thread")]
+ pub(crate) type FilterDataContextRef = std::rc::Rc<FilterDataContext>;
+@@ -12,7 +16,7 @@ pub(crate) type FilterDataContextRef = std::sync::Arc<FilterDataContext>;
+ // Supposed to be stored via FilterDataContextRef to avoid copying the data.
+ pub(crate) struct FilterDataContext {
+     pub(crate) memory: VerifiedFlatbufferMemory,
+-    pub(crate) unique_domains_hashes_map: HashMap<Hash, u32>,
++    pub(crate) unique_domains_hashes_map: DomainHashMap,
+     pub(crate) debug: bool,
+ }
+ 
+@@ -21,8 +25,10 @@ impl FilterDataContext {
+         // Reconstruct the unique_domains_hashes_map from the flatbuffer data
+         let root = memory.root();
+         let debug = root.debug();
+-        let mut unique_domains_hashes_map: HashMap<crate::utils::Hash, u32> = HashMap::new();
+-        for (index, hash) in root.unique_domains_hashes().iter().enumerate() {
++        let domains = root.unique_domains_hashes();
++        let mut unique_domains_hashes_map: DomainHashMap =
++            HashMap::with_capacity_and_hasher(domains.len(), Default::default());
++        for (index, hash) in domains.iter().enumerate() {
+             unique_domains_hashes_map.insert(hash, index as u32);
+         }
+         FilterDataContextRef::new(Self {
+diff --git a/src/filters/network_matchers.rs b/src/filters/network_matchers.rs
+index 11f39e3..59287e6 100644
+--- a/src/filters/network_matchers.rs
++++ b/src/filters/network_matchers.rs
+@@ -12,10 +12,65 @@ use crate::regex_manager::RegexManager;
+ use crate::request;
+ use crate::utils::{self, Hash};
+ use std::collections::HashMap;
++use std::hash::BuildHasher;
++
++/// Fast one-shot substring search that avoids `memmem::FinderBuilder` construction
++/// overhead on short URLs and hostnames.
++#[inline]
++fn fast_find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
++    let nlen = needle.len();
++    if nlen == 0 {
++        return Some(0);
++    }
++    let hlen = haystack.len();
++    if nlen > hlen {
++        return None;
++    }
++    if nlen == 1 {
++        return memchr::memchr(needle[0], haystack);
++    }
++    if hlen > 512 && nlen > 16 {
++        return memmem::find(haystack, needle);
++    }
++    // Prefer scanning for a less frequent byte than leading '/', '.', or '-' common in URL filters.
++    let first = needle[0];
++    let last_offset = nlen - 1;
++    let last = needle[last_offset];
++    let anchor_off = if matches!(first, b'/' | b'.' | b'-' | b'_' | b'a' | b'e' | b's' | b't')
++        && !matches!(last, b'/' | b'.' | b'-' | b'_' | b'a' | b'e' | b's' | b't')
++    {
++        last_offset
++    } else if nlen >= 3
++        && matches!(first, b'/' | b'.' | b'-' | b'_' | b'a' | b'e' | b's' | b't')
++    {
++        nlen / 2
++    } else {
++        0
++    };
++    let anchor_byte = needle[anchor_off];
++    let tail_after = last_offset - anchor_off;
++    let search_end = hlen - tail_after;
++    let mut pos = anchor_off;
++    while pos < search_end {
++        let Some(rel) = memchr::memchr(anchor_byte, &haystack[pos..search_end]) else {
++            return None;
++        };
++        let hit = pos + rel;
++        let idx = hit - anchor_off;
++        if haystack[idx] == first
++            && haystack[idx + last_offset] == last
++            && haystack[idx..idx + nlen] == *needle
++        {
++            return Some(idx);
++        }
++        pos = hit + 1;
++    }
++    None
++}
+ 
+ fn get_url_after_hostname<'a>(url: &'a str, hostname: &str) -> &'a str {
+     let start =
+-        memmem::find(url.as_bytes(), hostname.as_bytes()).unwrap_or(url.len() - hostname.len());
++        fast_find_bytes(url.as_bytes(), hostname.as_bytes()).unwrap_or(url.len() - hostname.len());
+     &url[start + hostname.len()..]
+ }
+ 
+@@ -41,7 +96,7 @@ fn is_anchored_by_hostname(
+     } else if filter_hostname_len == hostname_len {
+         // If they have the same len(), they should be equal
+         filter_hostname == hostname
+-    } else if let Some(match_index) = memmem::find(hostname.as_bytes(), filter_hostname.as_bytes())
++    } else if let Some(match_index) = fast_find_bytes(hostname.as_bytes(), filter_hostname.as_bytes())
+     {
+         if match_index == 0 {
+             // `filter_hostname` is a prefix of `hostname` and needs to match full a label.
+@@ -87,7 +142,7 @@ where
+     }
+ 
+     let request_url = request.get_url(mask.match_case());
+-    filters.any(|f| memmem::find(request_url.as_bytes(), f.as_bytes()).is_some())
++    filters.any(|f| fast_find_bytes(request_url.as_bytes(), f.as_bytes()).is_some())
+ }
+ 
+ // pattern|
+@@ -193,7 +248,7 @@ where
+                     filters,
+                     key,
+                     request,
+-                    memmem::find(request_url.as_bytes(), hostname.as_bytes()).unwrap_or_default()
++                    fast_find_bytes(request_url.as_bytes(), hostname.as_bytes()).unwrap_or_default()
+                         + hostname.len(),
+                     regex_manager,
+                 )
+@@ -348,7 +403,7 @@ where
+                 let url_after_hostname = get_url_after_hostname(request_url, hostname);
+                 filters.any(|f| {
+                     // Filter hostname does not necessarily have to be a full, proper hostname, part of it can be lumped together with the URL
+-                    url_after_hostname.contains(f)
++                    fast_find_bytes(url_after_hostname.as_bytes(), f.as_bytes()).is_some()
+                 })
+             } else {
+                 false
+@@ -415,10 +470,10 @@ pub fn check_options(mask: NetworkFilterMask, request: &request::Request) -> boo
+ }
+ 
+ #[inline]
+-pub fn check_included_domains_mapped(
++pub fn check_included_domains_mapped<S: BuildHasher>(
+     opt_domains: Option<&[u32]>,
+     hostname_hashes: Option<&[Hash]>,
+-    mapping: &HashMap<Hash, u32>,
++    mapping: &HashMap<Hash, u32, S>,
+ ) -> bool {
+     // Hostname must be among these domains to match
+     if let Some(included_domains) = opt_domains.as_ref() {
+@@ -439,10 +494,10 @@ pub fn check_included_domains_mapped(
+ }
+ 
+ #[inline]
+-pub fn check_excluded_domains_mapped(
++pub fn check_excluded_domains_mapped<S: BuildHasher>(
+     opt_not_domains: Option<&[u32]>,
+     hostname_hashes: Option<&[Hash]>,
+-    mapping: &HashMap<Hash, u32>,
++    mapping: &HashMap<Hash, u32, S>,
+ ) -> bool {
+     if let Some(excluded_domains) = opt_not_domains.as_ref() {
+         if let Some(hashes) = hostname_hashes {
+diff --git a/src/flatbuffers/containers/flat_multimap.rs b/src/flatbuffers/containers/flat_multimap.rs
+index b21c699..5a56985 100644
+--- a/src/flatbuffers/containers/flat_multimap.rs
++++ b/src/flatbuffers/containers/flat_multimap.rs
+@@ -34,6 +34,11 @@ where
+         }
+     }
+ 
++    #[inline(always)]
++    pub fn is_empty(&self) -> bool {
++        self.keys.len() == 0
++    }
++
+     pub fn get(&self, key: I) -> Option<FlatMultiMapViewIterator<'a, I, V, Keys>> {
+         let index = self.keys.partition_point(|x| *x < key);
+         if index < self.keys.len() && self.keys.get(index) == key {
+diff --git a/src/network_filter_list.rs b/src/network_filter_list.rs
+index c59c1d8..cf55886 100644
+--- a/src/network_filter_list.rs
++++ b/src/network_filter_list.rs
+@@ -201,6 +201,9 @@ impl NetworkFilterList<'_> {
+         regex_manager: &mut RegexManager,
+         mut on_match: impl FnMut(CheckResult) -> bool,
+     ) -> bool {
++        if filter_map.is_empty() || tokens.is_empty() {
++            return false;
++        }
+         for token in tokens {
+             if let Some(iter) = filter_map.get(to_short_hash(*token)) {
+                 for fb_filter in iter {
+diff --git a/src/request.rs b/src/request.rs
+index f83dd5c..5f18e87 100644
+--- a/src/request.rs
++++ b/src/request.rs
+@@ -165,14 +165,15 @@ impl Request {
+         let source_hostname_hashes = hostname_hashes_from_labels(source_hostname);
+ 
+         let url_lower_cased = url.to_ascii_lowercase();
++        let request_tokens = calculate_tokens(&url_lower_cased);
+ 
+         Request {
+             request_type,
+             method,
+             url: url.to_owned(),
+-            url_lower_cased: url_lower_cased.to_owned(),
++            url_lower_cased,
+             hostname: hostname.to_owned(),
+-            request_tokens: calculate_tokens(&url_lower_cased),
++            request_tokens,
+             hostname_hashes,
+             source_hostname_hashes,
+             is_third_party: third_party,

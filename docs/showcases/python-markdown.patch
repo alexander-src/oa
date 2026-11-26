@@ -1,0 +1,964 @@
+diff --git a/markdown/blockparser.py b/markdown/blockparser.py
+index 549c9ec..80c8410 100644
+--- a/markdown/blockparser.py
++++ b/markdown/blockparser.py
+@@ -152,9 +152,11 @@ class BlockParser:
+             blocks: The blocks of text to parse.
+ 
+         """
++        processors = list(self.blockprocessors)
+         while blocks:
+-            for processor in self.blockprocessors:
+-                if processor.test(parent, blocks[0]):
++            block = blocks[0]
++            for processor in processors:
++                if processor.test(parent, block):
+                     if processor.run(parent, blocks) is not False:
+                         # run returns True or None
+                         break
+diff --git a/markdown/blockprocessors.py b/markdown/blockprocessors.py
+index 11ff0dd..d8e4a8c 100644
+--- a/markdown/blockprocessors.py
++++ b/markdown/blockprocessors.py
+@@ -291,7 +291,7 @@ class BlockQuoteProcessor(BlockProcessor):
+     RE = re.compile(r'(^|\n)[ ]{0,3}>[ ]?(.*)')
+ 
+     def test(self, parent: etree.Element, block: str) -> bool:
+-        return bool(self.RE.search(block)) and not util.nearing_recursion_limit()
++        return '>' in block and bool(self.RE.search(block)) and not util.nearing_recursion_limit()
+ 
+     def run(self, parent: etree.Element, blocks: list[str]) -> None:
+         block = blocks.pop(0)
+@@ -508,7 +508,7 @@ class SetextHeaderProcessor(BlockProcessor):
+     RE = re.compile(r'^.*?\n(?:=+|-+)[ ]*(\n|$)', re.MULTILINE)
+ 
+     def test(self, parent: etree.Element, block: str) -> bool:
+-        return bool(self.RE.match(block))
++        return '\n' in block and ('=' in block or '-' in block) and bool(self.RE.match(block))
+ 
+     def run(self, parent: etree.Element, blocks: list[str]) -> None:
+         lines = blocks.pop(0).split('\n', 2)
+@@ -534,6 +534,8 @@ class HRProcessor(BlockProcessor):
+     SEARCH_RE = re.compile(RE, re.MULTILINE)
+ 
+     def test(self, parent: etree.Element, block: str) -> bool:
++        if '-' not in block and '*' not in block and '_' not in block:
++            return False
+         m = self.SEARCH_RE.search(block)
+         if m:
+             # Save match object on class instance so we can use it later.
+@@ -593,7 +595,7 @@ class ReferenceProcessor(BlockProcessor):
+     )
+ 
+     def test(self, parent: etree.Element, block: str) -> bool:
+-        return True
++        return ']:' in block
+ 
+     def run(self, parent: etree.Element, blocks: list[str]) -> bool:
+         block = blocks.pop(0)
+diff --git a/markdown/core.py b/markdown/core.py
+index 4faa423..b9ce3c8 100644
+--- a/markdown/core.py
++++ b/markdown/core.py
+@@ -43,6 +43,50 @@ __all__ = ['Markdown', 'markdown', 'markdownFromFile']
+ logger = logging.getLogger('MARKDOWN')
+ 
+ 
++class _BlockLevelList(list):
++    """List with an O(1) shadow set for `Markdown.is_block_level`."""
++
++    def __init__(self, items: Iterable[str]):
++        super().__init__(items)
++        self._set: set[str] = set(self)
++
++    def _sync(self) -> None:
++        self._set = set(self)
++
++    def append(self, item: str) -> None:
++        super().append(item)
++        self._set.add(item)
++
++    def extend(self, items: Iterable[str]) -> None:
++        super().extend(items)
++        self._set.update(items)
++
++    def insert(self, index: int, item: str) -> None:
++        super().insert(index, item)
++        self._set.add(item)
++
++    def remove(self, item: str) -> None:
++        super().remove(item)
++        self._sync()
++
++    def pop(self, index: int = -1) -> str:
++        val = super().pop(index)
++        self._sync()
++        return val
++
++    def clear(self) -> None:
++        super().clear()
++        self._set.clear()
++
++    def __setitem__(self, index: Any, value: Any) -> None:
++        super().__setitem__(index, value)
++        self._sync()
++
++    def __delitem__(self, index: Any) -> None:
++        super().__delitem__(index)
++        self._sync()
++
++
+ class Markdown:
+     """
+     A parser which converts Markdown to HTML.
+@@ -114,7 +158,7 @@ class Markdown:
+         ]
+         """ List of characters which get the backslash escape treatment. """
+ 
+-        self.block_level_elements: list[str] = BLOCK_LEVEL_ELEMENTS.copy()
++        self.block_level_elements: list[str] = _BlockLevelList(BLOCK_LEVEL_ELEMENTS)
+ 
+         self.registeredExtensions: list[Extension] = []
+         self.docType = ""  # TODO: Maybe delete this. It does not appear to be used anymore.
+@@ -320,8 +364,12 @@ class Markdown:
+         not a string always returns `False`.
+ 
+         """
+-        if isinstance(tag, str):
+-            return tag.lower().rstrip('/') in self.block_level_elements
++        if type(tag) is str or isinstance(tag, str):
++            norm = tag if (tag.islower() and (not tag or tag[-1] != '/')) else tag.lower().rstrip('/')
++            ble = self.block_level_elements
++            if type(ble) is _BlockLevelList:
++                return norm in ble._set
++            return norm in ble
+         # Some ElementTree tags are not strings, so return False.
+         return False
+ 
+diff --git a/markdown/extensions/attr_list.py b/markdown/extensions/attr_list.py
+index 060e476..d463538 100644
+--- a/markdown/extensions/attr_list.py
++++ b/markdown/extensions/attr_list.py
+@@ -120,64 +120,67 @@ class AttrListTreeprocessor(Treeprocessor):
+     NAME_RE = NAME_RE
+ 
+     def run(self, doc: Element) -> None:
++        is_block = self.md.is_block_level
++        header_tags = ('dt', 'td', 'th')
++        list_tags = ('ul', 'ol')
++        block_re = self.BLOCK_RE
++        header_re = self.HEADER_RE
++        inline_re = self.INLINE_RE
+         for elem in doc.iter():
+-            if self.md.is_block_level(elem.tag):
++            tag = elem.tag
++            if is_block(tag):
+                 # Block level: check for `attrs` on last line of text
+-                RE = self.BLOCK_RE
+-                if isheader(elem) or elem.tag in ['dt', 'td', 'th']:
+-                    # header, def-term, or table cell: check for attributes at end of element
+-                    RE = self.HEADER_RE
+-                if len(elem) and elem.tag == 'li':
+-                    # special case list items. children may include a `ul` or `ol`.
++                RE = header_re if (isheader(elem) or tag in header_tags) else block_re
++                n_children = len(elem)
++                if n_children and tag == 'li':
+                     pos = None
+-                    # find the `ul` or `ol` position
+                     for i, child in enumerate(elem):
+-                        if child.tag in ['ul', 'ol']:
++                        if child.tag in list_tags:
+                             pos = i
+                             break
+                     if pos is None and elem[-1].tail:
+-                        # use tail of last child. no `ul` or `ol`.
+-                        m = RE.search(elem[-1].tail)
+-                        if m:
+-                            if not self.assign_attrs(elem, m.group(1), strict=True):
+-                                elem[-1].tail = elem[-1].tail[:m.start()]
++                        t = elem[-1].tail
++                        if '{' in t:
++                            m = RE.search(t)
++                            if m:
++                                if not self.assign_attrs(elem, m.group(1), strict=True):
++                                    elem[-1].tail = t[:m.start()]
+                     elif pos is not None and pos > 0 and elem[pos-1].tail:
+-                        # use tail of last child before `ul` or `ol`
+-                        m = RE.search(elem[pos-1].tail)
+-                        if m:
+-                            if not self.assign_attrs(elem, m.group(1), strict=True):
+-                                elem[pos-1].tail = elem[pos-1].tail[:m.start()]
+-                    elif elem.text:
+-                        # use text. `ul` is first child.
++                        t = elem[pos-1].tail
++                        if '{' in t:
++                            m = RE.search(t)
++                            if m:
++                                if not self.assign_attrs(elem, m.group(1), strict=True):
++                                    elem[pos-1].tail = t[:m.start()]
++                    elif elem.text and '{' in elem.text:
+                         m = RE.search(elem.text)
+                         if m:
+                             if not self.assign_attrs(elem, m.group(1), strict=True):
+                                 elem.text = elem.text[:m.start()]
+-                elif len(elem) and elem[-1].tail:
+-                    # has children. Get from tail of last child
+-                    m = RE.search(elem[-1].tail)
+-                    if m:
+-                        if not self.assign_attrs(elem, m.group(1), strict=True):
+-                            elem[-1].tail = elem[-1].tail[:m.start()]
+-                            if isheader(elem):
+-                                # clean up trailing #s
+-                                elem[-1].tail = elem[-1].tail.rstrip('#').rstrip()
+-                elif elem.text:
+-                    # no children. Get from text.
++                elif n_children and elem[-1].tail:
++                    t = elem[-1].tail
++                    if '{' in t:
++                        m = RE.search(t)
++                        if m:
++                            if not self.assign_attrs(elem, m.group(1), strict=True):
++                                elem[-1].tail = t[:m.start()]
++                                if isheader(elem):
++                                    elem[-1].tail = elem[-1].tail.rstrip('#').rstrip()
++                elif elem.text and '{' in elem.text:
+                     m = RE.search(elem.text)
+                     if m:
+                         if not self.assign_attrs(elem, m.group(1), strict=True):
+                             elem.text = elem.text[:m.start()]
+                             if isheader(elem):
+-                                # clean up trailing #s
+                                 elem.text = elem.text.rstrip('#').rstrip()
+             else:
+                 # inline: check for `attrs` at start of tail
+-                if elem.tail:
+-                    m = self.INLINE_RE.match(elem.tail)
++                tail = elem.tail
++                if tail and tail[0] == '{':
++                    m = inline_re.match(tail)
+                     if m:
+                         remainder = self.assign_attrs(elem, m.group(1))
+-                        elem.tail = elem.tail[m.end():] + remainder
++                        elem.tail = tail[m.end():] + remainder
+ 
+     def assign_attrs(self, elem: Element, attrs_string: str, *, strict: bool = False) -> str:
+         """ Assign `attrs` to element.
+diff --git a/markdown/extensions/def_list.py b/markdown/extensions/def_list.py
+index fe9be0c..07ef75a 100644
+--- a/markdown/extensions/def_list.py
++++ b/markdown/extensions/def_list.py
+@@ -38,7 +38,7 @@ class DefListProcessor(BlockProcessor):
+         # A definition calls `parseBlocks` on its content, which can contain
+         # further definitions, so the nesting has to stop short of the
+         # interpreter's limit, as it does for blockquotes and lists.
+-        return bool(self.RE.search(block)) and not util.nearing_recursion_limit()
++        return ':' in block and bool(self.RE.search(block)) and not util.nearing_recursion_limit()
+ 
+     def run(self, parent: etree.Element, blocks: list[str]) -> bool | None:
+ 
+diff --git a/markdown/extensions/footnotes.py b/markdown/extensions/footnotes.py
+index 580cf59..2702986 100644
+--- a/markdown/extensions/footnotes.py
++++ b/markdown/extensions/footnotes.py
+@@ -260,7 +260,7 @@ class FootnoteBlockProcessor(BlockProcessor):
+         self.footnotes = footnotes
+ 
+     def test(self, parent: etree.Element, block: str) -> bool:
+-        return True
++        return ']:' in block and '[^' in block
+ 
+     def run(self, parent: etree.Element, blocks: list[str]) -> bool:
+         """ Find, set, and remove footnote definitions. """
+diff --git a/markdown/extensions/tables.py b/markdown/extensions/tables.py
+index 1a230db..a24caa8 100644
+--- a/markdown/extensions/tables.py
++++ b/markdown/extensions/tables.py
+@@ -54,6 +54,8 @@ class TableProcessor(BlockProcessor):
+ 
+         Keep border check and separator row do avoid repeating the work.
+         """
++        if '|' not in block or '\n' not in block or ('-' not in block and ':' not in block):
++            return False
+         is_table = False
+         # Only the first two rows are needed in most cases. Splitting the whole
+         # block here would make every test linear in the size of the block.
+@@ -157,6 +159,8 @@ class TableProcessor(BlockProcessor):
+ 
+     def _split(self, row: str) -> list[str]:
+         """ split a row of text with some code into a list of cells. """
++        if '`' not in row and '\\' not in row:
++            return row.split('|')
+         elements = []
+         pipes = []
+         tics = []
+diff --git a/markdown/extensions/toc.py b/markdown/extensions/toc.py
+index 57960ad..7ee74ba 100644
+--- a/markdown/extensions/toc.py
++++ b/markdown/extensions/toc.py
+@@ -258,6 +258,10 @@ def nest_toc_tokens(toc_list):
+     return ordered_list
+ 
+ 
++_HEADER_TAGS = frozenset(('h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6'))
++_SKIP_MARKER_TAGS = _HEADER_TAGS | frozenset(('pre', 'code'))
++
++
+ class TocTreeprocessor(Treeprocessor):
+     """ Step through document and build TOC. """
+ 
+@@ -292,31 +296,26 @@ class TocTreeprocessor(Treeprocessor):
+         # We do not allow the marker inside a header as that
+         # would causes an endless loop of placing a new TOC
+         # inside previously generated TOC.
++        skip_tags = _SKIP_MARKER_TAGS
+         for child in node:
+-            if not self.header_rgx.match(child.tag) and child.tag not in ['pre', 'code']:
++            if child.tag not in skip_tags:
+                 yield node, child
+-                yield from self.iterparent(child)
++                if len(child):
++                    yield from self.iterparent(child)
+ 
+     def replace_marker(self, root: etree.Element, elem: etree.Element) -> None:
+         """ Replace marker with elem. """
++        marker = self.marker
+         for (p, c) in self.iterparent(root):
+-            text = ''.join(c.itertext()).strip()
+-            if not text:
+-                continue
+-
+-            # To keep the output from screwing up the
+-            # validation by putting a `<div>` inside of a `<p>`
+-            # we actually replace the `<p>` in its entirety.
+-
+             # The `<p>` element may contain more than a single text content
+-            # (`nl2br` can introduce a `<br>`). In this situation, `c.text` returns
+-            # the very first content, ignore children contents or tail content.
+-            # `len(c) == 0` is here to ensure there is only text in the `<p>`.
+-            if c.text and c.text.strip() == self.marker and len(c) == 0:
+-                for i in range(len(p)):
+-                    if p[i] == c:
+-                        p[i] = elem
+-                        break
++            # (`nl2br` can introduce a `<br>`). `len(c) == 0` ensures only text.
++            if len(c) == 0:
++                text = c.text
++                if text and marker in text and text.strip() == marker:
++                    for i in range(len(p)):
++                        if p[i] == c:
++                            p[i] = elem
++                            break
+ 
+     def set_level(self, elem: etree.Element) -> None:
+         """ Adjust header level according to base level. """
+@@ -393,8 +392,10 @@ class TocTreeprocessor(Treeprocessor):
+         id_counters: dict[str, int] = {}
+ 
+         toc_tokens = []
++        header_tags = _HEADER_TAGS
+         for el in doc.iter():
+-            if isinstance(el.tag, str) and self.header_rgx.match(el.tag):
++            tag = el.tag
++            if tag in header_tags or (isinstance(tag, str) and len(tag) > 2 and self.header_rgx.match(tag)):
+                 self.set_level(el)
+                 innerhtml = render_inner_html(remove_fnrefs(el), self.md)
+                 name = strip_tags(innerhtml)
+diff --git a/markdown/inlinepatterns.py b/markdown/inlinepatterns.py
+index 46db28a..334cc4d 100644
+--- a/markdown/inlinepatterns.py
++++ b/markdown/inlinepatterns.py
+@@ -43,6 +43,7 @@ from __future__ import annotations
+ from . import util
+ from typing import TYPE_CHECKING, Any, Collection, NamedTuple, cast
+ from collections import deque
++from bisect import bisect_right
+ import re
+ import xml.etree.ElementTree as etree
+ from html import entities
+@@ -1273,21 +1274,56 @@ class LinkInlineProcessor(InlineProcessor):
+ 
+         return href, title, index, handled
+ 
++    _BRACKET_RE = re.compile(r'[\[\]]')
++
+     def getText(self, data: str, index: int) -> tuple[str, int, bool]:
+         """Parse the content between `[]` of the start of an image or link
+         resolving nested square brackets.
+ 
+         """
+         # Scanning forward from every `[` is quadratic when the brackets do not
+-        # close, so find the closing bracket for every index of `data` at once.
++        # close, so index all bracket transitions in `data` once and answer each
++        # query in O(log K) where K is the number of brackets in `data`.
+         if self._bracket_data is not data:
+             self._bracket_data = data
+-            self._bracket_ends = self._findBracketEnds(data)
+-        end = self._bracket_ends[index]
++            if ']' not in data:
++                self._bracket_starts = None
++                self._bracket_ends = None
++            else:
++                self._bracket_starts, self._bracket_ends = self._findBracketIntervals(data)
++        if self._bracket_starts is None:
++            return data[index:], len(data), False
++        iv = bisect_right(self._bracket_starts, index) - 1
++        end = self._bracket_ends[iv]
+         if end is None:
+             return data[index:], len(data), False
+         return data[index:end - 1], end, True
+ 
++    @classmethod
++    def _findBracketIntervals(cls, data: str) -> tuple[list[int], list[int | None]]:
++        starts: list[int] = [0]
++        ends: list[int | None] = [None]
++        depth = 0
++        stack: list[tuple[int, int]] = [(0, 0)]
++        starts_append = starts.append
++        ends_append = ends.append
++        stack_append = stack.append
++        stack_pop = stack.pop
++        for m in cls._BRACKET_RE.finditer(data):
++            p = m.start()
++            if data[p] == '[':
++                depth += 1
++            else:
++                depth -= 1
++            pos = p + 1
++            while stack and depth < stack[-1][1]:
++                ends[stack_pop()[0]] = pos
++            iv_idx = len(starts)
++            starts_append(pos)
++            ends_append(None)
++            stack_append((iv_idx, depth))
++        return starts, ends
++
+     @staticmethod
+     def _findBracketEnds(data: str) -> list[int | None]:
+         """
+diff --git a/markdown/serializers.py b/markdown/serializers.py
+index 69f031c..acd5036 100644
+--- a/markdown/serializers.py
++++ b/markdown/serializers.py
+@@ -137,84 +137,169 @@ def _escape_attrib_html(text: str) -> str:
+         _raise_serialization_error(text)
+ 
+ 
++_RAW_TEXT_TAGS = frozenset(("script", "style"))
++
++
+ def _serialize_html(write: Callable[[str], None], elem: Element, format: Literal["html", "xhtml"]) -> None:
+-    stack: deque[Element | str] = deque([elem])
++    stack: list[Element | str] = [elem]
++    stack_pop = stack.pop
++    stack_append = stack.append
++    stack_extend = stack.extend
++    html_empty = HTML_EMPTY
++    raw_tags = _RAW_TEXT_TAGS
++    bool_attrs = BOOLEAN_ATTRIBUTES['html']
++    is_xhtml = format == "xhtml"
++    is_html = format == "html"
++    qname_cls = QName
++    str_cls = str
++    escape_cdata = _escape_cdata
++    escape_attrib_html = _escape_attrib_html
++    comment_tag = Comment
++    pi_tag = ProcessingInstruction
+ 
+-    count = 0
+     while stack:
+-        count += 1
+-        el = stack.popleft()
++        el = stack_pop()
+ 
+-        if isinstance(el, str):
++        if type(el) is str_cls or isinstance(el, str_cls):
+             write(el)
+             continue
+ 
+         tag = el.tag
+         text = el.text
+ 
+-        if tag is Comment:
+-            write(f"<!--{_escape_cdata(text)}-->")
+-        elif tag is ProcessingInstruction:
+-            write(f"<?{_escape_cdata(text)}?>")
++        if type(tag) is str_cls:
++            tag_l = tag if tag.islower() else tag.lower()
++            attrib = el.attrib
++            tail = el.tail
++            if not attrib:
++                if is_xhtml and tag_l in html_empty:
++                    write(f"<{tag} />")
++                    if tail:
++                        write(escape_cdata(tail) if ('&' in tail or '<' in tail or '>' in tail) else tail)
++                    continue
++                if len(el) == 0:
++                    if tag_l in html_empty:
++                        if text:
++                            t_out = text if tag_l in raw_tags else (escape_cdata(text) if ('&' in text or '<' in text or '>' in text) else text)
++                            write(f"<{tag}>{t_out}")
++                        else:
++                            write(f"<{tag}>")
++                    elif text:
++                        t_out = text if tag_l in raw_tags else (escape_cdata(text) if ('&' in text or '<' in text or '>' in text) else text)
++                        write(f"<{tag}>{t_out}</{tag}>")
++                    else:
++                        write(f"<{tag}></{tag}>")
++                    if tail:
++                        write(escape_cdata(tail) if ('&' in tail or '<' in tail or '>' in tail) else tail)
++                    continue
++                if text:
++                    t_out = text if tag_l in raw_tags else (escape_cdata(text) if ('&' in text or '<' in text or '>' in text) else text)
++                    write(f"<{tag}>{t_out}")
++                else:
++                    write(f"<{tag}>")
++                if tail:
++                    stack_append(escape_cdata(tail) if ('&' in tail or '<' in tail or '>' in tail) else tail)
++                if tag_l not in html_empty:
++                    stack_append(f"</{tag}>")
++                stack_extend(el[::-1])
++                continue
++
++            parts = [f"<{tag}"]
++            parts_append = parts.append
++            items = attrib.items() if len(attrib) == 1 else sorted(attrib.items())
++            for k, v in items:
++                if type(k) is not str_cls and isinstance(k, qname_cls):
++                    k = k.text
++                if v is None:
++                    parts_append(f" {k}")
++                else:
++                    if type(v) is not str_cls and isinstance(v, qname_cls):
++                        v = v.text
++                    if type(v) is not str_cls or '&' in v or '<' in v or '>' in v or '"' in v:
++                        v = escape_attrib_html(v)
++                    if is_html and k == v and k in bool_attrs:
++                        parts_append(f" {v}")
++                    else:
++                        parts_append(f' {k}="{v}"')
++            if is_xhtml and tag_l in html_empty:
++                parts_append(" />")
++                write("".join(parts))
++                if tail:
++                    write(escape_cdata(tail) if ('&' in tail or '<' in tail or '>' in tail) else tail)
++                continue
++            parts_append(">")
++            if text:
++                parts_append(text if tag_l in raw_tags else (escape_cdata(text) if ('&' in text or '<' in text or '>' in text) else text))
++            if len(el) == 0:
++                if tag_l not in html_empty:
++                    parts_append(f"</{tag}>")
++                write("".join(parts))
++                if tail:
++                    write(escape_cdata(tail) if ('&' in tail or '<' in tail or '>' in tail) else tail)
++                continue
++            write("".join(parts))
++            if tail:
++                stack_append(escape_cdata(tail) if ('&' in tail or '<' in tail or '>' in tail) else tail)
++            if tag_l not in html_empty:
++                stack_append(f"</{tag}>")
++            stack_extend(el[::-1])
++            continue
++
++        if tag is comment_tag:
++            write(f"<!--{escape_cdata(text)}-->")
++        elif tag is pi_tag:
++            write(f"<?{escape_cdata(text)}?>")
+         elif tag is None:
+             if text:
+-                write(_escape_cdata(text))
+-            # Add the children in reverse order so we process them in the right order.
++                write(escape_cdata(text))
+             if el.tail:
+-                stack.appendleft(_escape_cdata(el.tail))
+-            stack.extendleft(reversed(el))
++                stack_append(escape_cdata(el.tail))
++            stack_extend(el[::-1])
+             continue
+         else:
+             namespace_uri = None
+-            if isinstance(tag, QName):
+-                # `QNAME` objects store their data as a string: `{uri}tag`
++            if isinstance(tag, qname_cls):
+                 if tag.text[:1] == "{":
+                     namespace_uri, tag = tag.text[1:].split("}", 1)
+                 else:
+                     raise ValueError('QName objects must define a tag.')
++            tag_l = tag.lower()
+             write(f"<{tag}")
+             items = el.items()
+             if items:
+-                items = sorted(items)  # lexical order
++                items = sorted(items)
+                 for k, v in items:
+-                    if isinstance(k, QName):
+-                        # Assume a text only `QName`
++                    if isinstance(k, qname_cls):
+                         k = k.text
+-                    if isinstance(v, QName):
+-                        # Assume a text only `QName`
++                    if isinstance(v, qname_cls):
+                         v = v.text
+                     if v is None:
+-                        # A valueless attribute is preserved exactly as it
+-                        # was provided: render the bare attribute name.
+                         write(f" {k}")
+                     else:
+-                        v = _escape_attrib_html(v)
+-                        if k == v and format == 'html' and k in BOOLEAN_ATTRIBUTES['html']:
+-                            # handle boolean attributes
++                        v = escape_attrib_html(v)
++                        if k == v and is_html and k in bool_attrs:
+                             write(f" {v}")
+                         else:
+                             write(f' {k}="{v}"')
+             if namespace_uri:
+                 write(f' xmlns="{_escape_attrib(namespace_uri)}"')
+-            if format == "xhtml" and tag.lower() in HTML_EMPTY:
++            if is_xhtml and tag_l in html_empty:
+                 write(" />")
+             else:
+                 write(">")
+                 if text:
+-                    if tag.lower() in ["script", "style"]:
++                    if tag_l in raw_tags:
+                         write(text)
+                     else:
+-                        write(_escape_cdata(text))
+-                # Add the tail, end tag, and then the children in reverse order.
+-                # Since we pop from the left, this will ensure results are ordered correctly.
++                        write(escape_cdata(text))
+                 if el.tail:
+-                    stack.appendleft(_escape_cdata(el.tail))
+-                if tag.lower() not in HTML_EMPTY:
+-                    stack.appendleft(f"</{tag}>")
+-                stack.extendleft(reversed(el))
++                    stack_append(escape_cdata(el.tail))
++                if tag_l not in html_empty:
++                    stack_append(f"</{tag}>")
++                stack_extend(el[::-1])
+                 continue
+         if el.tail:
+-            write(_escape_cdata(el.tail))
++            write(escape_cdata(el.tail))
+ 
+ 
+ def _write_html(root: Element, format: Literal["html", "xhtml"] = "html") -> str:
+diff --git a/markdown/treeprocessors.py b/markdown/treeprocessors.py
+index 4fdf3c8..3edecad 100644
+--- a/markdown/treeprocessors.py
++++ b/markdown/treeprocessors.py
+@@ -26,6 +26,7 @@ references, or last minute adjustments.
+ 
+ from __future__ import annotations
+ 
++from collections import deque
+ import re
+ import xml.etree.ElementTree as etree
+ from typing import TYPE_CHECKING, Any
+@@ -72,6 +73,43 @@ class Treeprocessor(util.Processor):
+         pass  # pragma: no cover
+ 
+ 
++_REF_ONLY_CLASSES = (
++    inlinepatterns.ReferenceInlineProcessor,
++    inlinepatterns.ImageReferenceInlineProcessor,
++    inlinepatterns.ShortReferenceInlineProcessor,
++    inlinepatterns.ShortImageReferenceInlineProcessor,
++)
++
++# Exact required literal triggers for built-in inline patterns.
++# Each entry maps pattern.pattern -> (all_substrings_required, any_substring_required).
++_PATTERN_TRIGGERS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
++    r'(?:(?<!\\)((?:\\{2})+)(?=`+)|(?<!\\)`)': (('`',), ()),
++    r'\\(.)': (('\\',), ()),
++    r'\[\^([^\]]*)\]': (('[^',), ()),
++    r'(?<!\!)\[': (('[',), ()),
++    r'\!\[': (('![',), ()),
++    r'<([A-Za-z][A-Za-z0-9+.-]*://[^<>]*)>': (('<', '://'), ()),
++    r'<([^<> !]+@[^@<> ]+)>': (('<', '@'), ()),
++    r'  \n': (('  \n',), ()),
++    r'\*|_': ((), ('*', '_')),
++}
++
++
++def _pattern_triggers(pattern: inlinepatterns.Pattern) -> tuple[tuple[str, ...], tuple[str, ...]]:
++    pat = getattr(pattern, 'pattern', None)
++    if pat is None:
++        return (), ()
++    hit = _PATTERN_TRIGGERS.get(pat)
++    if hit is not None:
++        return hit
++    if isinstance(pattern, inlinepatterns.HtmlInlineProcessor):
++        if pat.startswith('(<'):
++            return ('<',), ()
++        if pat.startswith('(&'):
++            return ('&',), ()
++    return (), ()
++
++
+ class InlineProcessor(Treeprocessor):
+     """
+     A `Treeprocessor` that traverses a tree, applying inline patterns.
+@@ -86,6 +124,18 @@ class InlineProcessor(Treeprocessor):
+         self.md = md
+         self.inlinePatterns = md.inlinePatterns
+         self.ancestors: list[str] = []
++        self._compiled_patterns: list[tuple[Any, ...]] | None = None
++
++    def _build_compiled_patterns(self) -> list[tuple[Any, ...]]:
++        compiled = []
++        for pattern in self.inlinePatterns:
++            new_style = isinstance(pattern, inlinepatterns.InlineProcessor)
++            reg = pattern.getCompiledRegExp()
++            excludes = tuple(ex.lower() for ex in pattern.ANCESTOR_EXCLUDES)
++            req_all, req_any = _pattern_triggers(pattern)
++            needs_refs = type(pattern) in _REF_ONLY_CLASSES
++            compiled.append((pattern, reg, new_style, excludes, req_all, req_any, needs_refs))
++        return compiled
+ 
+     def __makePlaceholder(self, type: str) -> tuple[str, str]:
+         """ Generate a placeholder """
+@@ -130,11 +180,51 @@ class InlineProcessor(Treeprocessor):
+ 
+         """
+         if not isinstance(data, util.AtomicString):
++            patterns = self._compiled_patterns
++            if patterns is None:
++                patterns = self._build_compiled_patterns()
+             startIndex = 0
+-            count = len(self.inlinePatterns)
++            count = len(patterns)
++            has_refs = bool(self.md.references)
++            ancestors = self.ancestors
+             while patternIndex < count:
+-                data, matched, startIndex = self.__applyPattern(
+-                    self.inlinePatterns[patternIndex], data, patternIndex, startIndex
++                pattern, reg, new_style, excludes, req_all, req_any, needs_refs = patterns[patternIndex]
++                if needs_refs and not has_refs:
++                    patternIndex += 1
++                    startIndex = 0
++                    continue
++                if req_all:
++                    skip = False
++                    for tok in req_all:
++                        if tok not in data:
++                            skip = True
++                            break
++                    if skip:
++                        patternIndex += 1
++                        startIndex = 0
++                        continue
++                elif req_any:
++                    found = False
++                    for tok in req_any:
++                        if tok in data:
++                            found = True
++                            break
++                    if not found:
++                        patternIndex += 1
++                        startIndex = 0
++                        continue
++                if excludes:
++                    excluded = False
++                    for exclude in excludes:
++                        if exclude in ancestors:
++                            excluded = True
++                            break
++                    if excluded:
++                        patternIndex += 1
++                        startIndex = 0
++                        continue
++                data, matched, startIndex = self.__applyPatternFast(
++                    pattern, reg, new_style, data, patternIndex, startIndex
+                 )
+                 if not matched:
+                     patternIndex += 1
+@@ -250,6 +340,62 @@ class InlineProcessor(Treeprocessor):
+ 
+         return result
+ 
++    def __applyPatternFast(
++        self,
++        pattern: inlinepatterns.Pattern,
++        compiled_re: re.Pattern[str],
++        new_style: bool,
++        data: str,
++        patternIndex: int,
++        startIndex: int = 0
++    ) -> tuple[str, bool, int]:
++        if new_style:
++            match = None
++            for match in compiled_re.finditer(data, startIndex):
++                node, start, end = pattern.handleMatch(match, data)
++                if start is None or end is None:
++                    startIndex += match.end(0)
++                    match = None
++                    continue
++                break
++        else:  # pragma: no cover
++            match = compiled_re.match(data[startIndex:])
++            leftData = data[:startIndex]
++
++        if not match:
++            return data, False, 0
++
++        if not new_style:  # pragma: no cover
++            node = pattern.handleMatch(match)
++            start = match.start(0)
++            end = match.end(0)
++
++        if node is None:
++            return data, True, end
++
++        if not isinstance(node, str):
++            if not isinstance(node.text, util.AtomicString):
++                for child in (node, *node):
++                    if child.text:
++                        self.ancestors.append(child.tag.lower())
++                        child.text = self.__handleInline(
++                            child.text, patternIndex + 1
++                        )
++                        self.ancestors.pop()
++                    if child.tail:
++                        child.tail = self.__handleInline(
++                            child.tail, patternIndex
++                        )
++
++        placeholder = self.__stashNode(node, pattern.type())
++
++        if new_style:
++            return f"{data[:start]}{placeholder}{data[end:]}", True, start + len(placeholder)
++        else:  # pragma: no cover
++            return f"{leftData}{match.group(1)}{placeholder}{match.groups()[-1]}", True, (
++                len(leftData) + len(match.group(1)) + len(placeholder)
++            )
++
+     def __applyPattern(
+         self,
+         pattern: inlinepatterns.Pattern,
+@@ -364,17 +510,20 @@ class InlineProcessor(Treeprocessor):
+ 
+         """
+         self.stashed_nodes: dict[str, etree.Element | str] = {}
++        self._compiled_patterns = self._build_compiled_patterns()
+ 
+         # Ensure a valid parent list, but copy passed in lists
+         # to ensure we don't have the user accidentally change it on us.
+         tree_parents = [] if ancestors is None else ancestors[:]
+ 
+         self.parent_map = {c: p for p in tree.iter() for c in p}
+-        stack = [(tree, tree_parents)]
++        stack: deque[tuple[etree.Element, list[str]]] = deque([(tree, tree_parents)])
+         self.__build_ancestors(tree, tree_parents)
++        ph_prefix = self.__placeholder_prefix
++        atomic_str = util.AtomicString
+ 
+         while stack:
+-            currElement, parents = stack.pop(0)
++            currElement, parents = stack.popleft()
+ 
+             self.ancestors = parents
+             if currElement is not tree:
+@@ -382,32 +531,35 @@ class InlineProcessor(Treeprocessor):
+ 
+             insertQueue = []
+             for child in currElement:
+-                if child.text and not isinstance(
+-                    child.text, util.AtomicString
+-                ):
++                text = child.text
++                if text and not isinstance(text, atomic_str):
+                     self.ancestors.append(child.tag.lower())
+-                    text = child.text
+-                    child.text = None
+-                    lst = self.__processPlaceholders(
+-                        self.__handleInline(text), child
+-                    )
+-                    for item in lst:
+-                        self.parent_map[item[0]] = child
+-                    stack += lst
+-                    insertQueue.append((child, lst))
++                    handled = self.__handleInline(text)
++                    if ph_prefix in handled:
++                        child.text = None
++                        lst = self.__processPlaceholders(handled, child)
++                        for item in lst:
++                            self.parent_map[item[0]] = child
++                        stack.extend(lst)
++                        insertQueue.append((child, lst))
++                    else:
++                        child.text = handled
+                     self.ancestors.pop()
+                 if child.tail:
+                     tail = self.__handleInline(child.tail)
+-                    dumby = etree.Element('d')
+-                    child.tail = None
+-                    tailResult = self.__processPlaceholders(tail, dumby, False)
+-                    if dumby.tail:
+-                        child.tail = dumby.tail
+-                    pos = list(currElement).index(child) + 1
+-                    tailResult.reverse()
+-                    for newChild in tailResult:
+-                        self.parent_map[newChild[0]] = currElement
+-                        currElement.insert(pos, newChild[0])
++                    if ph_prefix in tail:
++                        dumby = etree.Element('d')
++                        child.tail = None
++                        tailResult = self.__processPlaceholders(tail, dumby, False)
++                        if dumby.tail:
++                            child.tail = dumby.tail
++                        pos = list(currElement).index(child) + 1
++                        tailResult.reverse()
++                        for newChild in tailResult:
++                            self.parent_map[newChild[0]] = currElement
++                            currElement.insert(pos, newChild[0])
++                    else:
++                        child.tail = tail
+                 if len(child):
+                     self.parent_map[child] = currElement
+                     stack.append((child, self.ancestors[:]))
+@@ -418,6 +570,7 @@ class InlineProcessor(Treeprocessor):
+                     element.insert(i, newChild)
+         # The tree is fully processed; release the per-run caches so the
+         # parsed elements are not retained until the next convert().
++        self._compiled_patterns = None
+         self.parent_map = {}
+         self.stashed_nodes = {}
+         return tree
+@@ -471,20 +624,26 @@ class UnescapeTreeprocessor(Treeprocessor):
+         return chr(int(m.group(1)))
+ 
+     def unescape(self, text: str) -> str:
++        if util.STX not in text:
++            return text
+         return self.RE.sub(self._unescape, text)
+ 
+     def run(self, root: etree.Element) -> None:
+         """ Loop over all elements and unescape all text. """
++        stx = util.STX
++        sub = self.RE.sub
++        cb = self._unescape
+         for elem in root.iter():
+             # Unescape text content
+-            if elem.text and not elem.tag == 'code':
+-                elem.text = self.unescape(elem.text)
++            text = elem.text
++            if text and elem.tag != 'code' and stx in text:
++                elem.text = sub(cb, text)
+             # Unescape tail content
+-            if elem.tail:
+-                elem.tail = self.unescape(elem.tail)
++            tail = elem.tail
++            if tail and stx in tail:
++                elem.tail = sub(cb, tail)
+             # Unescape attribute values
+-            for key, value in elem.items():
+-                if value is not None:
+-                    # A value of `None` is a valueless attribute, which
+-                    # has nothing to unescape.
+-                    elem.set(key, self.unescape(value))
++            if elem.attrib:
++                for key, value in elem.items():
++                    if value is not None and stx in value:
++                        elem.set(key, sub(cb, value))

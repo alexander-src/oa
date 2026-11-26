@@ -1,0 +1,1701 @@
+diff --git a/sqlparse/engine/grouping.py b/sqlparse/engine/grouping.py
+index 554fa3e..a4b5d3a 100644
+--- a/sqlparse/engine/grouping.py
++++ b/sqlparse/engine/grouping.py
+@@ -36,45 +36,56 @@ def _group_matching(tlist, cls, depth=0):
+         )
+ 
+     # Limit the number of tokens to prevent DoS attacks
+-    if MAX_GROUPING_TOKENS is not None \
+-       and len(tlist.tokens) > MAX_GROUPING_TOKENS:
++    tokens = tlist.tokens
++    if MAX_GROUPING_TOKENS is not None and len(tokens) > MAX_GROUPING_TOKENS:
+         raise SQLParseError(
+             f"Maximum number of tokens exceeded ({MAX_GROUPING_TOKENS})."
+         )
+ 
+     opens = []
+     tidx_offset = 0
+-    token_list = list(tlist)
++    token_list = list(tokens)
++    open_tt, open_val = cls.M_OPEN
++    close_tt, close_val = cls.M_CLOSE
++    open_is_str = type(open_val) is str
++    close_is_str = type(close_val) is str
++    open_up = open_val.upper() if open_is_str else None
++    close_up = close_val.upper() if close_is_str else None
+ 
+     for idx, token in enumerate(token_list):
+-        tidx = idx - tidx_offset
+-
+         if token.is_whitespace:
+-            # ~50% of tokens will be whitespace. Will checking early
+-            # for them avoid 3 comparisons, but then add 1 more comparison
+-            # for the other ~50% of tokens...
+             continue
+ 
+         if token.is_group and not isinstance(token, cls):
+-            # Check inside previously grouped (i.e. parenthesis) if group
+-            # of different type is inside (i.e., case). though ideally  should
+-            # should check for all open/close tokens at once to avoid recursion
+             _group_matching(token, cls, depth + 1)
+             continue
+ 
+-        if token.match(*cls.M_OPEN):
+-            opens.append(tidx)
++        tt = token.ttype
++        if tt is open_tt:
++            if open_is_str:
++                matched = token.normalized == (open_up if token.is_keyword else open_val)
++            else:
++                matched = token.match(open_tt, open_val)
++            if matched:
++                if MAX_GROUPING_DEPTH is not None and depth + len(opens) >= MAX_GROUPING_DEPTH:
++                    raise SQLParseError(
++                        f"Maximum grouping depth exceeded ({MAX_GROUPING_DEPTH})."
++                    )
++                opens.append(idx - tidx_offset)
++                continue
+ 
+-        elif token.match(*cls.M_CLOSE):
+-            try:
++        if tt is close_tt:
++            if close_is_str:
++                matched = token.normalized == (close_up if token.is_keyword else close_val)
++            else:
++                matched = token.match(close_tt, close_val)
++            if matched:
++                if not opens:
++                    continue
+                 open_idx = opens.pop()
+-            except IndexError:
+-                # this indicates invalid sql and unbalanced tokens.
+-                # instead of break, continue in case other "valid" groups exist
+-                continue
+-            close_idx = tidx
+-            tlist.group_tokens(cls, open_idx, close_idx)
+-            tidx_offset += close_idx - open_idx
++                close_idx = idx - tidx_offset
++                tlist.group_tokens(cls, open_idx, close_idx)
++                tidx_offset += close_idx - open_idx
+ 
+ 
+ def group_brackets(tlist):
+@@ -165,57 +176,105 @@ def group_typed_literal(tlist):
+            post, extend=True)
+ 
+ 
+-def group_period(tlist):
+-    def match(token):
+-        for ttype, value in ((T.Punctuation, '.'),
+-                             (T.Operator, '->'),
+-                             (T.Operator, '->>')):
+-            if token.match(ttype, value):
+-                return True
+-        return False
++_PERIOD_PREV_CLS = (sql.SquareBrackets, sql.Identifier)
++_PERIOD_NEXT_CLS = (sql.SquareBrackets, sql.Function)
++_PERIOD_NEXT_TT = frozenset((T.Name, T.String.Symbol, T.Wildcard, T.String.Single))
++_AS_BAD_NEXT_TT = frozenset((T.DML, T.DDL, T.CTE))
++_COMP_CLS = (sql.Parenthesis, sql.Function, sql.Identifier, sql.Operation, sql.TypedLiteral)
++_OP_CLS = (sql.SquareBrackets, sql.Parenthesis, sql.Function, sql.Identifier, sql.Operation, sql.TypedLiteral)
++_OP_KWS = frozenset(('CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP'))
++_IDLIST_CLS = (sql.Function, sql.Case, sql.Identifier, sql.Comparison, sql.IdentifierList, sql.Operation)
++_IDLIST_ROLE_KWS = frozenset(('NULL', 'ROLE'))
++_NUM_STR_NAME = frozenset(T_NUMERICAL + T_STRING + T_NAME)
++_IDLIST_TT = _NUM_STR_NAME | frozenset((T.Keyword, T.Comment, T.Wildcard))
+ 
+-    def valid_prev(token):
+-        sqlcls = sql.SquareBrackets, sql.Identifier
+-        ttypes = T.Name, T.String.Symbol
+-        return imt(token, i=sqlcls, t=ttypes)
+ 
+-    def valid_next(token):
+-        # issue261, allow invalid next token
++def _period_match(token):
++    tt = token.ttype
++    if tt is T.Punctuation:
++        return token.value == '.'
++    if tt is T.Operator:
++        val = token.value
++        return val == '->' or val == '->>'
++    return False
++
++
++def _period_valid_prev(token):
++    if isinstance(token, _PERIOD_PREV_CLS):
+         return True
++    tt = token.ttype
++    return tt is T.Name or tt is T.String.Symbol
+ 
+-    def post(tlist, pidx, tidx, nidx):
+-        # next_ validation is being performed here. issue261
+-        sqlcls = sql.SquareBrackets, sql.Function
+-        ttypes = T.Name, T.String.Symbol, T.Wildcard, T.String.Single
+-        next_ = tlist[nidx] if nidx is not None else None
+-        valid_next = imt(next_, i=sqlcls, t=ttypes)
+ 
+-        return (pidx, nidx) if valid_next else (pidx, tidx)
++def _period_valid_next(token):
++    return True
+ 
+-    _group(tlist, sql.Identifier, match, valid_prev, valid_next, post)
+ 
++def _period_post(tlist, pidx, tidx, nidx):
++    next_ = tlist[nidx] if nidx is not None else None
++    if next_ is not None:
++        if isinstance(next_, _PERIOD_NEXT_CLS) or next_.ttype in _PERIOD_NEXT_TT:
++            return pidx, nidx
++    return pidx, tidx
+ 
+-def group_as(tlist):
+-    def match(token):
+-        return token.is_keyword and token.normalized == 'AS'
+ 
+-    def valid_prev(token):
+-        return token.normalized == 'NULL' or not token.is_keyword
++def _as_valid_prev(token):
++    return token.normalized == 'NULL' or not token.is_keyword
+ 
+-    def valid_next(token):
+-        ttypes = T.DML, T.DDL, T.CTE
+-        return not imt(token, t=ttypes) and token is not None
+ 
+-    def post(tlist, pidx, tidx, nidx):
+-        return pidx, nidx
++def _as_valid_next(token):
++    return token is not None and token.ttype not in _AS_BAD_NEXT_TT
+ 
+-    _group(tlist, sql.Identifier, match, valid_prev, valid_next, post)
+ 
++def _post_pidx_nidx(tlist, pidx, tidx, nidx):
++    return pidx, nidx
+ 
+-def group_assignment(tlist):
+-    def match(token):
+-        return token.match(T.Assignment, ':=')
+ 
++def _comp_valid(token):
++    if token is None:
++        return False
++    if isinstance(token, _COMP_CLS) or token.ttype in _NUM_STR_NAME:
++        return True
++    return token.is_keyword and token.normalized == 'NULL'
++
++
++def _op_match(token):
++    tt = token.ttype
++    return tt is T.Operator or tt is T.Wildcard
++
++
++def _op_valid(token):
++    if token is None:
++        return False
++    if isinstance(token, _OP_CLS) or token.ttype in _NUM_STR_NAME:
++        return True
++    return token.ttype is T.Keyword and token.normalized in _OP_KWS
++
++
++def _op_post(tlist, pidx, tidx, nidx):
++    tlist[tidx].ttype = T.Operator
++    return pidx, nidx
++
++
++def _idlist_valid(token):
++    if token is None:
++        return False
++    if isinstance(token, _IDLIST_CLS) or token.ttype in _IDLIST_TT:
++        return True
++    return token.ttype is T.Keyword and token.normalized in _IDLIST_ROLE_KWS
++
++
++def group_period(tlist):
++    _group(tlist, sql.Identifier, _period_match, _period_valid_prev,
++           _period_valid_next, _period_post)
++
++
++def group_as(tlist):
++    _group(tlist, sql.Identifier, None, _as_valid_prev, _as_valid_next,
++           _post_pidx_nidx, match_ttype=T.Keyword, match_val='AS')
++
++
++def group_assignment(tlist):
+     def valid(token):
+         return token is not None and token.ttype not in (T.Keyword,)
+ 
+@@ -225,47 +284,48 @@ def group_assignment(tlist):
+         nidx = snidx or nidx
+         return pidx, nidx
+ 
+-    valid_prev = valid_next = valid
+-    _group(tlist, sql.Assignment, match, valid_prev, valid_next, post)
++    _group(tlist, sql.Assignment, None, valid, valid, post,
++           match_ttype=T.Assignment, match_val=':=')
+ 
+ 
+ def group_comparison(tlist):
+-    sqlcls = (sql.Parenthesis, sql.Function, sql.Identifier,
+-              sql.Operation, sql.TypedLiteral)
+-    ttypes = T_NUMERICAL + T_STRING + T_NAME
+-
+-    def match(token):
+-        return token.ttype == T.Operator.Comparison
+-
+-    def valid(token):
+-        return bool(imt(token, t=ttypes, i=sqlcls) or (token and token.is_keyword and token.normalized == 'NULL'))
+-
+-    def post(tlist, pidx, tidx, nidx):
+-        return pidx, nidx
+-
+-    valid_prev = valid_next = valid
+-    _group(tlist, sql.Comparison, match,
+-           valid_prev, valid_next, post, extend=False)
++    _group(tlist, sql.Comparison, None,
++           _comp_valid, _comp_valid, _post_pidx_nidx, extend=False,
++           match_ttype=T.Operator.Comparison)
+ 
+ 
+ @recurse(sql.Identifier)
+ def group_identifier(tlist):
+-    ttypes = (T.String.Symbol, T.Name)
+-
+-    tidx, token = tlist.token_next_by(t=ttypes)
+-    while token:
+-        tlist.group_tokens(sql.Identifier, tidx, tidx)
+-        tidx, token = tlist.token_next_by(t=ttypes, idx=tidx)
++    t_name = T.Name
++    t_sym = T.String.Symbol
++    ident_cls = sql.Identifier
++    tokens = tlist.tokens
++    for idx, tk in enumerate(tokens):
++        tt = tk.ttype
++        if tt is t_name or tt is t_sym:
++            grp = ident_cls([tk])
++            grp.parent = tlist
++            tokens[idx] = grp
+ 
+ 
+ @recurse(sql.Over)
+ def group_over(tlist):
+-    tidx, token = tlist.token_next_by(m=sql.Over.M_OPEN)
+-    while token:
+-        nidx, next_ = tlist.token_next(tidx)
+-        if imt(next_, i=sql.Parenthesis, t=T.Name):
+-            tlist.group_tokens(sql.Over, tidx, nidx)
+-        tidx, token = tlist.token_next_by(m=sql.Over.M_OPEN, idx=tidx)
++    tokens = tlist.tokens
++    t_kw = T.Keyword
++    paren_cls = sql.Parenthesis
++    t_name = T.Name
++    over_cls = sql.Over
++    idx = 0
++    while idx < len(tokens):
++        tk = tokens[idx]
++        if tk.ttype is t_kw and tk.normalized == 'OVER':
++            nidx, next_ = tlist.token_next(idx)
++            if next_ is not None and (
++                isinstance(next_, paren_cls)
++                or (next_.ttype is not None and t_name in next_.ttype._ancestors)
++            ):
++                tlist.group_tokens(over_cls, idx, nidx)
++        idx += 1
+ 
+ 
+ def group_arrays(tlist):
+@@ -289,47 +349,14 @@ def group_arrays(tlist):
+ 
+ 
+ def group_operator(tlist):
+-    ttypes = T_NUMERICAL + T_STRING + T_NAME
+-    sqlcls = (sql.SquareBrackets, sql.Parenthesis, sql.Function,
+-              sql.Identifier, sql.Operation, sql.TypedLiteral)
+-
+-    def match(token):
+-        return imt(token, t=(T.Operator, T.Wildcard))
+-
+-    def valid(token):
+-        return imt(token, i=sqlcls, t=ttypes) \
+-            or (token and token.match(
+-                T.Keyword,
+-                ('CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP')))
+-
+-    def post(tlist, pidx, tidx, nidx):
+-        tlist[tidx].ttype = T.Operator
+-        return pidx, nidx
+-
+-    valid_prev = valid_next = valid
+-    _group(tlist, sql.Operation, match,
+-           valid_prev, valid_next, post, extend=False)
++    _group(tlist, sql.Operation, _op_match,
++           _op_valid, _op_valid, _op_post, extend=False)
+ 
+ 
+ def group_identifier_list(tlist):
+-    m_role = T.Keyword, ('null', 'role')
+-    sqlcls = (sql.Function, sql.Case, sql.Identifier, sql.Comparison,
+-              sql.IdentifierList, sql.Operation)
+-    ttypes = (T_NUMERICAL + T_STRING + T_NAME
+-              + (T.Keyword, T.Comment, T.Wildcard))
+-
+-    def match(token):
+-        return token.match(T.Punctuation, ',')
+-
+-    def valid(token):
+-        return imt(token, i=sqlcls, m=m_role, t=ttypes)
+-
+-    def post(tlist, pidx, tidx, nidx):
+-        return pidx, nidx
+-
+-    valid_prev = valid_next = valid
+-    _group(tlist, sql.IdentifierList, match,
+-           valid_prev, valid_next, post, extend=True)
++    _group(tlist, sql.IdentifierList, None,
++           _idlist_valid, _idlist_valid, _post_pidx_nidx, extend=True,
++           match_ttype=T.Punctuation, match_val=',')
+ 
+ 
+ @recurse(sql.Comment)
+@@ -352,32 +379,40 @@ def group_comments(tlist):
+ 
+ @recurse(sql.Where)
+ def group_where(tlist):
+-    tidx, token = tlist.token_next_by(m=sql.Where.M_OPEN)
+-    while token:
+-        eidx, end = tlist.token_next_by(m=sql.Where.M_CLOSE, idx=tidx)
++    tokens = tlist.tokens
++    t_kw = T.Keyword
++    where_cls = sql.Where
++    idx = 0
++    while idx < len(tokens):
++        tk = tokens[idx]
++        if tk.ttype is t_kw and tk.normalized == 'WHERE':
++            eidx, end = tlist.token_next_by(m=where_cls.M_CLOSE, idx=idx)
++            if end is None:
++                eidx = tlist.token_index(tlist._groupable_tokens[-1])
++            else:
++                eidx = eidx - 1
++            tlist.group_tokens(where_cls, idx, eidx)
++        idx += 1
+ 
+-        if end is None:
+-            end = tlist._groupable_tokens[-1]
+-        else:
+-            end = tlist.tokens[eidx - 1]
+-        # TODO: convert this to eidx instead of end token.
+-        # i think above values are len(tlist) and eidx-1
+-        eidx = tlist.token_index(end)
+-        tlist.group_tokens(sql.Where, tidx, eidx)
+-        tidx, token = tlist.token_next_by(m=sql.Where.M_OPEN, idx=tidx)
++
++_I_ALIAS = (sql.Parenthesis, sql.Function, sql.Case, sql.Identifier,
++            sql.Operation, sql.Comparison)
+ 
+ 
+ @recurse()
+ def group_aliased(tlist):
+-    I_ALIAS = (sql.Parenthesis, sql.Function, sql.Case, sql.Identifier,
+-               sql.Operation, sql.Comparison)
+-
+-    tidx, token = tlist.token_next_by(i=I_ALIAS, t=T.Number)
+-    while token:
+-        nidx, next_ = tlist.token_next(tidx)
+-        if isinstance(next_, sql.Identifier):
+-            tlist.group_tokens(sql.Identifier, tidx, nidx, extend=True)
+-        tidx, token = tlist.token_next_by(i=I_ALIAS, t=T.Number, idx=tidx)
++    tokens = tlist.tokens
++    t_num = T.Number
++    i_alias = _I_ALIAS
++    ident_cls = sql.Identifier
++    idx = 0
++    while idx < len(tokens):
++        tk = tokens[idx]
++        if isinstance(tk, i_alias) or (tk.ttype is not None and t_num in tk.ttype._ancestors):
++            nidx, next_ = tlist.token_next(idx)
++            if isinstance(next_, ident_cls):
++                tlist.group_tokens(ident_cls, idx, nidx, extend=True)
++        idx += 1
+ 
+ 
+ @recurse(sql.Function)
+@@ -386,38 +421,68 @@ def group_functions(tlist):
+     has_table = False
+     has_as = False
+     for tmp_token in tlist.tokens:
+-        if tmp_token.value.upper() == 'CREATE':
+-            has_create = True
+-        if tmp_token.value.upper() == 'TABLE':
+-            has_table = True
+-        if tmp_token.value.upper() == 'AS':
+-            has_as = True
++        if tmp_token.is_keyword:
++            norm = tmp_token.normalized
++            if norm == 'CREATE':
++                has_create = True
++            elif norm == 'TABLE':
++                has_table = True
++            elif norm == 'AS':
++                has_as = True
++        elif not tmp_token.is_whitespace and not tmp_token.is_group:
++            v = tmp_token.value
++            if len(v) <= 6:
++                vu = v.upper()
++                if vu == 'CREATE':
++                    has_create = True
++                elif vu == 'TABLE':
++                    has_table = True
++                elif vu == 'AS':
++                    has_as = True
+     if has_create and has_table and not has_as:
+         return
+ 
+-    tidx, token = tlist.token_next_by(t=T.Name)
+-    while token:
+-        nidx, next_ = tlist.token_next(tidx)
+-        if isinstance(next_, sql.Parenthesis):
+-            over_idx, over = tlist.token_next(nidx)
+-            if over and isinstance(over, sql.Over):
+-                eidx = over_idx
+-            else:
+-                eidx = nidx
+-            tlist.group_tokens(sql.Function, tidx, eidx)
+-        tidx, token = tlist.token_next_by(t=T.Name, idx=tidx)
++    tokens = tlist.tokens
++    t_name = T.Name
++    paren_cls = sql.Parenthesis
++    over_cls = sql.Over
++    func_cls = sql.Function
++    idx = 0
++    while idx < len(tokens):
++        tk = tokens[idx]
++        tt = tk.ttype
++        if tt is not None and t_name in tt._ancestors:
++            nidx, next_ = tlist.token_next(idx)
++            if isinstance(next_, paren_cls):
++                over_idx, over = tlist.token_next(nidx)
++                if over and isinstance(over, over_cls):
++                    eidx = over_idx
++                else:
++                    eidx = nidx
++                tlist.group_tokens(func_cls, idx, eidx)
++        idx += 1
+ 
+ 
+ @recurse(sql.Identifier)
+ def group_order(tlist):
+     """Group together Identifier and Asc/Desc token"""
+-    tidx, token = tlist.token_next_by(t=T.Keyword.Order)
+-    while token:
+-        pidx, prev_ = tlist.token_prev(tidx)
+-        if imt(prev_, i=sql.Identifier, t=T.Number):
+-            tlist.group_tokens(sql.Identifier, pidx, tidx)
+-            tidx = pidx
+-        tidx, token = tlist.token_next_by(t=T.Keyword.Order, idx=tidx)
++    tokens = tlist.tokens
++    t_order = T.Keyword.Order
++    t_num = T.Number
++    ident_cls = sql.Identifier
++    idx = 0
++    while idx < len(tokens):
++        tk = tokens[idx]
++        tt = tk.ttype
++        if tt is not None and t_order in tt._ancestors:
++            pidx, prev_ = tlist.token_prev(idx)
++            if prev_ is not None and (
++                isinstance(prev_, ident_cls)
++                or (prev_.ttype is not None and t_num in prev_.ttype._ancestors)
++            ):
++                tlist.group_tokens(ident_cls, pidx, idx)
++                idx = pidx
++        idx += 1
+ 
+ 
+ @recurse()
+@@ -444,38 +509,132 @@ def group_values(tlist):
+ 
+ 
+ def group(stmt):
+-    for func in [
+-        group_comments,
+-
+-        # _group_matching
+-        group_brackets,
+-        group_parenthesis,
+-        group_case,
+-        group_if,
+-        group_for,
+-        group_begin,
+-
+-        group_over,
+-        group_functions,
+-        group_where,
+-        group_period,
+-        group_arrays,
+-        group_identifier,
+-        group_order,
+-        group_typecasts,
+-        group_tzcasts,
+-        group_typed_literal,
+-        group_operator,
+-        group_comparison,
+-        group_as,
+-        group_aliased,
+-        group_assignment,
+-
+-        align_comments,
+-        group_identifier_list,
+-        group_values,
+-    ]:
+-        func(stmt)
++    tokens = stmt.tokens
++    has_comment = False
++    has_lbracket = False
++    has_lparen = False
++    has_colon2 = False
++    has_comma = False
++    has_dot = False
++    has_assign = False
++    has_tzcast = False
++    has_order = False
++    has_comparison = False
++    has_operator = False
++    has_string_single = False
++    run_all = False
++    kws = set()
++
++    t_ws = T.Whitespace
++    t_nl = T.Newline
++    t_punct = T.Punctuation
++    t_kw = T.Keyword
++    t_kw_order = T.Keyword.Order
++    t_kw_tz = T.Keyword.TZCast
++    t_comment = T.Comment
++    t_assign = T.Assignment
++    t_comp = T.Operator.Comparison
++    t_op = T.Operator
++    t_wc = T.Wildcard
++    t_str_s = T.String.Single
++
++    for tk in tokens:
++        tt = tk.ttype
++        if tt is None:
++            if tk.is_group:
++                run_all = True
++                break
++            continue
++        if tt is t_ws or tt is t_nl:
++            continue
++        if tt is t_punct:
++            v = tk.value
++            if v == '(':
++                has_lparen = True
++            elif v == '[':
++                has_lbracket = True
++            elif v == ',':
++                has_comma = True
++            elif v == '.':
++                has_dot = True
++            elif v == '::':
++                has_colon2 = True
++        else:
++            anc = tt._ancestors
++            if t_kw in anc:
++                kws.add(tk.normalized)
++                if tt is t_kw_order:
++                    has_order = True
++                elif tt is t_kw_tz:
++                    has_tzcast = True
++            elif t_comment in anc:
++                has_comment = True
++            elif tt is t_assign:
++                has_assign = True
++            elif tt is t_comp:
++                has_comparison = True
++                has_operator = True
++            elif tt is t_wc or t_op in anc:
++                has_operator = True
++            elif tt is t_str_s:
++                has_string_single = True
++
++    if run_all or has_comment:
++        group_comments(stmt)
++
++    if MAX_GROUPING_TOKENS is not None and len(stmt.tokens) > MAX_GROUPING_TOKENS:
++        raise SQLParseError(
++            f"Maximum number of tokens exceeded ({MAX_GROUPING_TOKENS})."
++        )
++
++    if run_all or has_lbracket:
++        group_brackets(stmt)
++    if run_all or has_lparen:
++        group_parenthesis(stmt)
++    if run_all or 'CASE' in kws:
++        group_case(stmt)
++    if run_all or 'IF' in kws:
++        group_if(stmt)
++    if run_all or 'FOR' in kws or 'FOREACH' in kws:
++        group_for(stmt)
++    if run_all or 'BEGIN' in kws:
++        group_begin(stmt)
++
++    if run_all or (has_lparen and 'OVER' in kws):
++        group_over(stmt)
++    if run_all or has_lparen:
++        group_functions(stmt)
++    if run_all or 'WHERE' in kws:
++        group_where(stmt)
++    if run_all or has_dot:
++        group_period(stmt)
++    if run_all or has_lbracket:
++        group_arrays(stmt)
++    group_identifier(stmt)
++    if run_all or has_order:
++        group_order(stmt)
++    if run_all or has_colon2:
++        group_typecasts(stmt)
++    if run_all or has_tzcast:
++        group_tzcasts(stmt)
++    if run_all or has_string_single:
++        group_typed_literal(stmt)
++    if run_all or has_operator:
++        group_operator(stmt)
++    if run_all or has_comparison:
++        group_comparison(stmt)
++    if run_all or 'AS' in kws:
++        group_as(stmt)
++    group_aliased(stmt)
++    if run_all or has_assign:
++        group_assignment(stmt)
++
++    if run_all or has_comment:
++        align_comments(stmt)
++    if run_all or has_comma:
++        group_identifier_list(stmt)
++    if run_all or (has_lparen and 'VALUES' in kws):
++        group_values(stmt)
+     return stmt
+ 
+ 
+@@ -498,7 +657,9 @@ def _group(tlist, cls, match,
+            post=None,
+            extend=True,
+            recurse=True,
+-           depth=0
++           depth=0,
++           match_ttype=None,
++           match_val=None
+            ):
+     """Groups together tokens that are joined by a middle token. i.e. x < y"""
+     if MAX_GROUPING_DEPTH is not None and depth > MAX_GROUPING_DEPTH:
+@@ -506,39 +667,57 @@ def _group(tlist, cls, match,
+             f"Maximum grouping depth exceeded ({MAX_GROUPING_DEPTH})."
+         )
+ 
+-    # Limit the number of tokens to prevent DoS attacks
+-    if MAX_GROUPING_TOKENS is not None \
+-       and len(tlist.tokens) > MAX_GROUPING_TOKENS:
++    tokens = tlist.tokens
++    if MAX_GROUPING_TOKENS is not None and len(tokens) > MAX_GROUPING_TOKENS:
+         raise SQLParseError(
+             f"Maximum number of tokens exceeded ({MAX_GROUPING_TOKENS})."
+         )
+ 
+-    tidx_offset = 0
++    is_delim_group = isinstance(tlist, _DELIMITED_GROUPS)
+     pidx, prev_ = None, None
+-    token_list = list(tlist)
+-
+-    for idx, token in enumerate(token_list):
+-        tidx = idx - tidx_offset
+-        if tidx < 0:  # tidx shouldn't get negative
+-            continue
++    idx = 0
++    tokens_len = len(tokens)
+ 
++    while idx < tokens_len:
++        token = tokens[idx]
+         if token.is_whitespace:
++            idx += 1
+             continue
+ 
+         if recurse and token.is_group and not isinstance(token, cls):
+-            _group(token, cls, match, valid_prev, valid_next,
+-                   post, extend, True, depth + 1)
++            sub_tokens = token.tokens
++            if len(sub_tokens) > 1 or (sub_tokens and sub_tokens[0].is_group):
++                _group(token, cls, match, valid_prev, valid_next,
++                       post, extend, True, depth + 1, match_ttype, match_val)
++
++        if match_ttype is not None:
++            matched = (
++                token.ttype is match_ttype
++                and (match_val is None or token.normalized == match_val)
++                and (match is None or match(token))
++            )
++        else:
++            matched = match(token)
+ 
+-        if match(token):
+-            nidx, next_ = tlist.token_next(tidx)
++        if matched:
++            nidx, next_ = tlist.token_next(idx)
+             if (prev_ and valid_prev(prev_) and valid_next(next_)
+-                    and not _is_delimiter(tlist, prev_)
+-                    and not _is_delimiter(tlist, next_)):
+-                from_idx, to_idx = post(tlist, pidx, tidx, nidx)
++                    and not (is_delim_group and (prev_ is tokens[0] or prev_ is tokens[-1]))
++                    and not (is_delim_group and next_ is not None and (next_ is tokens[0] or next_ is tokens[-1]))):
++                from_idx, to_idx = post(tlist, pidx, idx, nidx)
++                if recurse and to_idx > idx:
++                    for sub in tokens[idx + 1:to_idx + 1]:
++                        if sub.is_group and not isinstance(sub, cls):
++                            sub_tokens = sub.tokens
++                            if len(sub_tokens) > 1 or (sub_tokens and sub_tokens[0].is_group):
++                                _group(sub, cls, match, valid_prev, valid_next,
++                                       post, extend, True, depth + 1, match_ttype, match_val)
+                 grp = tlist.group_tokens(cls, from_idx, to_idx, extend=extend)
+ 
+-                tidx_offset += to_idx - from_idx
++                tokens_len = len(tokens)
+                 pidx, prev_ = from_idx, grp
++                idx = from_idx + 1
+                 continue
+ 
+-        pidx, prev_ = tidx, token
++        pidx, prev_ = idx, token
++        idx += 1
+diff --git a/sqlparse/engine/statement_splitter.py b/sqlparse/engine/statement_splitter.py
+index bc57d17..f291b35 100644
+--- a/sqlparse/engine/statement_splitter.py
++++ b/sqlparse/engine/statement_splitter.py
+@@ -150,47 +150,63 @@ class StatementSplitter:
+ 
+     def process(self, stream):
+         """Process the stream"""
+-        EOS_TTYPE = T.Whitespace, T.Comment.Single
++        t_ws = T.Whitespace
++        t_nl = T.Newline
++        t_cs = T.Comment.Single
++        t_cm = T.Comment.Multiline
++        t_punct = T.Punctuation
++        t_kw = T.Keyword
++        token_cls = sql.Token
++        stmt_cls = sql.Statement
++        change_splitlevel = self._change_splitlevel
++        tokens = self.tokens
++        tokens_append = tokens.append
+ 
+         # Run over all stream tokens
+         for ttype, value in stream:
+             # Yield token if we finished a statement and there's no whitespaces
+             # It will count newline token as a non whitespace. In this context
+             # whitespace ignores newlines.
+-            # why don't multi line comments also count?
+-            if self.consume_ws and ttype not in EOS_TTYPE:
+-                yield sql.Statement(self.tokens)
++            if self.consume_ws and ttype is not t_ws and ttype is not t_cs:
++                yield stmt_cls(tokens)
+ 
+                 # Reset filter and prepare to process next statement
+                 self._reset()
+-
+-            # Change current split level (increase, decrease or remain equal)
+-            self.level += self._change_splitlevel(ttype, value)
+-
+-            # Append the token to the current statement
+-            self.tokens.append(sql.Token(ttype, value))
+-
+-            # Check if we get the end of a statement
+-            # Issue762: Allow GO (or "GO 2") as statement splitter.
+-            # When implementing a language toggle, it's not only to add
+-            # keywords it's also to change some rules, like this splitting
+-            # rule.
+-            # Issue809: Ignore semicolons inside BEGIN...END blocks, but handle
+-            # standalone BEGIN; as a transaction statement
+-            if ttype is T.Punctuation and value == ';':
+-                self._seen_begin = False
+-                # Split on semicolon if not inside a BEGIN...END block
+-                if self.level <= 0 and 'BEGIN' not in self._block_stack:
++                tokens = self.tokens
++                tokens_append = tokens.append
++
++            if ttype is t_ws or ttype is t_nl:
++                tokens_append(token_cls(ttype, value))
++                continue
++
++            if ttype is t_punct:
++                if value == ';':
++                    self.level += change_splitlevel(ttype, value)
++                    tokens_append(token_cls(ttype, value))
++                    self._seen_begin = False
++                    if self.level <= 0 and 'BEGIN' not in self._block_stack:
++                        self.consume_ws = True
++                    continue
++                if value == '(' or value == ')':
++                    self.level += change_splitlevel(ttype, value)
++                tokens_append(token_cls(ttype, value))
++                if self._seen_begin:
++                    self._seen_begin = False
++                continue
++
++            if ttype._is_keyword:
++                self.level += change_splitlevel(ttype, value)
++                tokens_append(token_cls(ttype, value))
++                if ttype is t_kw and (value == 'GO' or (len(value) > 2 and value[0] == 'G' and value.split()[0] == 'GO')):
+                     self.consume_ws = True
+-            elif ttype is T.Keyword and value.split()[0] == 'GO':
+-                self.consume_ws = True
+-            elif (ttype not in (T.Whitespace, T.Newline, T.Comment.Single,
+-                                T.Comment.Multiline)
+-                  and not (ttype is T.Keyword and value.upper() == 'BEGIN')):
+-                # Reset _seen_begin if we see a non-whitespace, non-comment
+-                # token but not for BEGIN itself (which just set the flag)
++                elif self._seen_begin and not (ttype is t_kw and value.upper() == 'BEGIN'):
++                    self._seen_begin = False
++                continue
++
++            tokens_append(token_cls(ttype, value))
++            if self._seen_begin and ttype is not t_cs and ttype is not t_cm:
+                 self._seen_begin = False
+ 
+         # Yield pending statement (if any)
+-        if self.tokens and not all(t.is_whitespace for t in self.tokens):
+-            yield sql.Statement(self.tokens)
++        if tokens and not all(t.is_whitespace for t in tokens):
++            yield stmt_cls(tokens)
+diff --git a/sqlparse/filters/reindent.py b/sqlparse/filters/reindent.py
+index f8f6453..b09f412 100644
+--- a/sqlparse/filters/reindent.py
++++ b/sqlparse/filters/reindent.py
+@@ -5,10 +5,27 @@
+ # This module is part of python-sqlparse and is released under
+ # the BSD License: https://opensource.org/licenses/BSD-3-Clause
+ 
++import re
++
+ from sqlparse import sql
+ from sqlparse import tokens as T
+ from sqlparse.utils import indent, offset
+ 
++_SPLIT_KWDS_RE = re.compile(
++    r'FROM|STRAIGHT_JOIN$|JOIN$|AND|OR|GROUP BY|ORDER BY|UNION|VALUES|'
++    r'SET|BETWEEN|EXCEPT|HAVING|LIMIT',
++    re.IGNORECASE,
++)
++_SPLIT_KWD_CACHE = {}
++
++
++def _is_split_kwd(norm):
++    hit = _SPLIT_KWD_CACHE.get(norm)
++    if hit is None:
++        hit = _SPLIT_KWDS_RE.search(norm) is not None
++        _SPLIT_KWD_CACHE[norm] = hit
++    return hit
++
+ 
+ class ReindentFilter:
+     def __init__(self, width=2, char=' ', wrap_after=0, n='\n',
+@@ -93,11 +110,23 @@ class ReindentFilter:
+             self.n + self.char * max(0, self.leading_ws + offset))
+ 
+     def _next_token(self, tlist, idx=-1):
+-        split_words = ('FROM', 'STRAIGHT_JOIN$', 'JOIN$', 'AND', 'OR',
+-                       'GROUP BY', 'ORDER BY', 'UNION', 'VALUES',
+-                       'SET', 'BETWEEN', 'EXCEPT', 'HAVING', 'LIMIT')
+-        m_split = T.Keyword, split_words, True
+-        tidx, token = tlist.token_next_by(m=m_split, idx=idx)
++        tokens = tlist.tokens
++        start = idx + 1
++        end = len(tokens)
++        kw_tt = T.Keyword
++        cache = _SPLIT_KWD_CACHE
++        tidx, token = None, None
++        for j in range(start, end):
++            tk = tokens[j]
++            if tk.ttype is kw_tt:
++                norm = tk.normalized
++                hit = cache.get(norm)
++                if hit is None:
++                    hit = _SPLIT_KWDS_RE.search(norm) is not None
++                    cache[norm] = hit
++                if hit:
++                    tidx, token = j, tk
++                    break
+ 
+         if token and token.normalized == 'BETWEEN':
+             tidx, token = self._next_token(tlist, tidx)
+@@ -124,23 +153,28 @@ class ReindentFilter:
+             tidx, token = self._next_token(tlist, tidx)
+ 
+     def _split_statements(self, tlist):
+-        ttypes = T.Keyword.DML, T.Keyword.DDL
+-        tidx, token = tlist.token_next_by(t=ttypes)
+-        while token:
+-            pidx, prev_ = tlist.token_prev(tidx, skip_ws=False)
+-            if prev_ and prev_.is_whitespace:
+-                del tlist.tokens[pidx]
+-                tidx -= 1
+-            # only break if it's not the first token
+-            if prev_:
+-                tlist.insert_before(tidx, self.nl())
+-                tidx += 1
+-            tidx, token = tlist.token_next_by(t=ttypes, idx=tidx)
++        tokens = tlist.tokens
++        t_dml = T.Keyword.DML
++        t_ddl = T.Keyword.DDL
++        idx = 0
++        while idx < len(tokens):
++            tt = tokens[idx].ttype
++            if tt is t_dml or tt is t_ddl:
++                pidx, prev_ = tlist.token_prev(idx, skip_ws=False)
++                if prev_ and prev_.is_whitespace:
++                    del tokens[pidx]
++                    idx -= 1
++                if prev_:
++                    tlist.insert_before(idx, self.nl())
++                    idx += 1
++            idx += 1
+ 
+     def _process(self, tlist):
+-        func_name = f'_process_{type(tlist).__name__}'
+-        func = getattr(self, func_name.lower(), self._process_default)
+-        func(tlist)
++        func = self._PROCESSORS.get(type(tlist))
++        if func is not None:
++            func(self, tlist)
++        else:
++            self._process_default(tlist)
+ 
+     def _process_where(self, tlist):
+         tidx, token = tlist.token_next_by(m=(T.Keyword, 'WHERE'))
+@@ -271,10 +305,26 @@ class ReindentFilter:
+             tidx, token = tlist.token_next_by(i=sql.Parenthesis, idx=tidx)
+ 
+     def _process_default(self, tlist, stmts=True):
+-        self._split_statements(tlist) if stmts else None
++        tokens = tlist.tokens
++        if len(tokens) == 1:
++            tk = tokens[0]
++            if not tk.is_group and not tk.is_keyword:
++                return
++        if stmts:
++            self._split_statements(tlist)
+         self._split_kwds(tlist)
+-        for sgroup in tlist.get_sublists():
+-            self._process(sgroup)
++        for tk in tokens:
++            if tk.is_group:
++                self._process(tk)
++
++    _PROCESSORS = {
++        sql.Where: _process_where,
++        sql.Parenthesis: _process_parenthesis,
++        sql.Function: _process_function,
++        sql.IdentifierList: _process_identifierlist,
++        sql.Case: _process_case,
++        sql.Values: _process_values,
++    }
+ 
+     def process(self, stmt):
+         self._curr_stmt = stmt
+diff --git a/sqlparse/filters/tokens.py b/sqlparse/filters/tokens.py
+index cc00a84..8b45a4e 100644
+--- a/sqlparse/filters/tokens.py
++++ b/sqlparse/filters/tokens.py
+@@ -25,15 +25,27 @@ class _CaseFilter:
+ class KeywordCaseFilter(_CaseFilter):
+     ttype = T.Keyword
+ 
++    def process(self, stream):
++        conv = self.convert
++        for tt, val in stream:
++            if tt._is_keyword:
++                yield tt, conv(val)
++            else:
++                yield tt, val
++
+ 
+ class IdentifierCaseFilter(_CaseFilter):
+     ttype = T.Name, T.String.Symbol
+ 
+     def process(self, stream):
+-        for ttype, value in stream:
+-            if ttype in self.ttype and value.strip()[0] != '"':
+-                value = self.convert(value)
+-            yield ttype, value
++        conv = self.convert
++        t_name = T.Name
++        t_sym = T.String.Symbol
++        for tt, val in stream:
++            if (tt is t_name or tt is t_sym) and val.strip()[0] != '"':
++                yield tt, conv(val)
++            else:
++                yield tt, val
+ 
+ 
+ class TruncateStringFilter:
+diff --git a/sqlparse/lexer.py b/sqlparse/lexer.py
+index 5d4a5f9..611ba9f 100644
+--- a/sqlparse/lexer.py
++++ b/sqlparse/lexer.py
+@@ -19,6 +19,20 @@ from sqlparse import keywords, tokens
+ from sqlparse.utils import consume
+ 
+ 
++_ASCII_WORD_MATCH = re.compile(r'[A-Za-z_][A-Za-z0-9_]*').match
++_MASTER_WORDS_UP = frozenset((
++    'CASE', 'IN', 'VALUES', 'USING', 'FROM', 'AS',
++    'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'STRAIGHT', 'CROSS', 'NATURAL', 'JOIN',
++    'END', 'IF', 'NOT', 'ASC', 'DESC', 'NULLS', 'UNION', 'CREATE', 'DOUBLE',
++    'GROUP', 'ORDER', 'PRIMARY', 'HANDLER', 'GO', 'LATERAL', 'AT', 'WITH',
++    'LIKE', 'ILIKE', 'RLIKE', 'REGEXP',
++))
++_MASTER_WORDS_BOTH = _MASTER_WORDS_UP | frozenset(w.lower() for w in _MASTER_WORDS_UP)
++_FAST_END_DELIMS = frozenset(',);=<>+-*/[]')
++_FAST_WS_CHARS = frozenset(' \t\r\n')
++_FAST_WS_DOT = frozenset(' \t\r\n.')
++
++
+ class Lexer:
+     """The Lexer supports configurable syntax.
+     To add support for additional keywords, use the `add_keywords` method."""
+@@ -74,21 +88,69 @@ class Lexer:
+         Useful if you want to load a reduced set of syntax configurations.
+         After this call, regexps and keyword dictionaries need to be loaded
+         to make the lexer functional again."""
+-        self._SQL_REGEX = []
++        self._raw_sql_regex = []
++        self._compiled_sql_regex = None
+         self._keywords = []
++        self._keywords_flat = {}
++        self._keywords_fast = {}
++        self._master_match = None
++        self._group_actions = {}
++        self._fast_single = None
++
++    @property
++    def _SQL_REGEX(self):
++        if self._compiled_sql_regex is None:
++            FLAGS = re.IGNORECASE | re.UNICODE
++            self._compiled_sql_regex = [
++                (re.compile(rx, FLAGS).match, tt)
++                for rx, tt in self._raw_sql_regex
++            ]
++        return self._compiled_sql_regex
++
++    @_SQL_REGEX.setter
++    def _SQL_REGEX(self, value):
++        self._compiled_sql_regex = value
+ 
+     def set_SQL_REGEX(self, SQL_REGEX):
+         """Set the list of regex that will parse the SQL."""
+         FLAGS = re.IGNORECASE | re.UNICODE
+-        self._SQL_REGEX = [
+-            (re.compile(rx, FLAGS).match, tt)
+-            for rx, tt in SQL_REGEX
+-        ]
++        self._raw_sql_regex = SQL_REGEX
++        self._compiled_sql_regex = None
++        parts = []
++        actions = {}
++        for idx, (rx, tt) in enumerate(SQL_REGEX):
++            gname = f'_t{idx}'
++            parts.append(f'(?P<{gname}>{rx})')
++            actions[gname] = tt
++        self._master_match = re.compile('|'.join(parts), FLAGS).match if parts else None
++        self._group_actions = actions
++        self._fast_single = (
++            {
++                ' ': tokens.Whitespace,
++                '\t': tokens.Whitespace,
++                '\n': tokens.Newline,
++                ',': tokens.Punctuation,
++                ';': tokens.Punctuation,
++                '(': tokens.Punctuation,
++                ')': tokens.Punctuation,
++            }
++            if SQL_REGEX is keywords.SQL_REGEX
++            else None
++        )
+ 
+     def add_keywords(self, keywords):
+         """Add keyword dictionaries. Keywords are looked up in the same order
+         that dictionaries were added."""
+         self._keywords.append(keywords)
++        flat = self._keywords_flat
++        fast = self._keywords_fast
++        for k, v in keywords.items():
++            if k not in flat:
++                flat[k] = v
++                fast[k] = v
++                kl = k.lower()
++                if kl not in fast:
++                    fast[kl] = v
+ 
+     def is_keyword(self, value):
+         """Checks for a keyword.
+@@ -96,12 +158,7 @@ class Lexer:
+         If the given value is in one of the KEYWORDS_* dictionary
+         it's considered a keyword. Otherwise, tokens.Name is returned.
+         """
+-        val = value.upper()
+-        for kwdict in self._keywords:
+-            if val in kwdict:
+-                return kwdict[val], value
+-        else:
+-            return tokens.Name, value
++        return self._keywords_flat.get(value.upper(), tokens.Name), value
+ 
+     def get_tokens(self, text, encoding=None):
+         """
+@@ -134,35 +191,100 @@ class Lexer:
+ 
+         delimited_spans = keywords.find_delimited_spans(text)
+         span_openers = delimited_spans.openers
++        has_spans = bool(span_openers)
+ 
+-        iterable = enumerate(text)
+-        for pos, char in iterable:
+-            # Only positions the lexer actually reaches may open a
+-            # dollar-quoted literal or a multiline comment; a delimiter
+-            # inside a string literal or behind a "--" comment is skipped
+-            # along with its surrounding token and never resolved.
+-            if pos in span_openers:
++        master_match = self._master_match
++        group_actions = self._group_actions
++        keywords_flat = self._keywords_flat
++        keywords_fast = self._keywords_fast
++        fast_single = self._fast_single
++        kw_marker = keywords.PROCESS_AS_KEYWORD
++        name_token = tokens.Name
++        punct_token = tokens.Punctuation
++        error_token = tokens.Error
++        ascii_word_match = _ASCII_WORD_MATCH
++        master_words_both = _MASTER_WORDS_BOTH
++        master_words_up = _MASTER_WORDS_UP
++        fast_end_delims = _FAST_END_DELIMS
++        fast_ws_chars = _FAST_WS_CHARS
++        fast_ws_dot = _FAST_WS_DOT
++        pos = 0
++        length = len(text)
++
++        while pos < length:
++            if has_spans and pos in span_openers:
+                 resolved = delimited_spans.resolve(pos)
+                 if resolved is not None:
+                     end, ttype = resolved
+                     yield ttype, text[pos:end]
+-                    consume(iterable, end - pos - 1)
++                    pos = end
+                     continue
+ 
+-            for rexmatch, action in self._SQL_REGEX:
+-                m = rexmatch(text, pos)
+-
+-                if not m:
++            if fast_single is not None:
++                ch = text[pos]
++                st = fast_single.get(ch)
++                if st is not None:
++                    yield st, ch
++                    pos += 1
+                     continue
+-                elif isinstance(action, tokens._TokenType):
+-                    yield action, m.group()
+-                elif action is keywords.PROCESS_AS_KEYWORD:
+-                    yield self.is_keyword(m.group())
++                if ch == '.' and (pos + 1 >= length or not ('0' <= text[pos + 1] <= '9')):
++                    yield punct_token, '.'
++                    pos += 1
++                    continue
++                if ('a' <= ch <= 'z') or ('A' <= ch <= 'Z') or ch == '_':
++                    wm = ascii_word_match(text, pos)
++                    end = wm.end()
++                    val = wm.group()
++                    next_ch = text[end] if end < length else ''
++                    if next_ch == '' or next_ch in fast_end_delims:
++                        if val not in master_words_both and (val.islower() or val.isupper() or val.upper() not in master_words_up):
++                            if pos > 0 and text[pos - 1] == '.' and ch != '_':
++                                yield name_token, val
++                            else:
++                                tt = keywords_fast.get(val)
++                                if tt is None:
++                                    tt = name_token if (val.islower() or val.isupper()) else keywords_flat.get(val.upper(), name_token)
++                                yield tt, val
++                            pos = end
++                            continue
++                    elif next_ch in fast_ws_chars:
++                        if (end + 1 >= length or text[end + 1] not in fast_ws_dot):
++                            if val not in master_words_both and (val.islower() or val.isupper() or val.upper() not in master_words_up):
++                                if pos > 0 and text[pos - 1] == '.' and ch != '_':
++                                    yield name_token, val
++                                else:
++                                    tt = keywords_fast.get(val)
++                                    if tt is None:
++                                        tt = name_token if (val.islower() or val.isupper()) else keywords_flat.get(val.upper(), name_token)
++                                    yield tt, val
++                                pos = end
++                                continue
++                    elif next_ch == '(' and ch != '_':
++                        if val not in master_words_both and (val.islower() or val.isupper() or val.upper() not in master_words_up):
++                            yield name_token, val
++                            pos = end
++                            continue
++                    elif next_ch == '.' and ch != '_' and (end + 1 >= length or not ('0' <= text[end + 1] <= '9')):
++                        if val not in master_words_both and (val.islower() or val.isupper() or val.upper() not in master_words_up):
++                            yield name_token, val
++                            pos = end
++                            continue
+ 
+-                consume(iterable, m.end() - pos - 1)
+-                break
++            m = master_match(text, pos) if master_match is not None else None
++            if m is not None:
++                action = group_actions[m.lastgroup]
++                val = m.group()
++                if action is kw_marker:
++                    tt = keywords_fast.get(val)
++                    if tt is None:
++                        tt = name_token if (val.islower() or val.isupper()) else keywords_flat.get(val.upper(), name_token)
++                    yield tt, val
++                elif isinstance(action, tokens._TokenType):
++                    yield action, val
++                pos = m.end()
+             else:
+-                yield tokens.Error, char
++                yield error_token, text[pos]
++                pos += 1
+ 
+ 
+ def tokenize(sql, encoding=None):
+diff --git a/sqlparse/sql.py b/sqlparse/sql.py
+index ec44a6d..3822a01 100644
+--- a/sqlparse/sql.py
++++ b/sqlparse/sql.py
+@@ -59,15 +59,23 @@ class Token:
+     )
+ 
+     def __init__(self, ttype, value):
+-        value = str(value)
++        if type(value) is not str:
++            value = str(value)
+         self.value = value
+         self.ttype = ttype
+         self.parent = None
+         self.is_group = False
+-        self.is_keyword = ttype in T.Keyword
+-        self.is_whitespace = self.ttype in T.Whitespace
+-        self.is_newline = self.ttype in T.Newline
+-        self.normalized = value.upper() if self.is_keyword else value
++        if ttype is None:
++            self.is_keyword = False
++            self.is_whitespace = False
++            self.is_newline = False
++            self.normalized = value
++        else:
++            is_kw = ttype._is_keyword
++            self.is_keyword = is_kw
++            self.is_whitespace = ttype._is_whitespace
++            self.is_newline = ttype._is_newline
++            self.normalized = (value if value.isupper() else value.upper()) if is_kw else value
+ 
+     def __str__(self):
+         return self.value
+@@ -109,24 +117,29 @@ class Token:
+         If *regex* is ``True``, the given values are treated as regular
+         expressions. Partial matches are allowed. Defaults to ``False``.
+         """
+-        type_matched = self.ttype is ttype
+-        if not type_matched or values is None:
+-            return type_matched
++        if self.ttype is not ttype:
++            return False
++        if values is None:
++            return True
++
++        norm = self.normalized
++        if not regex:
++            if type(values) is str:
++                return norm == (values.upper() if self.is_keyword else values)
++            if self.is_keyword:
++                for v in values:
++                    if norm == v.upper():
++                        return True
++                return False
++            return norm in values
+ 
+         if isinstance(values, str):
+             values = (values,)
+-
+-        if regex:
+-            # TODO: Add test for regex with is_keyword = false
+-            flag = re.IGNORECASE if self.is_keyword else 0
+-            values = (re.compile(v, flag) for v in values)
+-
+-            return any(pattern.search(self.normalized) for pattern in values)
+-
+-        if self.is_keyword:
+-            values = (v.upper() for v in values)
+-
+-        return self.normalized in values
++        flag = re.IGNORECASE if self.is_keyword else 0
++        for v in values:
++            if re.search(v, norm, flag):
++                return True
++        return False
+ 
+     def within(self, group_cls):
+         """Returns ``True`` if this token is within *group_cls*.
+@@ -165,13 +178,40 @@ class TokenList(Token):
+     __slots__ = 'tokens'
+ 
+     def __init__(self, tokens=None):
+-        self.tokens = tokens or []
+-        [setattr(token, 'parent', self) for token in self.tokens]
+-        super().__init__(None, ''.join(token.value for token in self.tokens))
++        tokens = tokens or []
++        self.tokens = tokens
++        if len(tokens) == 1:
++            t0 = tokens[0]
++            t0.parent = self
++            val = t0.value
++        else:
++            for token in tokens:
++                token.parent = self
++            val = ''.join([token.value for token in tokens])
++        self.value = val
++        self.normalized = val
++        self.ttype = None
++        self.parent = None
+         self.is_group = True
++        self.is_keyword = False
++        self.is_whitespace = False
++        self.is_newline = False
+ 
+     def __str__(self):
+-        return ''.join(token.value for token in self.flatten())
++        parts = []
++        parts_append = parts.append
++        toks = self.tokens
++        stack = toks[::-1] if type(toks) is list else list(toks)[::-1]
++        stack_pop = stack.pop
++        stack_extend = stack.extend
++        while stack:
++            tk = stack_pop()
++            if tk.is_group:
++                sub = tk.tokens
++                stack_extend(sub[::-1] if type(sub) is list else list(sub)[::-1])
++            else:
++                parts_append(tk.value)
++        return ''.join(parts)
+ 
+     # weird bug
+     # def __len__(self):
+@@ -263,15 +303,105 @@ class TokenList(Token):
+         if *skip_cm* is ``True`` (default: ``False``), comments are
+         ignored too.
+         """
+-        # this on is inconsistent, using Comment instead of T.Comment...
+-        def matcher(tk):
+-            return not ((skip_ws and tk.is_whitespace)
+-                        or (skip_cm and imt(tk, t=T.Comment, i=Comment)))
+-        return self._token_matching(matcher)[1]
++        comment_tt = T.Comment
++        for tk in self.tokens:
++            if skip_ws and tk.is_whitespace:
++                continue
++            if skip_cm:
++                tt = tk.ttype
++                if (tt is not None and comment_tt in tt._ancestors) or isinstance(tk, Comment):
++                    continue
++            return tk
++        return None
+ 
+     def token_next_by(self, i=None, m=None, t=None, idx=-1, end=None):
+-        idx += 1
+-        return self._token_matching(lambda tk: imt(tk, i, m, t), idx, end)
++        if idx is None:
++            return None
++        start = idx + 1
++        tokens = self.tokens
++        if end is None:
++            end = len(tokens)
++        if start >= end:
++            return None, None
++
++        # Fast paths for single-criterion lookups (the vast majority of grouping calls).
++        if i is not None and m is None and t is None:
++            for j in range(start, end):
++                tk = tokens[j]
++                if isinstance(tk, i):
++                    return j, tk
++            return None, None
++
++        if t is not None and i is None and m is None:
++            tt_cls = T._TokenType
++            if type(t) is tt_cls:
++                for j in range(start, end):
++                    tk = tokens[j]
++                    tt = tk.ttype
++                    if tt is not None and t in tt._ancestors:
++                        return j, tk
++            elif type(t) is list or type(t) is tuple:
++                for j in range(start, end):
++                    tk = tokens[j]
++                    tt = tk.ttype
++                    if tt is not None:
++                        anc = tt._ancestors
++                        for target in t:
++                            if target in anc:
++                                return j, tk
++            else:
++                for j in range(start, end):
++                    tk = tokens[j]
++                    if tk.ttype in t:
++                        return j, tk
++            return None, None
++
++        if m is not None and i is None and t is None and type(m) is tuple:
++            if len(m) == 2:
++                m_tt, m_vals = m
++                m_re = False
++            else:
++                m_tt, m_vals, m_re = m
++            if not m_re:
++                if m_vals is None:
++                    for j in range(start, end):
++                        tk = tokens[j]
++                        if tk.ttype is m_tt:
++                            return j, tk
++                    return None, None
++                if type(m_vals) is str:
++                    m_vals_up = m_vals.upper()
++                    for j in range(start, end):
++                        tk = tokens[j]
++                        if tk.ttype is m_tt and tk.normalized == (m_vals_up if tk.is_keyword else m_vals):
++                            return j, tk
++                    return None, None
++                m_vals_set = frozenset(m_vals)
++                m_vals_up_set = frozenset(v.upper() for v in m_vals)
++                for j in range(start, end):
++                    tk = tokens[j]
++                    if tk.ttype is m_tt and tk.normalized in (m_vals_up_set if tk.is_keyword else m_vals_set):
++                        return j, tk
++                return None, None
++
++        # Fast path for combined (i, t) lookups (used heavily by group_aliased).
++        if i is not None and t is not None and m is None:
++            tt_cls = T._TokenType
++            if type(t) is tt_cls:
++                for j in range(start, end):
++                    tk = tokens[j]
++                    if isinstance(tk, i):
++                        return j, tk
++                    tt = tk.ttype
++                    if tt is not None and t in tt._ancestors:
++                        return j, tk
++                return None, None
++
++        for j in range(start, end):
++            tk = tokens[j]
++            if imt(tk, i, m, t):
++                return j, tk
++        return None, None
+ 
+     def token_not_matching(self, funcs, idx):
+         funcs = (funcs,) if not isinstance(funcs, (list, tuple)) else funcs
+@@ -300,46 +430,82 @@ class TokenList(Token):
+         """
+         if idx is None:
+             return None, None
+-        idx += 1  # alot of code usage current pre-compensates for this
++        tokens = self.tokens
++        if _reverse:
++            start = idx - 1
++            if start < 0:
++                return None, None
++            if not skip_cm:
++                if skip_ws:
++                    for j in range(start, -1, -1):
++                        tk = tokens[j]
++                        if not tk.is_whitespace:
++                            return j, tk
++                    return None, None
++                return start, tokens[start]
++            comment_tt = T.Comment
++            for j in range(start, -1, -1):
++                tk = tokens[j]
++                if skip_ws and tk.is_whitespace:
++                    continue
++                tt = tk.ttype
++                if (tt is not None and comment_tt in tt._ancestors) or isinstance(tk, Comment):
++                    continue
++                return j, tk
++            return None, None
+ 
+-        def matcher(tk):
+-            return not ((skip_ws and tk.is_whitespace)
+-                        or (skip_cm and imt(tk, t=T.Comment, i=Comment)))
+-        return self._token_matching(matcher, idx, reverse=_reverse)
++        start = idx + 1
++        end = len(tokens)
++        if start >= end:
++            return None, None
++        if not skip_cm:
++            if skip_ws:
++                for j in range(start, end):
++                    tk = tokens[j]
++                    if not tk.is_whitespace:
++                        return j, tk
++                return None, None
++            return start, tokens[start]
++        comment_tt = T.Comment
++        for j in range(start, end):
++            tk = tokens[j]
++            if skip_ws and tk.is_whitespace:
++                continue
++            tt = tk.ttype
++            if (tt is not None and comment_tt in tt._ancestors) or isinstance(tk, Comment):
++                continue
++            return j, tk
++        return None, None
+ 
+     def token_index(self, token, start=0):
+         """Return list index of token."""
+         start = start if isinstance(start, int) else self.token_index(start)
+-        return start + self.tokens[start:].index(token)
++        return self.tokens.index(token, start)
+ 
+     def group_tokens(self, grp_cls, start, end, include_end=True,
+                      extend=False):
+         """Replace tokens by an instance of *grp_cls*."""
+         start_idx = start
+-        start = self.tokens[start_idx]
++        tokens = self.tokens
++        start = tokens[start_idx]
+ 
+         end_idx = end + include_end
+ 
+-        # will be needed later for new group_clauses
+-        # while skip_ws and tokens and tokens[-1].is_whitespace:
+-        #     tokens = tokens[:-1]
+-
+         if extend and isinstance(start, grp_cls):
+-            subtokens = self.tokens[start_idx + 1:end_idx]
++            subtokens = tokens[start_idx + 1:end_idx]
+ 
+             grp = start
+             grp.tokens.extend(subtokens)
+-            del self.tokens[start_idx + 1:end_idx]
+-            grp.value += ''.join(token.value for token in subtokens)
++            del tokens[start_idx + 1:end_idx]
++            grp.value += ''.join([token.value for token in subtokens])
++            for token in subtokens:
++                token.parent = grp
+         else:
+-            subtokens = self.tokens[start_idx:end_idx]
++            subtokens = tokens[start_idx:end_idx]
+             grp = grp_cls(subtokens)
+-            self.tokens[start_idx:end_idx] = [grp]
++            tokens[start_idx:end_idx] = [grp]
+             grp.parent = self
+ 
+-        for token in subtokens:
+-            token.parent = grp
+-
+         return grp
+ 
+     def insert_before(self, where, token):
+diff --git a/sqlparse/tokens.py b/sqlparse/tokens.py
+index 143f66b..88c2320 100644
+--- a/sqlparse/tokens.py
++++ b/sqlparse/tokens.py
+@@ -14,9 +14,14 @@
+ 
+ class _TokenType(tuple):
+     parent = None
++    _ancestors = frozenset()
++    _is_keyword = False
++    _is_whitespace = False
++    _is_newline = False
++    _is_comment = False
+ 
+     def __contains__(self, item):
+-        return item is not None and (self is item or item[:len(self)] == self)
++        return item is not None and (self is item or self in item._ancestors)
+ 
+     def __getattr__(self, name):
+         # don't mess with dunder
+@@ -25,6 +30,11 @@ class _TokenType(tuple):
+         new = _TokenType(self + (name,))
+         setattr(self, name, new)
+         new.parent = self
++        new._ancestors = self._ancestors | {self, new}
++        new._is_keyword = self._is_keyword or (len(new) == 1 and name == 'Keyword')
++        new._is_whitespace = self._is_whitespace or (len(new) == 2 and self == ('Text',) and name == 'Whitespace')
++        new._is_newline = self._is_newline or (len(new) == 3 and self == ('Text', 'Whitespace') and name == 'Newline')
++        new._is_comment = self._is_comment or (len(new) == 1 and name == 'Comment')
+         return new
+ 
+     def __repr__(self):
+@@ -33,6 +43,7 @@ class _TokenType(tuple):
+ 
+ 
+ Token = _TokenType()
++Token._ancestors = frozenset((Token,))
+ 
+ # Special token types
+ Text = Token.Text
+diff --git a/sqlparse/utils.py b/sqlparse/utils.py
+index a55fd72..6a972e2 100644
+--- a/sqlparse/utils.py
++++ b/sqlparse/utils.py
+@@ -82,6 +82,9 @@ def recurse(*cls):
+     return wrap
+ 
+ 
++from sqlparse.tokens import _TokenType
++
++
+ def imt(token, i=None, m=None, t=None):
+     """Helper function to simplify comparisons Instance, Match and TokenType
+     :param token:
+@@ -92,20 +95,29 @@ def imt(token, i=None, m=None, t=None):
+     """
+     if token is None:
+         return False
+-    if i and isinstance(token, i):
++    if i is not None and isinstance(token, i):
+         return True
+-    if m:
+-        if isinstance(m, list):
+-            if any(token.match(*pattern) for pattern in m):
+-                return True
++    if m is not None:
++        if type(m) is list:
++            match = token.match
++            for pattern in m:
++                if match(*pattern):
++                    return True
+         elif token.match(*m):
+             return True
+-    if t:
+-        if isinstance(t, list):
+-            if any(token.ttype in ttype for ttype in t):
++    if t is not None:
++        ttype = token.ttype
++        if ttype is not None:
++            if type(t) is _TokenType:
++                if t in ttype._ancestors:
++                    return True
++            elif type(t) is list:
++                anc = ttype._ancestors
++                for target in t:
++                    if target in anc:
++                        return True
++            elif ttype in t:
+                 return True
+-        elif token.ttype in t:
+-            return True
+     return False
+ 
+ 

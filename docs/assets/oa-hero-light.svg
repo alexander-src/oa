@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="352" viewBox="0 0 880 352" role="img" aria-label="Verified benchmark gains produced with oa">
+  <style>
+    .bg { fill: #ffffff; stroke: #d0d7de; stroke-width: 1; }
+    .title { font: 600 15px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .sub { font: 400 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #59636e; }
+    .row-name { font: 600 13px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .row-meta { font: 400 11px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; }
+    .bar-base { fill: #eaeef2; }
+    .bar-fast { fill: #1a7f37; }
+    .bar-rss { fill: #0969da; }
+    .gain { font: 700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1a7f37; }
+    .gain-rss { font: 700 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #0969da; }
+    .nums { font: 400 11.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #59636e; }
+    .divider { stroke: #eaeef2; stroke-width: 1; }
+    .foot { font: 400 11px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; }
+    .legend { font: 500 11px ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #59636e; }
+  </style>
+
+  <rect x="1" y="1" width="878" height="350" rx="12" class="bg"/>
+
+  <text x="28" y="34" class="title">Verified gains measured with oa</text>
+  <text x="852" y="34" text-anchor="end" class="sub">interleaved A/B · Mann-Whitney U · exact SHA-256</text>
+
+  <line x1="28" y1="50" x2="852" y2="50" class="divider"/>
+
+  <!-- Legend -->
+  <rect x="266" y="62" width="12" height="8" rx="2" class="bar-base"/>
+  <text x="284" y="70" class="legend">Baseline (100%)</text>
+  <rect x="386" y="62" width="12" height="8" rx="2" class="bar-fast"/>
+  <text x="404" y="70" class="legend">After oa (wall time)</text>
+  <rect x="528" y="62" width="12" height="8" rx="2" class="bar-rss"/>
+  <text x="546" y="70" class="legend">After oa (peak RSS)</text>
+
+  <!-- Row 1 -->
+  <g transform="translate(0, 88)">
+    <text x="28" y="14" class="row-name">sqlparse · bench_grouping</text>
+    <text x="28" y="30" class="row-meta">upstream suite, n=2000 · 537/537 tests</text>
+    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
+    <rect x="266" y="20" width="32" height="10" rx="4" class="bar-fast"/>
+    <text x="622" y="16" class="gain">10.5x</text>
+    <text x="852" y="16" text-anchor="end" class="nums">68.1 ms -&gt; 6.5 ms</text>
+    <text x="852" y="31" text-anchor="end" class="row-meta">4.3x to 10.5x across upstream suite</text>
+  </g>
+
+  <!-- Row 2 -->
+  <g transform="translate(0, 136)">
+    <text x="28" y="14" class="row-name">examples/slow_log_parser</text>
+    <text x="28" y="30" class="row-meta">bundled demo · wall latency</text>
+    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
+    <rect x="266" y="20" width="37" height="10" rx="4" class="bar-fast"/>
+    <text x="622" y="16" class="gain">9.13x</text>
+    <text x="852" y="16" text-anchor="end" class="nums">512.7 ms -&gt; 55.7 ms</text>
+    <text x="852" y="31" text-anchor="end" class="row-meta">p = 0.0002 · exact SHA-256</text>
+  </g>
+
+  <!-- Row 3 -->
+  <g transform="translate(0, 184)">
+    <text x="28" y="14" class="row-name">examples/ram_aggregator</text>
+    <text x="28" y="30" class="row-meta">bundled demo · --metric rss</text>
+    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
+    <rect x="266" y="20" width="41" height="10" rx="4" class="bar-rss"/>
+    <text x="622" y="16" class="gain-rss">8.34x</text>
+    <text x="852" y="16" text-anchor="end" class="nums">160.0 -&gt; 19.2 MiB</text>
+    <text x="852" y="31" text-anchor="end" class="row-meta">-88.0% peak RSS · p = 0.0002</text>
+  </g>
+
+  <!-- Row 4 -->
+  <g transform="translate(0, 232)">
+    <text x="28" y="14" class="row-name">andialbrecht/sqlparse</text>
+    <text x="28" y="30" class="row-meta">sqlparse.format · 537/537 tests</text>
+    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
+    <rect x="266" y="20" width="133" height="10" rx="4" class="bar-fast"/>
+    <text x="622" y="16" class="gain">2.55x</text>
+    <text x="852" y="16" text-anchor="end" class="nums">253.9 ms -&gt; 99.8 ms</text>
+    <text x="852" y="31" text-anchor="end" class="row-meta">p = 0.0000 · -7.9% peak RSS</text>
+  </g>
+
+  <!-- Row 5 -->
+  <g transform="translate(0, 280)">
+    <text x="28" y="14" class="row-name">Python-Markdown/markdown</text>
+    <text x="28" y="30" class="row-meta">docs corpus convert · 1,230/1,230 tests</text>
+    <rect x="266" y="6" width="340" height="10" rx="4" class="bar-base"/>
+    <rect x="266" y="20" width="177" height="10" rx="4" class="bar-fast"/>
+    <text x="622" y="16" class="gain">1.92x</text>
+    <text x="852" y="16" text-anchor="end" class="nums">497.3 ms -&gt; 258.8 ms</text>
+    <text x="852" y="31" text-anchor="end" class="row-meta">1.53x full CLI · p = 0.0000</text>
+  </g>
+
+  <line x1="28" y1="326" x2="852" y2="326" class="divider"/>
+  <text x="28" y="342" class="foot">Shorter bars are better. Full patches, benchmark scripts, and rejected dead ends live under docs/showcases/.</text>
+</svg>

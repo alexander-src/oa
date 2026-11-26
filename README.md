@@ -1,144 +1,203 @@
+<div align="center">
+
 # oa
 
-**Optimize Anything**: a single-binary CLI and MCP server that lets coding agents (Claude Code, Antigravity, Cursor, Codex, Gemini CLI) profile real bottlenecks, optimize latency or peak RAM, and accept changes only when tests, output equivalence, and interleaved A/B statistics pass.
+**Optimize Anything: profiling, equivalence gating, and interleaved A/B benchmarking for coding agents.**
 
-```text
-$ oa init --bench "python3 parser.py" --test "python3 -m unittest test_parser.py"
-Initialized oa session in slow_log_parser
-  Locked files    : 1 file(s)
-  Baseline timing : 570.03 ms median (p95 670.75 ms, CV 9.1%)
-  Peak RSS        : 19780 KiB
-  Output SHA-256  : 2fd0cb644a42a5c7.. (286 bytes)
-  Profiler        : python:cProfile+tracemalloc [CPU_ALGORITHMIC]
-  Top hotspots:
-    -  53.0% self ( 528.67 ms,      1 calls)  analyze_logs  (parser.py:65)
+[Quick start](#quick-start) · [Showcases](#showcases) · [How oa works](#how-oa-works) · [MCP & CLI](#mcp-and-cli) · [FAQ](#faq)
 
-$ oa evaluate          # after editing test_parser.py
-Verdict: CheatBlocked (vs best, metric Wall)
-Reason : Cheat Guard blocked evaluation: protected file(s) modified or deleted (test_parser.py)
+<br/>
 
-$ oa evaluate          # after replacing O(N*U) list scan with a set
-Verdict: KeepRecommended (vs best, metric Wall)
-Equiv  : exact output equivalence verified (exit 0, stdout sha256 2fd0cb644a42a5c7.., 0 output file(s))
-Ref    : 639.82 ms median (p95 715.84 ms, MAD 18.37 ms, n=8)
-Cand   : 76.59 ms median (p95 80.77 ms, MAD 2.80 ms, n=8)
-Gain   : 8.09x paired (95% CI [7.89x, 9.69x], Mann-Whitney p=0.0009)
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/oa-hero-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/oa-hero-light.svg">
+  <img alt="Verified benchmark gains measured with oa" src="docs/assets/oa-hero-light.svg" width="880">
+</picture>
 
-## Why `oa`
+</div>
 
-Coding agents are good at rewriting hot loops and bad at measuring whether the rewrite actually helped. Left alone, an agent will time one cold run against one warm run, edit a test or shrink a workload, break edge-case output, or claim a 2% speedup inside a 5% noise floor.
+<br/>
 
-`oa` enforces the measurement loop outside the model:
+Coding agents are good at rewriting code and bad at proving it got faster. Left to run ad-hoc `time` commands, they guess at bottlenecks, keep changes inside run-to-run noise, drop edge-case handling, or quietly loosen assertions to make a benchmark pass.
 
-- Cheat Guard locks tracked test, benchmark, and explicit files with SHA-256 digests at `oa init`, and stamps each `oa evaluate` result with a working-tree fingerprint so post-evaluation edits cannot be kept.
-- Equivalence Gate verifies exit code plus exact SHA-256 of stdout and declared output files (with optional line-filter normalization or an external oracle command).
-- Balanced interleaved A/B benchmarking builds and runs the reference version inside a detached shadow git worktree (`.oa/worktrees/best` or `baseline`), alternating `(ref, cand)` and `(cand, ref)` pairs to cancel thermal throttling and host drift. Changes are accepted only when the 2,000-resample 95% bootstrap CI lower bound exceeds the threshold and the two-sided Mann-Whitney U test passes (`p <= alpha`).
-- Latency and RAM modes support `--metric wall` (median wall time in ms) and `--metric rss` (kernel peak RSS in KiB via `/usr/bin/time`, macOS `/usr/bin/time -l`, or Unix `python3` `resource.getrusage`).
-- Cross-runtime profiling automatically runs Python `cProfile` + `tracemalloc` (with source snippets and allocation sites), Node.js V8 `--cpu-prof` (with JS/TS source snippets), or Linux `perf stat`/`perf record` (with automatic rootless `:u` user-space hardware counters for IPC, branch misses, and cache misses, plus `rusage` fallback).
-- Non-invasive git history stores snapshots under `refs/oa/baseline`, `refs/oa/best`, and `refs/oa/exp/<id>` without polluting your branch or tracked `.gitignore` (`.oa/` is added to `.git/info/exclude`), tracks a Pareto frontier in `.oa/ledger.jsonl`, and records dead ends so agents stop retrying failed ideas.
+`oa` is a single Rust binary (1.3 MB, `#![forbid(unsafe_code)]`, 2 direct dependencies) that runs as both a local CLI and a stdio MCP server. It locks your tests and benchmark scripts with SHA-256 hashes, profiles the actual hot functions, checks exact output equivalence, and runs balanced interleaved A/B pairs against a detached git shadow worktree of your baseline before recommending a keep or revert.
 
-Built in Rust with `#![forbid(unsafe_code)]`, two direct dependencies (`serde` and `serde_json`), and a 1.3 MB stripped release binary.
+## Quick start
 
-## Install
-
-Linux (`x86_64`) and macOS (`arm64`) prebuilt release binary with SHA-256 verification:
+### Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alexander-src/oa/main/install.sh | sh
 ```
 
-Or build from source (Rust 1.75+):
+Or build from source with Cargo:
 
 ```bash
-cargo install --git https://github.com/alexander-src/oa
+cargo install --git https://github.com/alexander-src/oa.git
 ```
 
-Windows (`x86_64`) prebuilt archives are attached on the [Releases](https://github.com/alexander-src/oa/releases) page.
+Prebuilt binaries for Linux (`x86_64`), macOS (`arm64`), and Windows (`x86_64`) are also attached to [GitHub Releases](https://github.com/alexander-src/oa/releases).
 
-## Wire Into Your Coding Agent
+### Connect your agent (MCP)
 
-Run `oa setup` once to register the `oa mcp` stdio server and install `SKILL.md` for detected agents (Claude Code, Antigravity, Cursor, Codex, Gemini CLI). Existing configs are backed up to `*.oa.bak` first.
+Register `oa` as an MCP server and install its agent workflow skill in one command (auto-detects Claude Code, Antigravity, Cursor, Gemini CLI, and Codex):
 
 ```bash
-oa setup --dry-run   # preview changes
-oa setup             # apply changes
+oa setup
 ```
 
-## CLI Quickstart
+> **Try asking your agent:**
+> *"Use oa to initialize an optimization session in this repo (`bench_cmd`: `python3 bench.py`, `test_cmd`: `pytest -q`). Profile the hot path, iterate on the top bottlenecks, revert anything that fails Cheat Guard or Mann-Whitney U, and generate a final `oa_report`."*
 
-Run `oa` directly in any git repository, or try the bundled `examples/slow_log_parser` workload:
+### Use from the terminal (CLI)
 
 ```bash
-oa init --bench "python3 parser.py" --test "python3 -m unittest test_parser.py"
-oa profile
-# edit code targeting the top hotspot
-oa evaluate
-oa checkpoint --keep --hypothesis "replace O(N*U) list scan with set"
-oa profile --diff-from baseline
-oa evaluate --against baseline
-oa report --out optimization_report.md
+# Lock tests/bench, snapshot refs/oa/baseline, capture reference SHA-256 and initial profile
+oa init --bench "python3 bench.py" --test "pytest -q"
+
+# Inspect hotspots (or diff against baseline after edits)
+oa profile --top 12
+
+# Run Cheat Guard -> tests -> SHA-256 equivalence -> balanced interleaved A/B
+oa evaluate --pairs 12
+
+# Keep verified win (updates refs/oa/best) or revert and log the dead end
+oa checkpoint --keep --hypothesis "cache TokenType ancestor sets"
+oa checkpoint --revert --hypothesis "switch lexer to finditer" --dead-end "0.96x regression"
+
+# Export a PR-ready Markdown report with ledger, CIs, p-values, and dead ends
+oa report
 ```
 
-Optimize peak memory instead of wall time:
+To reduce memory footprint instead of latency, pass `--metric rss` to `oa init` or `oa evaluate`. Want to try it immediately? Clone this repo and run `oa` on [examples/slow_log_parser](examples/slow_log_parser) (`--metric wall`) or [examples/ram_aggregator](examples/ram_aggregator) (`--metric rss`).
 
-```bash
-oa init --bench "python3 pipeline.py" --metric rss
-oa evaluate --metric rss
-```
+## Showcases
 
-## Real Verified Runs
+Every result below was measured on real code with locked test suites, byte-identical output SHA-256 checks, and balanced interleaved A/B pairs. Click any showcase for the full experiment ledger, profile diff, rejected dead ends, and apply-ready patch.
 
-Both runs below were executed on Linux `x86_64` (AMD Ryzen 7 9800X3D, 16 CPUs) using the compiled `oa 0.1.0` binary.
+<table>
+  <thead>
+    <tr>
+      <th>Target</th>
+      <th>Metric</th>
+      <th>Verified result</th>
+      <th>Verification</th>
+      <th>Case study</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>andialbrecht/sqlparse</strong><br/><sub>Python · ~4k stars · 30M+ PyPI/mo</sub></td>
+      <td>Wall time<br/><sub>+ Peak RSS</sub></td>
+      <td><strong>2.55x faster</strong> (<code>253.9 ms -&gt; 99.8 ms</code>, <code>-7.9%</code> RAM)<br/><sub><strong>4.3x to 10.5x</strong> across upstream <code>benchmarks/*.py</code></sub></td>
+      <td>537/537 pytest pass<br/><sub><code>p = 0.0000</code> · 1 regression caught</sub></td>
+      <td><a href="docs/showcases/sqlparse.md">Report</a> · <a href="docs/showcases/sqlparse.patch">Patch</a></td>
+    </tr>
+    <tr>
+      <td><strong>Python-Markdown/markdown</strong><br/><sub>Python · ~4.1k stars · powers MkDocs</sub></td>
+      <td>Wall time</td>
+      <td><strong>1.92x faster</strong> convert (<code>497.3 ms -&gt; 258.8 ms</code>)<br/><sub><strong>1.53x</strong> full CLI incl. cold Python start</sub></td>
+      <td>1,230/1,230 tests pass<br/><sub><code>p = 0.0000</code> · O(N^2) TOC bug fixed</sub></td>
+      <td><a href="docs/showcases/python-markdown.md">Report</a> · <a href="docs/showcases/python-markdown.patch">Patch</a></td>
+    </tr>
+    <tr>
+      <td><strong>brave/adblock-rust</strong><br/><sub>Rust · 134,208 EasyList rules</sub></td>
+      <td>Wall time<br/><sub>Linux <code>perf</code></sub></td>
+      <td><strong>1.05x faster</strong> (<code>142.7 ms -&gt; 136.1 ms</code>)<br/><sub>already 3.05 IPC native Rust</sub></td>
+      <td>246/246 cargo tests<br/><sub>2 regressions + 2 noise edits blocked</sub></td>
+      <td><a href="docs/showcases/adblock-rust.md">Report</a> · <a href="docs/showcases/adblock-rust.patch">Patch</a></td>
+    </tr>
+    <tr>
+      <td><strong>examples/ram_aggregator</strong><br/><sub>Bundled · reproducible in 15s</sub></td>
+      <td>Peak RSS<br/><sub><code>--metric rss</code></sub></td>
+      <td><strong>8.34x less RAM</strong> (<code>160.0 -&gt; 19.2 MiB</code>, <code>-88.0%</code>)<br/><sub>plus 1.29x faster wall time</sub></td>
+      <td>2/2 locked tests<br/><sub><code>p = 0.0002</code> · exact SHA-256</sub></td>
+      <td><a href="docs/showcases/ram-aggregator.md">Report</a> · <a href="examples/ram_aggregator/">Code</a></td>
+    </tr>
+    <tr>
+      <td><strong>examples/slow_log_parser</strong><br/><sub>Bundled · reproducible in 15s</sub></td>
+      <td>Wall time<br/><sub><code>--metric wall</code></sub></td>
+      <td><strong>9.13x faster</strong> (<code>512.7 ms -&gt; 55.7 ms</code>)</td>
+      <td>Locked test suite<br/><sub><code>p = 0.0002</code> · Cheat Guard demo</sub></td>
+      <td><a href="examples/slow_log_parser/">Code</a></td>
+    </tr>
+  </tbody>
+</table>
 
-### 1. `brave/adblock-rust` (`c4fb340e`, production Rust adblock engine)
+## How oa works
 
-Workload: compile 134,208 real EasyList + EasyPrivacy rules (`easylist.txt` + `easyprivacy.txt`) and match 30,000 real HTTP requests from `data/requests.json`, gated by all 246 upstream library tests (`cargo test --lib`) and an exact SHA-256 digest over every block/allow/exception/redirect/rewrite decision (`54cd0d0e524b4f9d`). `oa init` locked 102 test/bench files and profiled with Linux `perf` (3.05 IPC, 0.6% baseline CV).
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/oa-loop-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/oa-loop-light.svg">
+    <img alt="oa optimization and verification loop" src="docs/assets/oa-loop-light.svg" width="880">
+  </picture>
+</p>
 
-| # | Status | Hypothesis | Paired Gain | 95% CI | p-value | Median ms |
-| ---: | --- | --- | ---: | --- | ---: | ---: |
-| 1 | KEPT | Replace one-shot `memmem::FinderBuilder` with anchor-byte `memchr` scan for short URL/hostname needles | 1.03x | [1.02x, 1.03x] | 0.0001 | 136.97 |
-| 2 | REVERTED | Monomorphic ASCII tokenizer (`NoiseReject`: LLVM already devirtualized) | 1.00x | [1.00x, 1.01x] | 0.2855 | 137.21 |
-| 3 | REVERTED | Sort all tokens (`RegressionReject`: placed wildcard bucket `0` first) | 0.77x | [0.75x, 0.78x] | 0.0000 | 182.51 |
-| 4 | REVERTED | Sort non-zero tokens (`RegressionReject`: broke URL-order hostname early exit) | 0.79x | [0.78x, 0.80x] | 0.0000 | 173.85 |
-| 5 | KEPT | Lazy `FlatNetworkFilter::patterns()`, `FxHashMap` domain table, skip empty maps/tags, remove duplicate URL clone | 1.02x | [1.02x, 1.03x] | 0.0000 | 134.58 |
-| 6 | REVERTED | L1-sized `ShortHash` Bloom filter (`NoiseReject`: init cost offset 30k-request savings) | 1.01x | [1.00x, 1.03x] | 0.1988 | 135.81 |
+`oa init` snapshots your repository into a hidden git ref (`refs/oa/baseline`) without touching your branches or commit history, checks out a detached shadow worktree under `.oa/worktrees/`, hashes every test and benchmark file, and records the baseline output SHA-256.
 
-Direct 20-pair interleaved head-to-head (`oa evaluate --against baseline --pairs 20`): **142.73 ms -> 136.09 ms** (**1.05x**, 95% CI `[1.03x, 1.07x]`, Mann-Whitney `p = 0.0002`, 246/246 upstream tests passing, identical SHA-256 `54cd0d0e524b4f9d`).
+On every `oa evaluate`, `oa` enforces four gates in order. First, Cheat Guard re-hashes all locked files (normalizing CRLF on Windows) and aborts with `CheatBlocked` if an agent modified a test or benchmark. Second, your test suite must exit 0. Third, candidate stdout and any declared `--output-file` paths must match baseline via SHA-256 (`exact`, `normalized`, or a custom `oracle` command). Fourth, `oa` runs alternating `A/B` and `B/A` pairs between the shadow reference worktree and your working tree, then computes a two-sided Mann-Whitney U p-value (default `alpha = 0.01`) and a 2,000-resample bootstrap 95% confidence interval. Only candidates whose 95% CI lower bound clears the minimum speedup receive `KeepRecommended`.
 
-### 2. Bundled `examples/slow_log_parser` (Python)
+## MCP and CLI
 
-Reproducible directly from this repository (`python3 parser.py`, `python3 -m unittest test_parser.py`, stdout SHA-256 `2fd0cb644a42a5c7`):
+`oa mcp` speaks standard JSON-RPC 2.0 over stdio (supporting both newline-delimited JSON and `Content-Length` framing). Every MCP tool maps directly to a CLI subcommand:
 
-- Experiment #1 (edit `test_parser.py`): blocked immediately by Cheat Guard (`CheatBlocked`) and reverted.
-- Experiment #2 (replace O(N*U) list membership scan with `set`): kept at **8.09x** (`p = 0.0009`).
-- Experiment #3 (regex micro-optimization while `generate_logs` dominated remaining time): rejected as `NoiseReject` (`1.15x`, 95% CI `[0.95x, 1.22x]`, `p = 0.0409`) and reverted.
-- Final 10-pair head-to-head against baseline: **512.68 ms -> 55.70 ms** (**9.13x**, 95% CI `[8.63x, 9.45x]`, Mann-Whitney `p = 0.0002`).
+| MCP tool | CLI command | Purpose |
+| --- | --- | --- |
+| `oa_init` | `oa init` | Snapshot baseline ref, lock tests/bench, capture SHA-256 and initial profile |
+| `oa_profile` | `oa profile` | Run profiler, return hotspots with source snippets, classify bottleneck, diff vs prior |
+| `oa_evaluate` | `oa evaluate` | Run Cheat Guard, test suite, equivalence gate, and interleaved A/B statistics |
+| `oa_checkpoint` | `oa checkpoint` | Keep verified edit as `refs/oa/best` or revert working tree and log dead end |
+| `oa_ledger` | `oa ledger` | Inspect experiment history, Pareto frontier IDs, and recorded dead ends |
+| `oa_report` | `oa report` | Generate a PR-ready Markdown or JSON report |
 
-## MCP Tools
+### Supported profilers
 
-`oa mcp` runs a stdio JSON-RPC 2.0 server supporting both newline-delimited JSON and `Content-Length` framing.
-
-| Tool | Purpose |
-| --- | --- |
-| `oa_init` | Lock protected files, snapshot baseline/best worktrees, record output SHA-256, and return initial profile |
-| `oa_profile` | Profile current tree (`auto`, `python`, `node`, `perf`, `native`) and optionally diff hotspots vs `baseline` or `best` |
-| `oa_evaluate` | Run Cheat Guard, build, tests, equivalence gate, and balanced interleaved A/B evaluation (`wall` or `rss`) |
-| `oa_checkpoint` | Keep verified working tree into `refs/oa/best`, or revert and log a dead end in `.oa/ledger.jsonl` |
-| `oa_ledger` | Return experiment history, cumulative gain, Pareto frontier IDs, and ruled-out dead ends |
-| `oa_report` | Render a PR-ready Markdown or JSON optimization report |
+| Target | Built-in backend | Signals captured |
+| --- | --- | --- |
+| Python | `cProfile` + `tracemalloc` | Top self/cumulative functions, call counts, source lines, peak traced allocations |
+| Node.js | V8 `--cpu-prof` | Parsed `.cpuprofile` hit shares, call counts, and source snippets |
+| Native Linux (Rust/C/C++/Go) | `perf stat` + `perf record` (auto `:u` rootless fallback) | IPC, branch miss rate, cycles, symbol-level hotspots |
+| Any other binary / OS | `rusage` + timing fallback | Wall latency, peak RSS, and bottleneck classification |
 
 ## Limitations
 
-- `oa` requires a git repository with at least one commit so shadow worktrees and `refs/oa/*` snapshots can isolate baseline vs candidate code.
-- `--metric rss` requires Linux or macOS (`/usr/bin/time` or `python3` `resource.getrusage`); Windows currently supports `--metric wall` only.
-- Native line-level symbol profiling currently uses Linux `perf` (with rootless `:u` fallback). macOS (`sample`/`xctrace`), Windows (ETW), Go (`pprof`), and JVM/Ruby adapters are not implemented yet.
-- Sub-10 ms workloads are dominated by process startup jitter; wrap microbenchmarks in an inner loop so each invocation runs at least 50 to 200 ms.
-- Exact equivalence mode expects deterministic stdout and output files; use `--ignore-line <substr>` or `--oracle <cmd>` for workloads that print timestamps or nondeterministic ordering.
+- `oa` benchmarks commands you can run from a shell; interactive GUI apps and live networked services need a deterministic harness command first.
+- Hardware performance counters (`perf`) are Linux-only today; macOS (`sample`/`xctrace`) and Go `pprof` adapters are tracked as open issues ([#1](https://github.com/alexander-src/oa/issues/1), [#2](https://github.com/alexander-src/oa/issues/2)).
+- Peak RSS sampling (`--metric rss`) uses `/usr/bin/time` or Python `resource.getrusage` on Linux and macOS; Windows peak RSS support is tracked in [#3](https://github.com/alexander-src/oa/issues/3).
+- Cheat Guard prevents modifying locked files and tests, though it cannot stop a benchmark command that does not actually exercise the target code.
 
-## Contributing
+## FAQ
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the crate layout and the 5-step guide to adding a new language/OS profiler adapter or coding agent setup target.
+<details>
+<summary><strong>Does oa modify my git branch or commit history?</strong></summary>
+<br/>
+No. Snapshots are written to hidden refs (<code>refs/oa/baseline</code>, <code>refs/oa/best</code>, <code>refs/oa/exp/*</code>) and <code>.oa/</code> is added to <code>.git/info/exclude</code>. Your working branch, index, and <code>.gitignore</code> stay untouched.
+</details>
+
+<details>
+<summary><strong>How does Cheat Guard stop agents from gaming benchmarks?</strong></summary>
+<br/>
+<code>oa init</code> auto-detects test directories, benchmark scripts, and build manifests (plus any paths passed via <code>--lock</code>) and stores their SHA-256 digests in <code>.oa/locks.json</code>. Every <code>oa evaluate</code> verifies those digests before running tests or timings; any edit returns <code>CheatBlocked</code>, which cannot be bypassed even with <code>--force</code>.
+</details>
+
+<details>
+<summary><strong>Why interleaved A/B in shadow worktrees instead of before/after timing?</strong></summary>
+<br/>
+Thermal throttling, background daemons, and CPU frequency scaling easily shift sequential runs by 5% to 15%. Running alternating <code>AB</code>/<code>BA</code> pairs between a detached shadow worktree of baseline/best and your working tree cancels out drift, and the Mann-Whitney U test plus 95% bootstrap CI rejects noisy false positives.
+</details>
+
+<details>
+<summary><strong>Can I optimize memory usage instead of runtime?</strong></summary>
+<br/>
+Yes. Pass <code>--metric rss</code> to <code>oa init</code> or <code>oa evaluate</code>. The interleaved A/B pairs, Mann-Whitney U test, confidence interval, and report then optimize Peak Resident Set Size (KiB) while still running the test suite and exact SHA-256 output gate. See <a href="docs/showcases/ram-aggregator.md">docs/showcases/ram-aggregator.md</a>.
+</details>
+
+<details>
+<summary><strong>How do I contribute a new profiler adapter?</strong></summary>
+<br/>
+Profiler backends live in <a href="src/profiler.rs"><code>src/profiler.rs</code></a>. See <a href="CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> and the open <code>good first issue</code> tickets for Go <code>pprof</code>, macOS <code>sample</code>, and Windows peak RSS.
+</details>
 
 ## License
 
