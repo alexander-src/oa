@@ -10,14 +10,14 @@ use oa::guard::EquivalencePolicy;
 use oa::mcp;
 use oa::session::{
     checkpoint_session, clean_session, compare_commands, compare_git_revs, evaluate_session,
-    export_diff, get_ledger, init_session, profile_session, render_compare_markdown,
-    render_markdown_report, render_svg_report, session_status, verify_session, CheckpointAction,
-    CheckpointParams, CompareGitParams, CompareParams, EvalVerdict, EvaluateParams, InitParams,
-    MetricTarget, ProfileParams, VerifyParams,
+    export_diff, get_ledger, init_session, profile_session, render_compare_csv,
+    render_compare_markdown, render_markdown_report, render_svg_report, session_status,
+    verify_session, CheckpointAction, CheckpointParams, CompareGitParams, CompareParams,
+    EvalVerdict, EvaluateParams, InitParams, MetricTarget, ProfileParams, VerifyParams,
 };
 use oa::setup;
 use oa::stats::BenchVerdict;
-use oa::svg::SvgTheme;
+use oa::svg::{render_compare_svg, SvgTheme};
 
 const HELP: &str = "\
 oa - Optimize Anything: cross-language profiling, equivalence-gated benchmarking, and MCP harness
@@ -78,7 +78,7 @@ fn print_subcommand_help(cmd: &str) {
             "USAGE:\n  oa status [--path <DIR>] [--json]"
         ),
         "compare" => println!(
-            "USAGE:\n  oa compare <CMD_A> <CMD_B> [OPTIONS]\n  oa compare --git <REV_A>[..<REV_B>] --bench <CMD> [OPTIONS]\n\nOPTIONS:\n  --git <REV[..REV2]>    Compare git revision vs working tree (or REV1..REV2 in detached worktrees)\n  --bench <CMD>          Benchmark command to run in each revision (required with --git)\n  --build <CMD>          Optional build command run once per worktree before timing\n  --copy <PATH>          Copy an untracked relative file into detached worktrees (repeatable)\n  --metric <wall|rss>    Metric to compare: wall (ms, default) or rss (peak KiB)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --warmup <N>           Warmup pairs (default 2)\n  --min-speedup <RATIO>  Minimum 95% CI lower bound (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha (default 0.01)\n  --pin-core <ID>        Pin runs to Linux CPU core via taskset\n  --check-output         Fail if stdout SHA-256 differs between A and B\n  --fail-on-regression   Exit non-zero (code 2) if verdict is Slower\n  --markdown             Emit a paste-ready GitHub Markdown comparison table\n  --path <DIR>           Working directory or git repository path\n  --json                 Emit raw JSON output"
+            "USAGE:\n  oa compare <CMD_A> <CMD_B> [OPTIONS]\n  oa compare --git <REV_A>[..<REV_B>] --bench <CMD> [OPTIONS]\n\nOPTIONS:\n  --git <REV[..REV2]>    Compare git revision vs working tree (or REV1..REV2 in detached worktrees)\n  --bench <CMD>          Benchmark command to run in each revision (required with --git)\n  --build <CMD>          Optional build command run once per worktree before timing\n  --copy <PATH>          Copy an untracked relative file into detached worktrees (repeatable)\n  --metric <wall|rss>    Metric to compare: wall (ms, default) or rss (peak KiB)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --warmup <N>           Warmup pairs (default 2)\n  --min-speedup <RATIO>  Minimum 95% CI lower bound (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha (default 0.01)\n  --pin-core <ID>        Pin runs to Linux CPU core via taskset\n  --check-output         Fail if stdout SHA-256 differs between A and B\n  --fail-on-regression   Exit non-zero (code 2) if verdict is Slower\n  --markdown             Emit a paste-ready GitHub Markdown comparison table\n  --svg <FILE>           Write a dark/light SVG comparison chart to FILE\n  --theme <dark|light>   SVG chart theme when --svg is set (default dark)\n  --csv <FILE>           Write raw interleaved pair samples as CSV to FILE\n  --path <DIR>           Working directory or git repository path\n  --json                 Emit raw JSON output"
         ),
         "demo" => println!(
             "USAGE:\n  oa demo [--json]\n\nRuns a self-contained 4-second demo in a temporary git repository and cleans up on exit."
@@ -854,6 +854,9 @@ fn run_cli() -> Result<ExitCode, String> {
             let mut check_output = false;
             let mut fail_on_regression = false;
             let mut as_markdown = false;
+            let mut svg_path = None;
+            let mut theme = SvgTheme::Dark;
+            let mut csv_path = None;
             let mut path = None;
             let mut as_json = false;
 
@@ -902,6 +905,12 @@ fn run_cli() -> Result<ExitCode, String> {
                     "--check-output" => check_output = true,
                     "--fail-on-regression" => fail_on_regression = true,
                     "--markdown" | "--md" => as_markdown = true,
+                    "--svg" => svg_path = Some(next_val(rest, &mut i, "--svg")?),
+                    "--theme" => {
+                        let v = next_val(rest, &mut i, "--theme")?;
+                        theme = SvgTheme::parse_str(&v)?;
+                    }
+                    "--csv" => csv_path = Some(next_val(rest, &mut i, "--csv")?),
                     "--path" => path = Some(next_val(rest, &mut i, "--path")?),
                     "--json" => as_json = true,
                     other if other.starts_with('-') => {
@@ -970,6 +979,17 @@ fn run_cli() -> Result<ExitCode, String> {
                 })?
             };
 
+            if let Some(ref file) = svg_path {
+                let svg = render_compare_svg(&res, theme);
+                fs::write(file, &svg)
+                    .map_err(|e| format!("failed to write SVG chart to '{file}': {e}"))?;
+            }
+            if let Some(ref file) = csv_path {
+                let csv = render_compare_csv(&res);
+                fs::write(file, &csv)
+                    .map_err(|e| format!("failed to write CSV samples to '{file}': {e}"))?;
+            }
+
             if as_json {
                 println!(
                     "{}",
@@ -1027,6 +1047,12 @@ fn run_cli() -> Result<ExitCode, String> {
                     &res.stdout_sha256_a[..16],
                     &res.stdout_sha256_b[..16]
                 );
+                if let Some(ref file) = svg_path {
+                    println!("SVG     : {file}");
+                }
+                if let Some(ref file) = csv_path {
+                    println!("CSV     : {file}");
+                }
                 for w in &res.warnings {
                     println!("Warning : {w}");
                 }
