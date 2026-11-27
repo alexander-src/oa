@@ -369,6 +369,70 @@ fn standalone_compare_detects_speedup_and_equivalence() {
     assert!(res.stats.paired_ratio_median > 1.1);
     let md = oa::session::render_compare_markdown(&res);
     assert!(md.contains("### oa compare") && md.contains("Mann-Whitney U"));
+
+    assert_eq!(res.pair_samples.len(), 6);
+    assert_eq!(res.pair_samples[0].order, "AB");
+    assert_eq!(res.pair_samples[1].order, "BA");
+
+    let csv = oa::session::render_compare_csv(&res);
+    let csv_lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(csv_lines.len(), 7);
+    assert_eq!(csv_lines[0], "pair,order,a_ms,b_ms,ratio");
+    assert!(csv_lines[1].starts_with("1,AB,"));
+    assert!(csv_lines[2].starts_with("2,BA,"));
+
+    let dark_svg = oa::svg::render_compare_svg(&res, oa::svg::SvgTheme::Dark);
+    let light_svg = oa::svg::render_compare_svg(&res, oa::svg::SvgTheme::Light);
+    assert!(dark_svg.starts_with("<svg ") && dark_svg.contains("</svg>"));
+    assert!(dark_svg.contains("#0d1117") && dark_svg.contains("oa compare"));
+    assert!(light_svg.starts_with("<svg ") && light_svg.contains("#ffffff"));
+}
+
+#[test]
+fn cli_compare_writes_svg_and_csv_without_polluting_json_stdout() {
+    let py = python_bin();
+    let dir = TempRepo::new("cli_cmp_exports");
+    let svg_file = dir.path.join("compare.svg");
+    let csv_file = dir.path.join("compare.csv");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_oa"))
+        .args([
+            "compare",
+            &format!("{py} -c \"print(sum(range(50000)))\""),
+            &format!("{py} -c \"print(49999*50000//2)\""),
+            "--pairs",
+            "4",
+            "--warmup",
+            "1",
+            "--check-output",
+            "--svg",
+            &svg_file.to_string_lossy(),
+            "--theme",
+            "light",
+            "--csv",
+            &csv_file.to_string_lossy(),
+            "--json",
+        ])
+        .output()
+        .expect("run oa compare cli");
+
+    assert!(
+        out.status.success(),
+        "oa compare failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("stdout must remain valid JSON with --svg/--csv");
+    assert_eq!(parsed["pair_samples"].as_array().map(|a| a.len()), Some(4));
+
+    let svg = fs::read_to_string(&svg_file).expect("read exported svg");
+    assert!(svg.starts_with("<svg ") && svg.contains("#ffffff") && svg.contains("</svg>"));
+
+    let csv = fs::read_to_string(&csv_file).expect("read exported csv");
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines.len(), 5);
+    assert_eq!(lines[0], "pair,order,a_ms,b_ms,ratio");
 }
 
 #[test]

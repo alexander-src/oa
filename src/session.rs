@@ -1559,6 +1559,15 @@ pub struct CompareGitParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparePairSample {
+    pub pair: usize,
+    pub order: String,
+    pub value_a: f64,
+    pub value_b: f64,
+    pub ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompareResult {
     pub cmd_a: String,
     pub cmd_b: String,
@@ -1572,6 +1581,8 @@ pub struct CompareResult {
     pub stdout_sha256_a: String,
     pub stdout_sha256_b: String,
     pub outputs_identical: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pair_samples: Vec<ComparePairSample>,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -1690,6 +1701,7 @@ fn run_interleaved_compare(
 
     let mut samples_a = Vec::with_capacity(pairs);
     let mut samples_b = Vec::with_capacity(pairs);
+    let mut pair_samples = Vec::with_capacity(pairs);
     let mut rss_a_samples = Vec::new();
     let mut rss_b_samples = Vec::new();
     if let Some(r) = probe_a.peak_rss_kb {
@@ -1700,7 +1712,8 @@ fn run_interleaved_compare(
     }
 
     for i in 0..pairs {
-        let (out_a, out_b) = if i % 2 == 0 {
+        let ab_first = i % 2 == 0;
+        let (out_a, out_b) = if ab_first {
             let a = runner::run_command(exec_a, dir_a, pin_core, measure_rss)?;
             let b = runner::run_command(exec_b, dir_b, pin_core, measure_rss)?;
             (a, b)
@@ -1721,11 +1734,8 @@ fn run_interleaved_compare(
         if let Some(r) = out_b.peak_rss_kb {
             rss_b_samples.push(r);
         }
-        match metric {
-            MetricTarget::Wall => {
-                samples_a.push(out_a.wall_ms);
-                samples_b.push(out_b.wall_ms);
-            }
+        let (va, vb) = match metric {
+            MetricTarget::Wall => (out_a.wall_ms, out_b.wall_ms),
             MetricTarget::Rss => {
                 let ra = out_a.peak_rss_kb.ok_or_else(|| {
                     "peak RSS measurement unavailable on this platform".to_string()
@@ -1733,10 +1743,22 @@ fn run_interleaved_compare(
                 let rb = out_b.peak_rss_kb.ok_or_else(|| {
                     "peak RSS measurement unavailable on this platform".to_string()
                 })?;
-                samples_a.push(ra as f64);
-                samples_b.push(rb as f64);
+                (ra as f64, rb as f64)
             }
-        }
+        };
+        samples_a.push(va);
+        samples_b.push(vb);
+        pair_samples.push(ComparePairSample {
+            pair: i + 1,
+            order: if ab_first {
+                "AB".to_string()
+            } else {
+                "BA".to_string()
+            },
+            value_a: va,
+            value_b: vb,
+            ratio: if vb > 0.0 { va / vb } else { 0.0 },
+        });
     }
 
     let cmp = stats::compare_samples(&samples_a, &samples_b, min_speedup, alpha);
@@ -1757,6 +1779,7 @@ fn run_interleaved_compare(
         stdout_sha256_a: sha_a,
         stdout_sha256_b: sha_b,
         outputs_identical,
+        pair_samples,
         warnings,
     })
 }
@@ -1910,6 +1933,19 @@ pub fn render_compare_markdown(res: &CompareResult) -> String {
         res.stats.baseline.count,
         res.stats.mann_whitney_p,
     )
+}
+
+/// Formats raw interleaved pair samples from `oa compare` as RFC 4180 CSV.
+pub fn render_compare_csv(res: &CompareResult) -> String {
+    let unit = res.metric.unit();
+    let mut out = format!("pair,order,a_{unit},b_{unit},ratio\n");
+    for s in &res.pair_samples {
+        out.push_str(&format!(
+            "{},{},{:.4},{:.4},{:.6}\n",
+            s.pair, s.order, s.value_a, s.value_b, s.ratio
+        ));
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
