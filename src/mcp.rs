@@ -203,6 +203,7 @@ fn tool_schemas() -> Value {
                     "bench_cmd": { "type": "string", "description": "Benchmark command executed in both revisions when git_a is set." },
                     "build_cmd": { "type": "string", "description": "Optional build command executed once per worktree when git_a is set." },
                     "copy_files": { "type": "array", "items": { "type": "string" }, "description": "Optional untracked relative files to copy into detached worktrees." },
+                    "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Optional environment variables (KEY -> VALUE) applied to build and benchmark runs." },
                     "metric": { "type": "string", "enum": ["wall", "rss"] },
                     "pairs": { "type": "integer", "description": "Interleaved A/B pairs (default 10)." },
                     "warmup": { "type": "integer", "description": "Warmup pairs (default 2)." },
@@ -436,6 +437,15 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                 .get("check_output")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let env_vars: Vec<(String, String)> = args
+                .get("env")
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
 
             let res = if let Some(git_a) = str_arg(args, "git_a") {
                 let bench_cmd = str_arg(args, "bench_cmd").ok_or_else(|| {
@@ -448,6 +458,7 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                     bench_cmd,
                     build_cmd: str_arg(args, "build_cmd"),
                     copy_files: str_vec_arg(args, "copy_files"),
+                    env_vars,
                     metric,
                     pairs,
                     warmup,
@@ -465,6 +476,7 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                     path: str_arg(args, "path"),
                     cmd_a,
                     cmd_b,
+                    env_vars,
                     metric,
                     pairs,
                     warmup,

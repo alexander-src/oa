@@ -94,14 +94,14 @@ oa clean --refs
   </picture>
 </p>
 
-Need a quick interleaved A/B comparison or hotspot profile without initializing a session? Run `oa compare` on any two commands or git revisions (add `--markdown` for a paste-ready PR table), or run `oa profile --cmd` directly:
+Need a quick interleaved A/B comparison or hotspot profile without initializing a session? Run `oa compare` on any two commands or git revisions (pass `--markdown` for a paste-ready PR table, `--svg` for a chart, `--csv` for raw interleaved pair samples, or `--env KEY=VAL` for cross-platform environment variables), or run `oa profile --cmd` directly:
 
 ```bash
 # Compare your working tree (or a branch) against main in detached worktrees
-oa compare --git main --bench "cargo run --release" --build "cargo build --release" --pairs 15 --check-output --markdown
+oa compare --git main --bench "cargo run --release" --build "cargo build --release" --pairs 15 --check-output --markdown --svg compare.svg --csv pairs.csv
 
 # Compare any two shell commands
-oa compare "python3 old.py" "python3 new.py" --pairs 15 --check-output --markdown
+oa compare "python3 old.py" "python3 new.py" --env PYTHONOPTIMIZE=1 --pairs 15 --check-output --markdown
 
 # One-shot profile with source snippets (no oa init required)
 oa profile --cmd "python3 bench.py" --top 10
@@ -220,10 +220,10 @@ Running `oa report --format svg --theme dark` on the `Keats/tera` session produc
 
 ## GitHub Action
 
-Drop `uses: alexander-src/oa@v0.5.0` into any workflow to gate pull requests against their base branch on statistically verified speedups, peak RSS, and output SHA-256 equivalence (posts results to `$GITHUB_STEP_SUMMARY` and fails on regression or output mismatch):
+Drop `uses: alexander-src/oa@v0.6.0` into any workflow to gate pull requests against their base branch on statistically verified speedups, peak RSS, and output SHA-256 equivalence (posts results to `$GITHUB_STEP_SUMMARY` and fails on regression or output mismatch):
 
 ```yaml
-- uses: alexander-src/oa@v0.5.0
+- uses: alexander-src/oa@v0.6.0
   with:
     mode: git-compare
     base-ref: ${{ github.event.pull_request.base.sha }}
@@ -251,7 +251,7 @@ Also supports `mode: compare` (any two commands via `cmd-a` and `cmd-b`) and `mo
 | `oa_ledger` | `oa ledger` | Inspect experiment history, Pareto frontier IDs, and ruled-out dead ends |
 | `oa_report` | `oa report` | Export a PR-ready Markdown report, raw JSON ledger, or dark/light SVG chart (`--format svg`) |
 | `oa_diff` | `oa diff` | Export the clean unified patch and diff stat between `refs/oa/baseline` and `refs/oa/best` |
-| `oa_compare` | `oa compare` | Standalone interleaved A/B comparison of two commands or `--git <rev>[..<rev2>]` (`--markdown`, `--check-output`) |
+| `oa_compare` | `oa compare` | Standalone interleaved A/B comparison of two commands or `--git <rev>[..<rev2>]` (`--markdown`, `--svg`, `--csv`, `--env`, `--check-output`) |
 
 Utility commands (CLI): `oa demo` (1-second self-contained walkthrough), `oa doctor` (local profiler & agent check), `oa setup` (auto-configure MCP + `SKILL.md`), `oa clean [--refs]` (remove `.oa/` shadow worktrees and session state while keeping working tree edits).
 
