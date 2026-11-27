@@ -355,6 +355,7 @@ fn standalone_compare_detects_speedup_and_equivalence() {
         path: None,
         cmd_a: format!("{py} -c \"print(sum(i*i for i in range(1200000)))\""),
         cmd_b: format!("{py} -c \"n=1199999; print(n*(n+1)*(2*n+1)//6)\""),
+        env_vars: Vec::new(),
         metric: MetricTarget::Wall,
         pairs: 6,
         warmup: 1,
@@ -433,6 +434,51 @@ fn cli_compare_writes_svg_and_csv_without_polluting_json_stdout() {
     let lines: Vec<&str> = csv.lines().collect();
     assert_eq!(lines.len(), 5);
     assert_eq!(lines[0], "pair,order,a_ms,b_ms,ratio");
+}
+
+#[test]
+fn cli_compare_passes_env_vars_and_validates_format() {
+    let py = python_bin();
+    let check_cmd = format!(
+        "{py} -c \"import os, sys; assert os.environ['OA_A']=='1' and os.environ['OA_B']=='x=y'; print('ok')\""
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_oa"))
+        .args([
+            "compare",
+            &check_cmd,
+            &check_cmd,
+            "--env",
+            "OA_A=1",
+            "--env",
+            "OA_B=x=y",
+            "--pairs",
+            "3",
+            "--warmup",
+            "0",
+            "--check-output",
+            "--json",
+        ])
+        .output()
+        .expect("run oa compare with --env");
+    assert!(
+        out.status.success(),
+        "oa compare --env failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid json from --env compare");
+    assert_eq!(parsed["outputs_identical"], true);
+
+    let bad = Command::new(env!("CARGO_BIN_EXE_oa"))
+        .args(["compare", &check_cmd, &check_cmd, "--env", "NO_EQUALS"])
+        .output()
+        .expect("run oa compare with invalid --env");
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("expected KEY=VALUE"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
 }
 
 #[test]
@@ -565,6 +611,7 @@ fn compare_git_revs_detects_speedup_and_cleans_worktrees() {
         bench_cmd: format!("{py} local_bench.py"),
         build_cmd: None,
         copy_files: vec!["local_bench.py".to_string()],
+        env_vars: Vec::new(),
         metric: MetricTarget::Wall,
         pairs: 6,
         warmup: 1,

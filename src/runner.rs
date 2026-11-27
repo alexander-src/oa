@@ -190,6 +190,17 @@ pub fn run_command(
     pin_core: Option<usize>,
     measure_rusage: bool,
 ) -> Result<RunOutcome, String> {
+    run_command_with_env(cmd, cwd, pin_core, measure_rusage, &[])
+}
+
+/// Runs a command with extra environment variables applied cleanly across platforms.
+pub fn run_command_with_env(
+    cmd: &str,
+    cwd: &Path,
+    pin_core: Option<usize>,
+    measure_rusage: bool,
+    env_vars: &[(String, String)],
+) -> Result<RunOutcome, String> {
     let mut user_ms = None;
     let mut sys_ms = None;
     let mut peak_rss_kb = None;
@@ -324,6 +335,10 @@ pub fn run_command(
         c.current_dir(cwd);
         c
     };
+
+    for (k, v) in env_vars {
+        command.env(k, v);
+    }
 
     let start = Instant::now();
     let output = command

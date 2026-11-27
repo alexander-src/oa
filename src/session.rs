@@ -1532,6 +1532,7 @@ pub struct CompareParams {
     pub path: Option<String>,
     pub cmd_a: String,
     pub cmd_b: String,
+    pub env_vars: Vec<(String, String)>,
     pub metric: MetricTarget,
     pub pairs: usize,
     pub warmup: usize,
@@ -1549,6 +1550,7 @@ pub struct CompareGitParams {
     pub bench_cmd: String,
     pub build_cmd: Option<String>,
     pub copy_files: Vec<String>,
+    pub env_vars: Vec<(String, String)>,
     pub metric: MetricTarget,
     pub pairs: usize,
     pub warmup: usize,
@@ -1556,6 +1558,17 @@ pub struct CompareGitParams {
     pub alpha: f64,
     pub pin_core: Option<usize>,
     pub check_output: bool,
+}
+
+/// Parses a `KEY=VAL` environment variable specification.
+pub fn parse_env_pair(raw: &str) -> Result<(String, String), String> {
+    let (key, val) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("invalid --env '{raw}': expected KEY=VALUE"))?;
+    if key.is_empty() {
+        return Err(format!("invalid --env '{raw}': key cannot be empty"));
+    }
+    Ok((key.to_string(), val.to_string()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1643,6 +1656,7 @@ fn run_interleaved_compare(
     exec_b: &str,
     label_b: String,
     bench_cmd: Option<String>,
+    env_vars: &[(String, String)],
     metric: MetricTarget,
     pairs: usize,
     warmup: usize,
@@ -1655,7 +1669,7 @@ fn run_interleaved_compare(
     let measure_rss = metric == MetricTarget::Rss;
 
     // Initial check + SHA-256 + Peak RSS measurement for both commands.
-    let probe_a = runner::run_command(exec_a, dir_a, pin_core, true)?;
+    let probe_a = runner::run_command_with_env(exec_a, dir_a, pin_core, true, env_vars)?;
     if probe_a.exit_code != 0 {
         return Err(format!(
             "command A ({label_a}) exited {}: {}",
@@ -1666,7 +1680,7 @@ fn run_interleaved_compare(
                 .collect::<String>()
         ));
     }
-    let probe_b = runner::run_command(exec_b, dir_b, pin_core, true)?;
+    let probe_b = runner::run_command_with_env(exec_b, dir_b, pin_core, true, env_vars)?;
     if probe_b.exit_code != 0 {
         return Err(format!(
             "command B ({label_b}) exited {}: {}",
@@ -1691,11 +1705,11 @@ fn run_interleaved_compare(
 
     for i in 0..warmup {
         if i % 2 == 0 {
-            let _ = runner::run_command(exec_a, dir_a, pin_core, false)?;
-            let _ = runner::run_command(exec_b, dir_b, pin_core, false)?;
+            let _ = runner::run_command_with_env(exec_a, dir_a, pin_core, false, env_vars)?;
+            let _ = runner::run_command_with_env(exec_b, dir_b, pin_core, false, env_vars)?;
         } else {
-            let _ = runner::run_command(exec_b, dir_b, pin_core, false)?;
-            let _ = runner::run_command(exec_a, dir_a, pin_core, false)?;
+            let _ = runner::run_command_with_env(exec_b, dir_b, pin_core, false, env_vars)?;
+            let _ = runner::run_command_with_env(exec_a, dir_a, pin_core, false, env_vars)?;
         }
     }
 
@@ -1714,12 +1728,12 @@ fn run_interleaved_compare(
     for i in 0..pairs {
         let ab_first = i % 2 == 0;
         let (out_a, out_b) = if ab_first {
-            let a = runner::run_command(exec_a, dir_a, pin_core, measure_rss)?;
-            let b = runner::run_command(exec_b, dir_b, pin_core, measure_rss)?;
+            let a = runner::run_command_with_env(exec_a, dir_a, pin_core, measure_rss, env_vars)?;
+            let b = runner::run_command_with_env(exec_b, dir_b, pin_core, measure_rss, env_vars)?;
             (a, b)
         } else {
-            let b = runner::run_command(exec_b, dir_b, pin_core, measure_rss)?;
-            let a = runner::run_command(exec_a, dir_a, pin_core, measure_rss)?;
+            let b = runner::run_command_with_env(exec_b, dir_b, pin_core, measure_rss, env_vars)?;
+            let a = runner::run_command_with_env(exec_a, dir_a, pin_core, measure_rss, env_vars)?;
             (a, b)
         };
         if out_a.exit_code != 0 {
@@ -1798,6 +1812,7 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
         &params.cmd_b,
         params.cmd_b.clone(),
         None,
+        &params.env_vars,
         params.metric,
         params.pairs,
         params.warmup,
@@ -1841,7 +1856,7 @@ pub fn compare_git_revs(params: CompareGitParams) -> Result<CompareResult, Strin
     let label_a = format!("{} ({})", params.git_a, &sha_a[..8.min(sha_a.len())]);
 
     if let Some(ref build_cmd) = params.build_cmd {
-        let out_a = runner::run_command(build_cmd, &wt_a, None, false)?;
+        let out_a = runner::run_command_with_env(build_cmd, &wt_a, None, false, &params.env_vars)?;
         if out_a.exit_code != 0 {
             return Err(format!(
                 "build failed for {label_a} (exit {}): {}",
@@ -1849,7 +1864,7 @@ pub fn compare_git_revs(params: CompareGitParams) -> Result<CompareResult, Strin
                 snippet_output(&out_a.stderr, 300)
             ));
         }
-        let out_b = runner::run_command(build_cmd, &dir_b, None, false)?;
+        let out_b = runner::run_command_with_env(build_cmd, &dir_b, None, false, &params.env_vars)?;
         if out_b.exit_code != 0 {
             return Err(format!(
                 "build failed for {label_b} (exit {}): {}",
@@ -1867,6 +1882,7 @@ pub fn compare_git_revs(params: CompareGitParams) -> Result<CompareResult, Strin
         &params.bench_cmd,
         label_b,
         Some(params.bench_cmd.clone()),
+        &params.env_vars,
         params.metric,
         params.pairs,
         params.warmup,
