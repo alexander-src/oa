@@ -27,13 +27,25 @@ pub struct Hotspot {
     pub snippet: Option<String>,
 }
 
-/// Top memory allocation site (e.g., from Python `tracemalloc`).
+/// Top memory allocation site (Python `tracemalloc`, Node V8 `--heap-prof`, Go `pprof -alloc_space`, or Linux `perf page-faults`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllocSite {
     pub file: String,
     pub line: usize,
     pub size_kb: f64,
     pub count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+}
+
+/// Packable struct layout candidate detected via DWARF inspection (`pahole -P`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructPadding {
+    pub name: String,
+    pub current_bytes: u64,
+    pub packed_bytes: u64,
+    pub saved_bytes: u64,
+    pub savings_pct: f64,
 }
 
 /// Optional Linux hardware performance counters from `perf stat`.
@@ -64,6 +76,8 @@ pub struct ProfileReport {
     pub counters: Option<HardwareCounters>,
     pub hotspots: Vec<Hotspot>,
     pub alloc_sites: Vec<AllocSite>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub struct_padding: Vec<StructPadding>,
     pub notes: Vec<String>,
 }
 
@@ -207,8 +221,17 @@ for st in snap.statistics("lineno")[:10]:
         "count": st.count,
     })
 
+peak_rss_kb = None
+try:
+    import resource
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    peak_rss_kb = int(r.ru_maxrss // 1024) if sys.platform == "darwin" else int(r.ru_maxrss)
+except Exception:
+    peak_rss_kb = None
+
 payload = {
     "wall_ms": round(wall_ms, 3),
+    "peak_rss_kb": peak_rss_kb,
     "peak_alloc_kb": round(peak_mem / 1024.0, 2),
     "hotspots": rows[:15],
     "alloc_sites": allocs,
@@ -220,6 +243,8 @@ with open(out_path, "w", encoding="utf-8") as f:
 #[derive(Deserialize)]
 struct RawPyProfile {
     wall_ms: f64,
+    #[serde(default)]
+    peak_rss_kb: Option<u64>,
     peak_alloc_kb: f64,
     hotspots: Vec<RawPyHotspot>,
     alloc_sites: Vec<AllocSite>,
@@ -309,13 +334,14 @@ fn profile_python(
         wall_ms: parsed.wall_ms,
         user_ms: None,
         sys_ms: None,
-        peak_rss_kb: None,
+        peak_rss_kb: parsed.peak_rss_kb,
         peak_alloc_kb: Some(parsed.peak_alloc_kb),
         bottleneck_class,
         diagnosis,
         counters: None,
         hotspots,
         alloc_sites: parsed.alloc_sites,
+        struct_padding: Vec::new(),
         notes: vec![
             "cProfile + tracemalloc add profiling overhead; use oa_evaluate for unbiased wall-time speedups."
                 .to_string(),
@@ -569,12 +595,175 @@ pub fn parse_perf_report_srcline(
     hotspots
 }
 
+/// Parses `perf report --stdio --no-children -n --show-total-period -s dso,symbol,srcline --full-source-path -t '\t'`
+/// from a `page-faults` / `page-faults:u` capture into estimated RSS-growth `AllocSite` entries (4 KiB per fault).
+pub fn parse_perf_page_faults(
+    raw: &str,
+    cwd: &Path,
+    top_k: usize,
+) -> (Option<f64>, Vec<AllocSite>) {
+    let canon_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut agg: BTreeMap<(String, usize, String, bool), (u64, f64)> = BTreeMap::new();
+    let mut total_kb = 0.0f64;
+
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || !line.contains('\t') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+        // Format: Overhead, Samples, Period, DSO, Symbol, Source:Line [, IPC]
+        if cols.len() < 6 || !cols[0].ends_with('%') {
+            continue;
+        }
+        let Ok(period) = cols[2].parse::<u64>() else {
+            continue;
+        };
+        if period == 0 {
+            continue;
+        }
+        let dso = cols[3];
+        if dso.starts_with("ld-linux") || dso.starts_with("ld-musl") {
+            continue;
+        }
+        let sym = strip_perf_sym_prefix(cols[4]);
+        let srcline = cols[5];
+        let (file, line_no, in_project) =
+            parse_perf_srcline(srcline, cwd, &canon_cwd).unwrap_or((dso.to_string(), 0, false));
+        let kb = (period as f64) * 4.0;
+        total_kb += kb;
+        let entry = agg
+            .entry((file, line_no, sym, in_project))
+            .or_insert((0, 0.0));
+        entry.0 += period;
+        entry.1 += kb;
+    }
+
+    let mut rows: Vec<(String, usize, String, bool, u64, f64)> = agg
+        .into_iter()
+        .map(|((file, line, sym, in_proj), (count, kb))| (file, line, sym, in_proj, count, kb))
+        .collect();
+    // Prefer in-project sites first when sizes are comparable, otherwise largest byte impact.
+    rows.sort_by(|a, b| {
+        b.5.total_cmp(&a.5)
+            .then_with(|| b.3.cmp(&a.3))
+            .then_with(|| b.4.cmp(&a.4))
+    });
+
+    let sites: Vec<AllocSite> = rows
+        .into_iter()
+        .take(top_k)
+        .map(|(file, line, sym, _in_proj, count, kb)| AllocSite {
+            file,
+            line,
+            size_kb: (kb * 100.0).round() / 100.0,
+            count,
+            function: if sym.is_empty() { None } else { Some(sym) },
+        })
+        .collect();
+
+    let total = if total_kb > 0.0 {
+        Some((total_kb * 100.0).round() / 100.0)
+    } else {
+        None
+    };
+    (total, sites)
+}
+
+/// Parses tab-separated `pahole -P <binary>` output (`<struct>\t<current>\t<packed>\t<saved>`)
+/// to highlight structs that can shrink by reordering fields.
+pub fn parse_pahole_packable(raw: &str, top_k: usize) -> Vec<StructPadding> {
+    let mut rows = Vec::new();
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = t.split('\t').map(str::trim).collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        let name = cols[0];
+        if name.is_empty()
+            || name.starts_with('_')
+            || name.starts_with("std::")
+            || name.starts_with("core::")
+            || name.starts_with("alloc::")
+            || name.starts_with("__")
+            || matches!(name, "_IO_FILE" | "pthread_mutex_t" | "stat" | "sigaction")
+        {
+            continue;
+        }
+        let Ok(current_bytes) = cols[1].parse::<u64>() else {
+            continue;
+        };
+        let Ok(packed_bytes) = cols[2].parse::<u64>() else {
+            continue;
+        };
+        let Ok(saved_bytes) = cols[3].parse::<u64>() else {
+            continue;
+        };
+        if current_bytes < 16 || saved_bytes < 8 || packed_bytes >= current_bytes {
+            continue;
+        }
+        let savings_pct = ((saved_bytes as f64 / current_bytes as f64) * 1000.0).round() / 10.0;
+        rows.push(StructPadding {
+            name: name.to_string(),
+            current_bytes,
+            packed_bytes,
+            saved_bytes,
+            savings_pct,
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.saved_bytes
+            .cmp(&a.saved_bytes)
+            .then_with(|| b.savings_pct.total_cmp(&a.savings_pct))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    rows.truncate(top_k);
+    rows
+}
+
+#[cfg(target_os = "linux")]
+fn detect_local_elf_binary(cmd: &str, cwd: &Path) -> Option<std::path::PathBuf> {
+    let trimmed = cmd.trim();
+    if trimmed.contains('|') || trimmed.contains("&&") || trimmed.contains(';') {
+        return None;
+    }
+    for tok in trimmed.split_whitespace() {
+        // Skip leading KEY=VAL env prefixes.
+        if tok.contains('=') && !tok.starts_with('/') && !tok.starts_with('.') {
+            continue;
+        }
+        let candidate = if Path::new(tok).is_absolute() {
+            std::path::PathBuf::from(tok)
+        } else {
+            cwd.join(tok)
+        };
+        if candidate.is_file() {
+            if let Ok(mut f) = fs::File::open(&candidate) {
+                use std::io::Read;
+                let mut magic = [0u8; 4];
+                if f.read_exact(&mut magic).is_ok() && magic == *b"\x7fELF" {
+                    return Some(candidate);
+                }
+            }
+        }
+        break;
+    }
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn profile_linux_native(cmd: &str, cwd: &Path, top_k: usize) -> Result<ProfileReport, String> {
     let base = run_command(cmd, cwd, None, true)?;
     let mut notes = Vec::new();
     let mut counters = None;
     let mut hotspots = Vec::new();
+    let mut alloc_sites = Vec::new();
+    let mut peak_alloc_kb = None;
+    let mut struct_padding = Vec::new();
     let mut profiler = "linux:rusage".to_string();
 
     if command_exists("perf") {
@@ -699,11 +888,112 @@ fn profile_linux_native(cmd: &str, cwd: &Path, top_k: usize) -> Result<ProfileRe
                 }
             }
             let _ = fs::remove_file(&perf_data);
+
+            // Sample physical page-fault allocation sites (`page-faults[:u]`, 4 KiB per fault).
+            let pf_seq = PROF_SEQ.fetch_add(1, Ordering::Relaxed);
+            let pf_data = std::env::temp_dir().join(format!(
+                "oa_perf_pf_{}_{}.data",
+                std::process::id(),
+                pf_seq
+            ));
+            let pf_event = if used_user_only {
+                "page-faults:u"
+            } else {
+                "page-faults"
+            };
+            let pf_rec = Command::new("perf")
+                .args([
+                    "record",
+                    "-q",
+                    "-e",
+                    pf_event,
+                    "-c",
+                    "16",
+                    "-o",
+                    &pf_data.to_string_lossy(),
+                    "--",
+                    "sh",
+                    "-c",
+                    cmd,
+                ])
+                .current_dir(cwd)
+                .output();
+            if matches!(pf_rec, Ok(ref r) if r.status.success()) {
+                let pf_path = pf_data.to_string_lossy().to_string();
+                let pf_variants: [&[&str]; 2] = [
+                    &[
+                        "report",
+                        "--stdio",
+                        "--no-children",
+                        "-n",
+                        "--show-total-period",
+                        "--percent-limit",
+                        "0.5",
+                        "-s",
+                        "dso,symbol,srcline",
+                        "--full-source-path",
+                        "-t",
+                        "\t",
+                        "-i",
+                        &pf_path,
+                    ],
+                    &[
+                        "report",
+                        "--stdio",
+                        "--no-children",
+                        "-n",
+                        "--show-total-period",
+                        "--percent-limit",
+                        "0.5",
+                        "-s",
+                        "dso,symbol,srcline",
+                        "-t",
+                        "\t",
+                        "-i",
+                        &pf_path,
+                    ],
+                ];
+                for args in pf_variants {
+                    if let Ok(rep) = Command::new("perf").args(args).current_dir(cwd).output() {
+                        if rep.status.success() {
+                            let rep_txt = String::from_utf8_lossy(&rep.stdout);
+                            let (tot_kb, sites) = parse_perf_page_faults(&rep_txt, cwd, top_k);
+                            if !sites.is_empty() {
+                                peak_alloc_kb = tot_kb;
+                                alloc_sites = sites;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = fs::remove_file(&pf_data);
         } else if saw_paranoid {
             notes.push(
                 "Linux perf counters restricted by kernel.perf_event_paranoid; run 'sudo sysctl kernel.perf_event_paranoid=-1' to enable hardware IPC/cache profiling."
                     .to_string(),
             );
+        }
+    }
+
+    if command_exists("pahole") {
+        if let Some(elf_bin) = detect_local_elf_binary(cmd, cwd) {
+            if let Ok(out) = Command::new("pahole")
+                .args(["-P", &elf_bin.to_string_lossy()])
+                .current_dir(cwd)
+                .output()
+            {
+                if out.status.success() {
+                    let txt = String::from_utf8_lossy(&out.stdout);
+                    struct_padding = parse_pahole_packable(&txt, 8);
+                    if !struct_padding.is_empty() {
+                        notes.push(format!(
+                            "pahole found {} packable DWARF struct(s) with >= 8 bytes of field padding.",
+                            struct_padding.len()
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -716,12 +1006,13 @@ fn profile_linux_native(cmd: &str, cwd: &Path, top_k: usize) -> Result<ProfileRe
         user_ms: base.user_ms,
         sys_ms: base.sys_ms,
         peak_rss_kb: base.peak_rss_kb,
-        peak_alloc_kb: None,
+        peak_alloc_kb,
         bottleneck_class,
         diagnosis,
         counters,
         hotspots,
-        alloc_sites: Vec::new(),
+        alloc_sites,
+        struct_padding,
         notes,
     })
 }
@@ -1014,11 +1305,127 @@ pub fn parse_v8_cpuprofile(
         counters: None,
         hotspots,
         alloc_sites: Vec::new(),
+        struct_padding: Vec::new(),
         notes: vec![
             "Sampling profile via node --cpu-prof; use oa_evaluate for unbiased interleaved A/B timings."
                 .to_string(),
         ],
     })
+}
+
+#[derive(Deserialize)]
+struct V8HeapNode {
+    #[serde(default)]
+    id: u64,
+    #[serde(rename = "callFrame")]
+    call_frame: V8CallFrame,
+    #[serde(rename = "selfSize", default)]
+    self_size: u64,
+    #[serde(default)]
+    children: Vec<V8HeapNode>,
+}
+
+#[derive(Deserialize)]
+struct V8HeapSample {
+    #[serde(default)]
+    size: u64,
+    #[serde(rename = "nodeId", default)]
+    node_id: u64,
+}
+
+#[derive(Deserialize)]
+struct V8HeapProfile {
+    head: V8HeapNode,
+    #[serde(default)]
+    samples: Vec<V8HeapSample>,
+}
+
+/// Parses a V8 `.heapprofile` JSON payload (produced by `node --heap-prof`) into total sampled KiB and ranked `AllocSite`s.
+pub fn parse_v8_heapprofile(
+    raw_json: &str,
+    cwd: &Path,
+    top_k: usize,
+) -> Result<(f64, Vec<AllocSite>), String> {
+    let parsed: V8HeapProfile = serde_json::from_str(raw_json)
+        .map_err(|e| format!("failed to parse V8 heapprofile JSON: {e}"))?;
+    let canon_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+
+    let mut sample_counts: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    for s in &parsed.samples {
+        let e = sample_counts.entry(s.node_id).or_insert((0, 0));
+        e.0 += s.size;
+        e.1 += 1;
+    }
+
+    let mut agg: BTreeMap<(String, usize, String), (u64, u64)> = BTreeMap::new();
+    let mut stack: Vec<&V8HeapNode> = vec![&parsed.head];
+    let mut total_bytes: u64 = 0;
+
+    while let Some(node) = stack.pop() {
+        for child in &node.children {
+            stack.push(child);
+        }
+        let func = if node.call_frame.function_name.is_empty() {
+            "(anonymous)".to_string()
+        } else {
+            node.call_frame.function_name.clone()
+        };
+        if matches!(func.as_str(), "(root)" | "(idle)" | "(program)") {
+            continue;
+        }
+        let (samp_bytes, samp_cnt) = sample_counts.get(&node.id).copied().unwrap_or((0, 0));
+        let bytes = node.self_size.max(samp_bytes);
+        if bytes == 0 {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(bytes);
+        let clean_url = node
+            .call_frame
+            .url
+            .strip_prefix("file://")
+            .unwrap_or(&node.call_frame.url);
+        let display_file = if !clean_url.is_empty() && !clean_url.starts_with("node:") {
+            let p = Path::new(clean_url);
+            let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if let Ok(rel) = canon.strip_prefix(&canon_cwd) {
+                rel.to_string_lossy().to_string()
+            } else {
+                clean_url.to_string()
+            }
+        } else {
+            clean_url.to_string()
+        };
+        let line = if node.call_frame.line_number >= 0 {
+            (node.call_frame.line_number + 1) as usize
+        } else {
+            0
+        };
+        let count = samp_cnt.max(1);
+        let entry = agg.entry((display_file, line, func)).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(bytes);
+        entry.1 = entry.1.saturating_add(count);
+    }
+
+    let mut rows: Vec<(String, usize, String, u64, u64)> = agg
+        .into_iter()
+        .map(|((file, line, func), (bytes, count))| (file, line, func, bytes, count))
+        .collect();
+    rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| b.4.cmp(&a.4)));
+
+    let sites: Vec<AllocSite> = rows
+        .into_iter()
+        .take(top_k)
+        .map(|(file, line, func, bytes, count)| AllocSite {
+            file,
+            line,
+            size_kb: ((bytes as f64 / 1024.0) * 100.0).round() / 100.0,
+            count,
+            function: Some(func),
+        })
+        .collect();
+
+    let total_kb = ((total_bytes as f64 / 1024.0) * 100.0).round() / 100.0;
+    Ok((total_kb, sites))
 }
 
 fn profile_node(
@@ -1031,12 +1438,18 @@ fn profile_node(
     let out_dir = std::env::temp_dir().join(format!("oa_nodeprof_{}_{}", std::process::id(), seq));
     fs::create_dir_all(&out_dir).map_err(|e| format!("failed to create node profile dir: {e}"))?;
     let prof_name = "profile.cpuprofile";
+    let heap_name = "profile.heapprofile";
     let prof_path = out_dir.join(prof_name);
+    let heap_path = out_dir.join(heap_name);
 
     let mut args = vec![
         "--cpu-prof".to_string(),
         format!("--cpu-prof-dir={}", out_dir.to_string_lossy()),
         format!("--cpu-prof-name={prof_name}"),
+        "--heap-prof".to_string(),
+        format!("--heap-prof-dir={}", out_dir.to_string_lossy()),
+        format!("--heap-prof-name={heap_name}"),
+        "--heap-prof-interval=65536".to_string(),
     ];
     args.extend(target_args.iter().cloned());
 
@@ -1062,8 +1475,20 @@ fn profile_node(
 
     let raw_json = fs::read_to_string(&prof_path)
         .map_err(|e| format!("failed to read V8 cpuprofile output: {e}"))?;
+    let raw_heap = fs::read_to_string(&heap_path).ok();
     let _ = fs::remove_dir_all(&out_dir);
-    parse_v8_cpuprofile(&raw_json, wall_ms, cwd, top_k)
+
+    let mut report = parse_v8_cpuprofile(&raw_json, wall_ms, cwd, top_k)?;
+    if let Some(heap_json) = raw_heap {
+        if let Ok((alloc_kb, sites)) = parse_v8_heapprofile(&heap_json, cwd, top_k) {
+            if !sites.is_empty() {
+                report.profiler = "node:v8-cpu+heap-prof".to_string();
+                report.peak_alloc_kb = Some(alloc_kb);
+                report.alloc_sites = sites;
+            }
+        }
+    }
+    Ok(report)
 }
 
 fn detect_go_test_invocation(cmd: &str) -> Option<(String, Vec<String>)> {
@@ -1233,11 +1658,98 @@ pub fn parse_go_pprof_top(
         counters: None,
         hotspots,
         alloc_sites: Vec::new(),
+        struct_padding: Vec::new(),
         notes: vec![
             "Sampling profile via `go test -cpuprofile` + `go tool pprof -top`; use oa_evaluate for unbiased interleaved A/B timings."
                 .to_string(),
         ],
     })
+}
+
+fn parse_pprof_size_kb(token: &str) -> Option<f64> {
+    let t = token.trim();
+    if let Some(v) = t.strip_suffix("GB") {
+        return v.parse::<f64>().ok().map(|x| x * 1024.0 * 1024.0);
+    }
+    if let Some(v) = t.strip_suffix("MB") {
+        return v.parse::<f64>().ok().map(|x| x * 1024.0);
+    }
+    if let Some(v) = t.strip_suffix("kB").or_else(|| t.strip_suffix("KB")) {
+        return v.parse::<f64>().ok();
+    }
+    if let Some(v) = t.strip_suffix('B') {
+        return v.parse::<f64>().ok().map(|x| x / 1024.0);
+    }
+    if t == "0" {
+        return Some(0.0);
+    }
+    None
+}
+
+/// Parses `go tool pprof -top -alloc_space -unit=kB` output into total allocated KiB and ranked `AllocSite`s.
+pub fn parse_go_pprof_mem_top(
+    raw_text: &str,
+    _cwd: &Path,
+    top_k: usize,
+) -> Result<(f64, Vec<AllocSite>), String> {
+    let mut sites = Vec::new();
+    let mut in_table = false;
+    let mut total_kb = 0.0f64;
+
+    for line in raw_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("flat") && trimmed.contains("cum%") {
+            in_table = true;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed.split_whitespace().collect();
+        if cols.len() < 6 {
+            continue;
+        }
+        let Some(flat_kb) = parse_pprof_size_kb(cols[0]) else {
+            continue;
+        };
+        if flat_kb <= 0.0 {
+            continue;
+        }
+        total_kb += flat_kb;
+        let rest = cols[5..].join(" ");
+        let (function, file, line_no) = if let Some((func_part, loc_part)) = rest.rsplit_once(' ') {
+            if loc_part.contains(".go") {
+                let (f, ln) = match loc_part.rsplit_once(':') {
+                    Some((fp, l)) => (fp.to_string(), l.parse::<usize>().unwrap_or(0)),
+                    None => (loc_part.to_string(), 0),
+                };
+                (func_part.to_string(), f, ln)
+            } else {
+                (rest, String::new(), 0)
+            }
+        } else {
+            (rest, String::new(), 0)
+        };
+
+        if sites.len() < top_k {
+            sites.push(AllocSite {
+                file: if file.is_empty() {
+                    function.clone()
+                } else {
+                    file
+                },
+                line: line_no,
+                size_kb: (flat_kb * 100.0).round() / 100.0,
+                count: 0,
+                function: Some(function),
+            });
+        }
+    }
+
+    Ok(((total_kb * 100.0).round() / 100.0, sites))
 }
 
 fn profile_go(
@@ -1249,13 +1761,16 @@ fn profile_go(
     let seq = PROF_SEQ.fetch_add(1, Ordering::Relaxed);
     let prof_path =
         std::env::temp_dir().join(format!("oa_goprof_{}_{}.prof", std::process::id(), seq));
+    let mem_path =
+        std::env::temp_dir().join(format!("oa_gomem_{}_{}.prof", std::process::id(), seq));
 
     let mut args = vec![
         "test".to_string(),
         format!("-cpuprofile={}", prof_path.to_string_lossy()),
+        format!("-memprofile={}", mem_path.to_string_lossy()),
     ];
     for a in test_args {
-        if !a.starts_with("-cpuprofile") {
+        if !a.starts_with("-cpuprofile") && !a.starts_with("-memprofile") {
             args.push(a.clone());
         }
     }
@@ -1270,6 +1785,7 @@ fn profile_go(
 
     if !run_out.status.success() {
         let _ = fs::remove_file(&prof_path);
+        let _ = fs::remove_file(&mem_path);
         return Err(format!(
             "go test -cpuprofile exited {}: {}",
             run_out.status.code().unwrap_or(-1),
@@ -1295,6 +1811,7 @@ fn profile_go(
     let _ = fs::remove_file(&prof_path);
 
     if !top_out.status.success() {
+        let _ = fs::remove_file(&mem_path);
         return Err(format!(
             "go tool pprof failed: {}",
             String::from_utf8_lossy(&top_out.stderr)
@@ -1305,7 +1822,37 @@ fn profile_go(
     }
 
     let raw = String::from_utf8_lossy(&top_out.stdout);
-    parse_go_pprof_top(&raw, wall_ms, cwd, top_k)
+    let mut report = parse_go_pprof_top(&raw, wall_ms, cwd, top_k)?;
+
+    if mem_path.exists() {
+        if let Ok(mem_out) = Command::new(go_bin)
+            .args([
+                "tool",
+                "pprof",
+                "-top",
+                "-alloc_space",
+                "-unit=kB",
+                "-nodecount=25",
+                &mem_path.to_string_lossy(),
+            ])
+            .current_dir(cwd)
+            .output()
+        {
+            if mem_out.status.success() {
+                let mem_raw = String::from_utf8_lossy(&mem_out.stdout);
+                if let Ok((alloc_kb, sites)) = parse_go_pprof_mem_top(&mem_raw, cwd, top_k) {
+                    if !sites.is_empty() {
+                        report.profiler = "go:pprof+mem".to_string();
+                        report.peak_alloc_kb = Some(alloc_kb);
+                        report.alloc_sites = sites;
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(&mem_path);
+    }
+
+    Ok(report)
 }
 
 /// Parses macOS `/usr/bin/sample` output into a structured `ProfileReport`.
@@ -1431,6 +1978,7 @@ pub fn parse_macos_sample(
         counters: None,
         hotspots,
         alloc_sites: Vec::new(),
+        struct_padding: Vec::new(),
         notes: vec![
             "Sampling profile via macOS /usr/bin/sample (1 ms interval); use oa_evaluate for unbiased interleaved A/B timings."
                 .to_string(),
@@ -1455,6 +2003,7 @@ fn profile_macos_native(cmd: &str, cwd: &Path, top_k: usize) -> Result<ProfileRe
             counters: None,
             hotspots: Vec::new(),
             alloc_sites: Vec::new(),
+            struct_padding: Vec::new(),
             notes: vec![
                 "macOS `sample` not found; install Xcode Command Line Tools for symbol hotspots."
                     .to_string(),
@@ -1521,6 +2070,7 @@ fn profile_macos_native(cmd: &str, cwd: &Path, top_k: usize) -> Result<ProfileRe
         counters: None,
         hotspots: Vec::new(),
         alloc_sites: Vec::new(),
+        struct_padding: Vec::new(),
         notes: vec![
             "Command finished too fast for /usr/bin/sample to attach; increase workload duration (>200ms) for symbol-level hotspots."
                 .to_string(),
@@ -1597,6 +2147,7 @@ pub fn run_profile(
         counters: None,
         hotspots: Vec::new(),
         alloc_sites: Vec::new(),
+        struct_padding: Vec::new(),
         notes: Vec::new(),
     })
 }

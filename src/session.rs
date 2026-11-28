@@ -78,6 +78,7 @@ pub enum MetricTarget {
     #[default]
     Wall,
     Rss,
+    Pareto,
 }
 
 impl MetricTarget {
@@ -85,15 +86,16 @@ impl MetricTarget {
         match s.to_ascii_lowercase().as_str() {
             "wall" | "time" | "latency" => Ok(Self::Wall),
             "rss" | "ram" | "memory" | "mem" => Ok(Self::Rss),
+            "pareto" | "both" | "joint" | "wall+rss" => Ok(Self::Pareto),
             other => Err(format!(
-                "invalid metric '{other}': expected 'wall' or 'rss'"
+                "invalid metric '{other}': expected 'wall', 'rss', or 'pareto'"
             )),
         }
     }
 
     pub fn unit(self) -> &'static str {
         match self {
-            Self::Wall => "ms",
+            Self::Wall | Self::Pareto => "ms",
             Self::Rss => "KiB",
         }
     }
@@ -109,6 +111,10 @@ pub struct InitParams {
     pub profile_cmd: Option<String>,
     #[serde(default)]
     pub metric: MetricTarget,
+    #[serde(default)]
+    pub max_rss_regression: Option<f64>,
+    #[serde(default)]
+    pub max_wall_regression: Option<f64>,
     #[serde(default)]
     pub output_files: Vec<String>,
     #[serde(default)]
@@ -157,6 +163,10 @@ pub struct SessionConfig {
     pub profile_cmd: String,
     #[serde(default)]
     pub metric: MetricTarget,
+    #[serde(default)]
+    pub max_rss_regression: Option<f64>,
+    #[serde(default)]
+    pub max_wall_regression: Option<f64>,
     pub output_files: Vec<String>,
     pub equivalence: EquivalencePolicy,
     pub min_speedup: f64,
@@ -233,6 +243,8 @@ pub struct EvaluateParams {
     pub path: Option<String>,
     pub compare_against: Option<String>,
     pub metric: Option<MetricTarget>,
+    pub max_rss_regression: Option<f64>,
+    pub max_wall_regression: Option<f64>,
     pub pairs: Option<usize>,
     pub warmup: Option<usize>,
     pub min_speedup: Option<f64>,
@@ -254,6 +266,8 @@ pub struct EvalRecord {
     pub tests_passed: Option<bool>,
     pub equivalence: Option<EquivalenceResult>,
     pub stats: Option<ComparisonStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_stats: Option<ComparisonStats>,
     pub speedup_vs_baseline: Option<f64>,
     pub candidate_peak_rss_kb: Option<u64>,
     pub reference_peak_rss_kb: Option<u64>,
@@ -341,6 +355,175 @@ fn cumulative_gain(config: &SessionConfig, baseline: &BaselineRecord) -> f64 {
             (Some(b), Some(best)) if best > 0 => b as f64 / best as f64,
             _ => 1.0,
         },
+        MetricTarget::Pareto => {
+            let wall_r = if config.best_median_ms > 1e-9 {
+                baseline.timing.median_ms / config.best_median_ms
+            } else {
+                1.0
+            };
+            let rss_r = match (baseline.peak_rss_kb, config.best_peak_rss_kb) {
+                (Some(b), Some(best)) if best > 0 => b as f64 / best as f64,
+                _ => 1.0,
+            };
+            wall_r.max(rss_r)
+        }
+    }
+}
+
+/// Evaluates primary and paired secondary (wall + RSS) stats and applies regression guardrails.
+fn evaluate_joint_verdict(
+    metric: MetricTarget,
+    wall_cmp: ComparisonStats,
+    rss_cmp: Option<ComparisonStats>,
+    max_rss_regression: Option<f64>,
+    max_wall_regression: Option<f64>,
+) -> Result<
+    (
+        ComparisonStats,
+        Option<ComparisonStats>,
+        BenchVerdict,
+        String,
+    ),
+    String,
+> {
+    let wall_slowdown = if wall_cmp.baseline.median_ms > 1e-9 {
+        wall_cmp.candidate.median_ms / wall_cmp.baseline.median_ms
+    } else {
+        1.0
+    };
+    let rss_inflation = rss_cmp.as_ref().map(|r| {
+        if r.baseline.median_ms > 1e-9 {
+            r.candidate.median_ms / r.baseline.median_ms
+        } else {
+            1.0
+        }
+    });
+
+    match metric {
+        MetricTarget::Wall => {
+            if let Some(limit) = max_rss_regression {
+                let limit = limit.max(1.0);
+                if let (Some(infl), Some(ref r)) = (rss_inflation, &rss_cmp) {
+                    if infl > limit {
+                        let reg_pct = (infl - 1.0) * 100.0;
+                        let lim_pct = (limit - 1.0) * 100.0;
+                        let reason = format!(
+                            "RSS guardrail rejected: peak RSS regressed by +{reg_pct:.1}% ({:.0} -> {:.0} KiB, limit +{lim_pct:.1}%) despite wall ratio {:.2}x",
+                            r.baseline.median_ms,
+                            r.candidate.median_ms,
+                            wall_cmp.paired_ratio_median
+                        );
+                        return Ok((wall_cmp, rss_cmp, BenchVerdict::Slower, reason));
+                    }
+                }
+            }
+            let verdict = wall_cmp.verdict;
+            let reason = wall_cmp.reason.clone();
+            Ok((wall_cmp, rss_cmp, verdict, reason))
+        }
+        MetricTarget::Rss => {
+            let r = rss_cmp
+                .ok_or_else(|| "metric 'rss' requires paired peak RSS measurements".to_string())?;
+            if let Some(limit) = max_wall_regression {
+                let limit = limit.max(1.0);
+                if wall_slowdown > limit {
+                    let reg_pct = (wall_slowdown - 1.0) * 100.0;
+                    let lim_pct = (limit - 1.0) * 100.0;
+                    let reason = format!(
+                        "Wall guardrail rejected: wall time regressed by +{reg_pct:.1}% ({:.2} -> {:.2} ms, limit +{lim_pct:.1}%) despite peak RSS ratio {:.2}x",
+                        wall_cmp.baseline.median_ms,
+                        wall_cmp.candidate.median_ms,
+                        r.paired_ratio_median
+                    );
+                    return Ok((r, Some(wall_cmp), BenchVerdict::Slower, reason));
+                }
+            }
+            let verdict = r.verdict;
+            let reason = r.reason.clone();
+            Ok((r, Some(wall_cmp), verdict, reason))
+        }
+        MetricTarget::Pareto => {
+            let r = rss_cmp.ok_or_else(|| {
+                "metric 'pareto' requires paired peak RSS measurements alongside wall time"
+                    .to_string()
+            })?;
+            let rss_limit = max_rss_regression.unwrap_or(1.05).max(1.0);
+            let wall_limit = max_wall_regression.unwrap_or(1.05).max(1.0);
+            let infl = rss_inflation.unwrap_or(1.0);
+
+            if infl > rss_limit {
+                let reg_pct = (infl - 1.0) * 100.0;
+                let lim_pct = (rss_limit - 1.0) * 100.0;
+                let reason = format!(
+                    "Pareto guardrail rejected: peak RSS regressed by +{reg_pct:.1}% ({:.0} -> {:.0} KiB, limit +{lim_pct:.1}%) despite wall ratio {:.2}x",
+                    r.baseline.median_ms,
+                    r.candidate.median_ms,
+                    wall_cmp.paired_ratio_median
+                );
+                return Ok((wall_cmp, Some(r), BenchVerdict::Slower, reason));
+            }
+            if wall_slowdown > wall_limit {
+                let reg_pct = (wall_slowdown - 1.0) * 100.0;
+                let lim_pct = (wall_limit - 1.0) * 100.0;
+                let reason = format!(
+                    "Pareto guardrail rejected: wall time regressed by +{reg_pct:.1}% ({:.2} -> {:.2} ms, limit +{lim_pct:.1}%) despite peak RSS ratio {:.2}x",
+                    wall_cmp.baseline.median_ms,
+                    wall_cmp.candidate.median_ms,
+                    r.paired_ratio_median
+                );
+                return Ok((wall_cmp, Some(r), BenchVerdict::Slower, reason));
+            }
+
+            let rss_delta_pct = (infl - 1.0) * 100.0;
+            let wall_delta_pct = (wall_slowdown - 1.0) * 100.0;
+            let (verdict, reason) = match (wall_cmp.verdict, r.verdict) {
+                (BenchVerdict::Faster, BenchVerdict::Faster) => (
+                    BenchVerdict::Faster,
+                    format!(
+                        "Pareto win: wall {:.2}x (p={:.4}) AND peak RSS {:.2}x ({rss_delta_pct:+.1}%, p={:.4})",
+                        wall_cmp.paired_ratio_median,
+                        wall_cmp.mann_whitney_p,
+                        r.paired_ratio_median,
+                        r.mann_whitney_p
+                    ),
+                ),
+                (BenchVerdict::Faster, _) => (
+                    BenchVerdict::Faster,
+                    format!(
+                        "Pareto win: wall {:.2}x (p={:.4}) with peak RSS within guardrail ({rss_delta_pct:+.1}%)",
+                        wall_cmp.paired_ratio_median, wall_cmp.mann_whitney_p
+                    ),
+                ),
+                (_, BenchVerdict::Faster) => (
+                    BenchVerdict::Faster,
+                    format!(
+                        "Pareto win: peak RSS {:.2}x ({rss_delta_pct:+.1}%, p={:.4}) with wall time within guardrail ({wall_delta_pct:+.1}%)",
+                        r.paired_ratio_median, r.mann_whitney_p
+                    ),
+                ),
+                (BenchVerdict::Slower, _) | (_, BenchVerdict::Slower) => (
+                    BenchVerdict::Slower,
+                    format!(
+                        "Pareto regression: wall {:.2}x (p={:.4}), peak RSS {:.2}x (p={:.4})",
+                        wall_cmp.paired_ratio_median,
+                        wall_cmp.mann_whitney_p,
+                        r.paired_ratio_median,
+                        r.mann_whitney_p
+                    ),
+                ),
+                _ => (
+                    BenchVerdict::Noise,
+                    format!(
+                        "Neither wall time ({:.2}x, p={:.4}) nor peak RSS ({:.2}x, p={:.4}) cleared significance threshold",
+                        wall_cmp.paired_ratio_median,
+                        wall_cmp.mann_whitney_p,
+                        r.paired_ratio_median,
+                        r.mann_whitney_p
+                    ),
+                ),
+            };
+            Ok((wall_cmp, Some(r), verdict, reason))
+        }
     }
 }
 
@@ -519,6 +702,8 @@ pub fn init_session(params: InitParams) -> Result<InitReport, String> {
         build_cmd: params.build_cmd,
         profile_cmd,
         metric: params.metric,
+        max_rss_regression: params.max_rss_regression,
+        max_wall_regression: params.max_wall_regression,
         output_files: params.output_files,
         equivalence: params.equivalence,
         min_speedup: params.min_speedup.max(1.001),
@@ -668,6 +853,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
             tests_passed: None,
             equivalence: None,
             stats: None,
+            secondary_stats: None,
             speedup_vs_baseline: None,
             candidate_peak_rss_kb: None,
             reference_peak_rss_kb: None,
@@ -699,6 +885,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
                 tests_passed: None,
                 equivalence: None,
                 stats: None,
+                secondary_stats: None,
                 speedup_vs_baseline: None,
                 candidate_peak_rss_kb: None,
                 reference_peak_rss_kb: None,
@@ -742,6 +929,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
                 tests_passed: Some(false),
                 equivalence: None,
                 stats: None,
+                secondary_stats: None,
                 speedup_vs_baseline: None,
                 candidate_peak_rss_kb: None,
                 reference_peak_rss_kb: None,
@@ -780,6 +968,7 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
             tests_passed,
             equivalence: Some(eq),
             stats: None,
+            secondary_stats: None,
             speedup_vs_baseline: None,
             candidate_peak_rss_kb,
             reference_peak_rss_kb: None,
@@ -794,13 +983,20 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
     let ref_check = runner::run_command(&config.bench_cmd, &ref_wt, config.pin_core, true)?;
     let mut reference_peak_rss_kb = ref_check.peak_rss_kb;
 
-    let measure_rss = metric == MetricTarget::Rss;
-    if measure_rss && (candidate_peak_rss_kb.is_none() || reference_peak_rss_kb.is_none()) {
+    let max_rss_regression = params.max_rss_regression.or(config.max_rss_regression);
+    let max_wall_regression = params.max_wall_regression.or(config.max_wall_regression);
+    let require_rss = metric == MetricTarget::Rss
+        || metric == MetricTarget::Pareto
+        || max_rss_regression.is_some();
+    if require_rss && (candidate_peak_rss_kb.is_none() || reference_peak_rss_kb.is_none()) {
         return Err(
-            "metric 'rss' requires peak RSS measurement (/usr/bin/time or python3 on Linux/macOS; python Win32 K32GetProcessMemoryInfo on Windows)"
+            "metric 'rss'/'pareto' or --max-rss-regression requires peak RSS measurement (/usr/bin/time or python3 on Linux/macOS; python Win32 K32GetProcessMemoryInfo on Windows)"
                 .to_string(),
         );
     }
+    let measure_pair_rss = require_rss
+        || (cfg!(any(target_os = "linux", target_os = "macos"))
+            && Path::new("/usr/bin/time").is_file());
 
     let warmup = params.warmup.unwrap_or(config.warmup);
     let pairs = params.pairs.unwrap_or(config.pairs).max(3);
@@ -817,53 +1013,97 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
         }
     }
 
-    let mut ref_samples = Vec::with_capacity(pairs);
-    let mut cand_samples = Vec::with_capacity(pairs);
+    let mut ref_wall_samples = Vec::with_capacity(pairs);
+    let mut cand_wall_samples = Vec::with_capacity(pairs);
+    let mut ref_rss_samples = Vec::with_capacity(pairs);
+    let mut cand_rss_samples = Vec::with_capacity(pairs);
 
     for i in 0..pairs {
         let (r, c) = if i % 2 == 0 {
-            let r = runner::run_command(&config.bench_cmd, &ref_wt, config.pin_core, measure_rss)?;
-            let c = runner::run_command(&config.bench_cmd, &root, config.pin_core, measure_rss)?;
+            let r = runner::run_command(
+                &config.bench_cmd,
+                &ref_wt,
+                config.pin_core,
+                measure_pair_rss,
+            )?;
+            let c =
+                runner::run_command(&config.bench_cmd, &root, config.pin_core, measure_pair_rss)?;
             (r, c)
         } else {
-            let c = runner::run_command(&config.bench_cmd, &root, config.pin_core, measure_rss)?;
-            let r = runner::run_command(&config.bench_cmd, &ref_wt, config.pin_core, measure_rss)?;
+            let c =
+                runner::run_command(&config.bench_cmd, &root, config.pin_core, measure_pair_rss)?;
+            let r = runner::run_command(
+                &config.bench_cmd,
+                &ref_wt,
+                config.pin_core,
+                measure_pair_rss,
+            )?;
             (r, c)
         };
-        if measure_rss {
-            let r_kb = r
-                .peak_rss_kb
-                .ok_or_else(|| "missing reference peak_rss_kb during rss evaluation".to_string())?;
-            let c_kb = c
-                .peak_rss_kb
-                .ok_or_else(|| "missing candidate peak_rss_kb during rss evaluation".to_string())?;
-            ref_samples.push(r_kb as f64);
-            cand_samples.push(c_kb as f64);
-        } else {
-            ref_samples.push(r.wall_ms);
-            cand_samples.push(c.wall_ms);
+        ref_wall_samples.push(r.wall_ms);
+        cand_wall_samples.push(c.wall_ms);
+        if measure_pair_rss {
+            if let (Some(r_kb), Some(c_kb)) = (r.peak_rss_kb, c.peak_rss_kb) {
+                ref_rss_samples.push(r_kb as f64);
+                cand_rss_samples.push(c_kb as f64);
+            } else if require_rss {
+                return Err(
+                    "missing peak_rss_kb during rss/pareto/guardrail evaluation".to_string()
+                );
+            }
         }
     }
 
-    let cmp = stats::compare_samples(&ref_samples, &cand_samples, min_speedup, alpha);
-    let verdict = match cmp.verdict {
+    let wall_cmp =
+        stats::compare_samples(&ref_wall_samples, &cand_wall_samples, min_speedup, alpha);
+    let rss_cmp = if ref_rss_samples.len() == pairs && cand_rss_samples.len() == pairs {
+        let r_cmp = stats::compare_samples(&ref_rss_samples, &cand_rss_samples, min_speedup, alpha);
+        reference_peak_rss_kb = Some(r_cmp.baseline.median_ms.round() as u64);
+        candidate_peak_rss_kb = Some(r_cmp.candidate.median_ms.round() as u64);
+        Some(r_cmp)
+    } else {
+        None
+    };
+
+    let (cmp, secondary_stats, bench_verdict, reason) = evaluate_joint_verdict(
+        metric,
+        wall_cmp,
+        rss_cmp,
+        max_rss_regression,
+        max_wall_regression,
+    )?;
+    let verdict = match bench_verdict {
         BenchVerdict::Faster => EvalVerdict::KeepRecommended,
         BenchVerdict::Noise => EvalVerdict::NoiseReject,
         BenchVerdict::Slower => EvalVerdict::RegressionReject,
     };
 
-    if measure_rss {
-        reference_peak_rss_kb = Some(cmp.baseline.median_ms.round() as u64);
-        candidate_peak_rss_kb = Some(cmp.candidate.median_ms.round() as u64);
-    }
-
     let speedup_vs_baseline = if compare_against == "baseline" {
-        cmp.paired_ratio_median
-    } else if measure_rss {
+        if metric == MetricTarget::Pareto {
+            let rss_r = secondary_stats
+                .as_ref()
+                .map(|r| r.paired_ratio_median)
+                .unwrap_or(1.0);
+            cmp.paired_ratio_median.max(rss_r)
+        } else {
+            cmp.paired_ratio_median
+        }
+    } else if metric == MetricTarget::Rss {
         match (baseline.peak_rss_kb, candidate_peak_rss_kb) {
             (Some(b), Some(c)) if c > 0 => b as f64 / c as f64,
             _ => cmp.paired_ratio_median,
         }
+    } else if metric == MetricTarget::Pareto {
+        let wall_vs_base = if cmp.candidate.median_ms > 1e-9 {
+            baseline.timing.median_ms / cmp.candidate.median_ms
+        } else {
+            cmp.paired_ratio_median
+        };
+        let rss_vs_base = match (baseline.peak_rss_kb, candidate_peak_rss_kb) {
+            (Some(b), Some(c)) if c > 0 => b as f64 / c as f64,
+            _ => 1.0,
+        };
+        wall_vs_base.max(rss_vs_base)
     } else {
         cumulative_gain(&config, &baseline) * cmp.paired_ratio_median
     };
@@ -876,12 +1116,13 @@ pub fn evaluate_session(params: EvaluateParams) -> Result<EvalRecord, String> {
         metric,
         reference_commit,
         verdict,
-        reason: cmp.reason.clone(),
+        reason,
         tamper_violations: Vec::new(),
         build_passed,
         tests_passed,
         equivalence: Some(eq),
         stats: Some(cmp),
+        secondary_stats,
         speedup_vs_baseline: Some(speedup_vs_baseline),
         candidate_peak_rss_kb,
         reference_peak_rss_kb,
@@ -970,10 +1211,12 @@ pub fn checkpoint_session(params: CheckpointParams) -> Result<CheckpointResponse
             ensure_worktree_ready(&root, "best", &new_sha, config.build_cmd.as_deref())?;
 
             config.best_commit = new_sha.clone();
-            if eval.metric == MetricTarget::Wall {
+            if matches!(eval.metric, MetricTarget::Wall | MetricTarget::Pareto) {
                 if let Some(ref st) = eval.stats {
                     config.best_median_ms = st.candidate.median_ms;
                 }
+            } else if let Some(ref sec) = eval.secondary_stats {
+                config.best_median_ms = sec.candidate.median_ms;
             }
             if eval.candidate_peak_rss_kb.is_some() {
                 config.best_peak_rss_kb = eval.candidate_peak_rss_kb;
@@ -1217,7 +1460,7 @@ pub fn render_markdown_report(path: Option<&str>) -> Result<String, String> {
         md.push_str("No experiments recorded yet.\n\n");
     } else {
         let (gain_col, med_col) = match config.metric {
-            MetricTarget::Wall => ("Speedup", "Median ms"),
+            MetricTarget::Wall | MetricTarget::Pareto => ("Speedup", "Median ms"),
             MetricTarget::Rss => ("Reduction", "Median KiB"),
         };
         md.push_str(&format!(
@@ -1285,7 +1528,9 @@ pub fn render_svg_report(
         .to_string();
 
     let (baseline_value, best_value) = match config.metric {
-        MetricTarget::Wall => (ledger.baseline_median_ms, ledger.best_median_ms),
+        MetricTarget::Wall | MetricTarget::Pareto => {
+            (ledger.baseline_median_ms, ledger.best_median_ms)
+        }
         MetricTarget::Rss => (
             baseline.peak_rss_kb.unwrap_or(0) as f64,
             config
@@ -1299,7 +1544,9 @@ pub fn render_svg_report(
     for e in ledger.entries.iter().filter(|e| e.action == "KEPT") {
         let is_best = e.commit.as_deref() == Some(config.best_commit.as_str());
         let raw_val = match config.metric {
-            MetricTarget::Wall => e.candidate_median_ms.unwrap_or(ledger.best_median_ms),
+            MetricTarget::Wall | MetricTarget::Pareto => {
+                e.candidate_median_ms.unwrap_or(ledger.best_median_ms)
+            }
             MetricTarget::Rss => e
                 .candidate_peak_rss_kb
                 .map(|v| v as f64)
@@ -1363,6 +1610,8 @@ pub fn render_svg_report(
 pub struct VerifyParams {
     pub path: Option<String>,
     pub metric: Option<MetricTarget>,
+    pub max_rss_regression: Option<f64>,
+    pub max_wall_regression: Option<f64>,
     pub pairs: Option<usize>,
     pub warmup: Option<usize>,
     pub min_speedup: Option<f64>,
@@ -1388,6 +1637,8 @@ pub fn verify_session(params: VerifyParams) -> Result<VerifyReport, String> {
         path: params.path,
         compare_against: Some("baseline".to_string()),
         metric: params.metric,
+        max_rss_regression: params.max_rss_regression,
+        max_wall_regression: params.max_wall_regression,
         pairs: Some(params.pairs.unwrap_or(15)),
         warmup: params.warmup,
         min_speedup: params.min_speedup,
@@ -1399,9 +1650,21 @@ pub fn verify_session(params: VerifyParams) -> Result<VerifyReport, String> {
     if passed {
         if let Ok(mut cfg) = read_json::<SessionConfig>(&oa_path(&root, "config.json")) {
             if let Some(ref st) = eval.stats {
-                cfg.best_cumulative_gain = Some(st.paired_ratio_median);
-                if eval.metric == MetricTarget::Wall {
+                let gain = if eval.metric == MetricTarget::Pareto {
+                    let rss_r = eval
+                        .secondary_stats
+                        .as_ref()
+                        .map(|r| r.paired_ratio_median)
+                        .unwrap_or(1.0);
+                    st.paired_ratio_median.max(rss_r)
+                } else {
+                    st.paired_ratio_median
+                };
+                cfg.best_cumulative_gain = Some(gain);
+                if matches!(eval.metric, MetricTarget::Wall | MetricTarget::Pareto) {
                     cfg.best_median_ms = st.candidate.median_ms;
+                } else if let Some(ref sec) = eval.secondary_stats {
+                    cfg.best_median_ms = sec.candidate.median_ms;
                 }
             }
             if eval.candidate_peak_rss_kb.is_some() {
@@ -1416,6 +1679,7 @@ pub fn verify_session(params: VerifyParams) -> Result<VerifyReport, String> {
         let metric_name = match eval.metric {
             MetricTarget::Wall => "wall",
             MetricTarget::Rss => "peak RSS",
+            MetricTarget::Pareto => "pareto wall",
         };
         let gain_part = st
             .map(|s| {
@@ -1426,7 +1690,9 @@ pub fn verify_session(params: VerifyParams) -> Result<VerifyReport, String> {
             })
             .unwrap_or_else(|| "verified".to_string());
         let rss_part = match (eval.reference_peak_rss_kb, eval.candidate_peak_rss_kb) {
-            (Some(r), Some(c)) if r > 0 && eval.metric == MetricTarget::Wall => {
+            (Some(r), Some(c))
+                if r > 0 && matches!(eval.metric, MetricTarget::Wall | MetricTarget::Pareto) =>
+            {
                 let pct = ((c as f64 - r as f64) / r as f64) * 100.0;
                 format!(", {pct:+.1}% peak RSS")
             }
@@ -1534,6 +1800,8 @@ pub struct CompareParams {
     pub cmd_b: String,
     pub env_vars: Vec<(String, String)>,
     pub metric: MetricTarget,
+    pub max_rss_regression: Option<f64>,
+    pub max_wall_regression: Option<f64>,
     pub pairs: usize,
     pub warmup: usize,
     pub min_speedup: f64,
@@ -1552,6 +1820,8 @@ pub struct CompareGitParams {
     pub copy_files: Vec<String>,
     pub env_vars: Vec<(String, String)>,
     pub metric: MetricTarget,
+    pub max_rss_regression: Option<f64>,
+    pub max_wall_regression: Option<f64>,
     pub pairs: usize,
     pub warmup: usize,
     pub min_speedup: f64,
@@ -1588,7 +1858,11 @@ pub struct CompareResult {
     pub bench_cmd: Option<String>,
     pub metric: MetricTarget,
     pub verdict: stats::BenchVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub stats: ComparisonStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_stats: Option<ComparisonStats>,
     pub peak_rss_a_kb: Option<u64>,
     pub peak_rss_b_kb: Option<u64>,
     pub stdout_sha256_a: String,
@@ -1658,6 +1932,8 @@ fn run_interleaved_compare(
     bench_cmd: Option<String>,
     env_vars: &[(String, String)],
     metric: MetricTarget,
+    max_rss_regression: Option<f64>,
+    max_wall_regression: Option<f64>,
     pairs: usize,
     warmup: usize,
     min_speedup: f64,
@@ -1666,7 +1942,12 @@ fn run_interleaved_compare(
     check_output: bool,
 ) -> Result<CompareResult, String> {
     let pairs = pairs.max(3);
-    let measure_rss = metric == MetricTarget::Rss;
+    let require_rss = metric == MetricTarget::Rss
+        || metric == MetricTarget::Pareto
+        || max_rss_regression.is_some();
+    let measure_pair_rss = require_rss
+        || (cfg!(any(target_os = "linux", target_os = "macos"))
+            && Path::new("/usr/bin/time").is_file());
 
     // Initial check + SHA-256 + Peak RSS measurement for both commands.
     let probe_a = runner::run_command_with_env(exec_a, dir_a, pin_core, true, env_vars)?;
@@ -1713,8 +1994,10 @@ fn run_interleaved_compare(
         }
     }
 
-    let mut samples_a = Vec::with_capacity(pairs);
-    let mut samples_b = Vec::with_capacity(pairs);
+    let mut wall_a = Vec::with_capacity(pairs);
+    let mut wall_b = Vec::with_capacity(pairs);
+    let mut pair_rss_a = Vec::with_capacity(pairs);
+    let mut pair_rss_b = Vec::with_capacity(pairs);
     let mut pair_samples = Vec::with_capacity(pairs);
     let mut rss_a_samples = Vec::new();
     let mut rss_b_samples = Vec::new();
@@ -1728,12 +2011,16 @@ fn run_interleaved_compare(
     for i in 0..pairs {
         let ab_first = i % 2 == 0;
         let (out_a, out_b) = if ab_first {
-            let a = runner::run_command_with_env(exec_a, dir_a, pin_core, measure_rss, env_vars)?;
-            let b = runner::run_command_with_env(exec_b, dir_b, pin_core, measure_rss, env_vars)?;
+            let a =
+                runner::run_command_with_env(exec_a, dir_a, pin_core, measure_pair_rss, env_vars)?;
+            let b =
+                runner::run_command_with_env(exec_b, dir_b, pin_core, measure_pair_rss, env_vars)?;
             (a, b)
         } else {
-            let b = runner::run_command_with_env(exec_b, dir_b, pin_core, measure_rss, env_vars)?;
-            let a = runner::run_command_with_env(exec_a, dir_a, pin_core, measure_rss, env_vars)?;
+            let b =
+                runner::run_command_with_env(exec_b, dir_b, pin_core, measure_pair_rss, env_vars)?;
+            let a =
+                runner::run_command_with_env(exec_a, dir_a, pin_core, measure_pair_rss, env_vars)?;
             (a, b)
         };
         if out_a.exit_code != 0 {
@@ -1742,14 +2029,24 @@ fn run_interleaved_compare(
         if out_b.exit_code != 0 {
             return Err(format!("command B ({label_b}) failed on pair {}", i + 1));
         }
+        wall_a.push(out_a.wall_ms);
+        wall_b.push(out_b.wall_ms);
         if let Some(r) = out_a.peak_rss_kb {
             rss_a_samples.push(r);
         }
         if let Some(r) = out_b.peak_rss_kb {
             rss_b_samples.push(r);
         }
+        if measure_pair_rss {
+            if let (Some(ra), Some(rb)) = (out_a.peak_rss_kb, out_b.peak_rss_kb) {
+                pair_rss_a.push(ra as f64);
+                pair_rss_b.push(rb as f64);
+            } else if require_rss {
+                return Err("peak RSS measurement unavailable on this platform".to_string());
+            }
+        }
         let (va, vb) = match metric {
-            MetricTarget::Wall => (out_a.wall_ms, out_b.wall_ms),
+            MetricTarget::Wall | MetricTarget::Pareto => (out_a.wall_ms, out_b.wall_ms),
             MetricTarget::Rss => {
                 let ra = out_a.peak_rss_kb.ok_or_else(|| {
                     "peak RSS measurement unavailable on this platform".to_string()
@@ -1760,8 +2057,6 @@ fn run_interleaved_compare(
                 (ra as f64, rb as f64)
             }
         };
-        samples_a.push(va);
-        samples_b.push(vb);
         pair_samples.push(ComparePairSample {
             pair: i + 1,
             order: if ab_first {
@@ -1775,8 +2070,24 @@ fn run_interleaved_compare(
         });
     }
 
-    let cmp = stats::compare_samples(&samples_a, &samples_b, min_speedup, alpha);
-    let verdict = cmp.verdict;
+    let wall_cmp = stats::compare_samples(&wall_a, &wall_b, min_speedup, alpha);
+    let rss_cmp = if pair_rss_a.len() == pairs && pair_rss_b.len() == pairs {
+        Some(stats::compare_samples(
+            &pair_rss_a,
+            &pair_rss_b,
+            min_speedup,
+            alpha,
+        ))
+    } else {
+        None
+    };
+    let (cmp, secondary_stats, verdict, reason) = evaluate_joint_verdict(
+        metric,
+        wall_cmp,
+        rss_cmp,
+        max_rss_regression,
+        max_wall_regression,
+    )?;
     let warnings = collect_noise_warnings(&cmp, metric);
     let peak_rss_a_kb = median_u64(&rss_a_samples);
     let peak_rss_b_kb = median_u64(&rss_b_samples);
@@ -1787,7 +2098,9 @@ fn run_interleaved_compare(
         bench_cmd,
         metric,
         verdict,
+        reason: Some(reason),
         stats: cmp,
+        secondary_stats,
         peak_rss_a_kb,
         peak_rss_b_kb,
         stdout_sha256_a: sha_a,
@@ -1814,6 +2127,8 @@ pub fn compare_commands(params: CompareParams) -> Result<CompareResult, String> 
         None,
         &params.env_vars,
         params.metric,
+        params.max_rss_regression,
+        params.max_wall_regression,
         params.pairs,
         params.warmup,
         params.min_speedup,
@@ -1884,6 +2199,8 @@ pub fn compare_git_revs(params: CompareGitParams) -> Result<CompareResult, Strin
         Some(params.bench_cmd.clone()),
         &params.env_vars,
         params.metric,
+        params.max_rss_regression,
+        params.max_wall_regression,
         params.pairs,
         params.warmup,
         params.min_speedup,

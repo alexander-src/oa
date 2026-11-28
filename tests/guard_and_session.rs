@@ -123,6 +123,8 @@ fn full_session_guards_and_verified_optimization() {
         build_cmd: None,
         profile_cmd: None,
         metric: Default::default(),
+        max_rss_regression: None,
+        max_wall_regression: None,
         output_files: Vec::new(),
         lock_files: Vec::new(),
         auto_lock_tests: true,
@@ -357,6 +359,8 @@ fn standalone_compare_detects_speedup_and_equivalence() {
         cmd_b: format!("{py} -c \"n=1199999; print(n*(n+1)*(2*n+1)//6)\""),
         env_vars: Vec::new(),
         metric: MetricTarget::Wall,
+        max_rss_regression: None,
+        max_wall_regression: None,
         pairs: 6,
         warmup: 1,
         min_speedup: 1.05,
@@ -506,6 +510,8 @@ fn rss_metric_detects_memory_reduction() {
         build_cmd: None,
         profile_cmd: None,
         metric: MetricTarget::Rss,
+        max_rss_regression: None,
+        max_wall_regression: None,
         output_files: Vec::new(),
         lock_files: Vec::new(),
         auto_lock_tests: true,
@@ -613,6 +619,8 @@ fn compare_git_revs_detects_speedup_and_cleans_worktrees() {
         copy_files: vec!["local_bench.py".to_string()],
         env_vars: Vec::new(),
         metric: MetricTarget::Wall,
+        max_rss_regression: None,
+        max_wall_regression: None,
         pairs: 6,
         warmup: 1,
         min_speedup: 1.05,
@@ -641,4 +649,259 @@ fn compare_git_revs_detects_speedup_and_cleans_worktrees() {
         .filter(|l| l.starts_with("worktree "))
         .count();
     assert_eq!(wt_count, 1, "expected only main worktree, got:\n{wt_text}");
+}
+
+#[test]
+fn pareto_rejects_wall_speedup_with_rss_regression_and_accepts_clean_win() {
+    use oa::session::MetricTarget;
+
+    let py = python_bin();
+    let repo = TempRepo::new("pareto_guardrail");
+    repo.git(&["init"]);
+    repo.git(&["config", "user.name", "Test"]);
+    repo.git(&["config", "user.email", "test@example.com"]);
+    // Baseline: ~150ms CPU loop with minimal extra allocation (8192 * 256 = 2_097_152 -> exact sum 267386880).
+    repo.write(
+        "workload.py",
+        "acc = 0\nfor i in range(2_097_152):\n    acc += i & 0xff\nprint(acc)\n",
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "baseline"]);
+
+    let init = init_session(InitParams {
+        path: Some(repo.path_str()),
+        bench_cmd: format!("{py} workload.py"),
+        test_cmd: None,
+        build_cmd: None,
+        profile_cmd: None,
+        metric: MetricTarget::Pareto,
+        max_rss_regression: Some(1.10),
+        max_wall_regression: Some(1.10),
+        output_files: Vec::new(),
+        lock_files: Vec::new(),
+        auto_lock_tests: true,
+        equivalence: EquivalencePolicy::Exact,
+        min_speedup: 1.15,
+        alpha: 0.05,
+        warmup: 1,
+        pairs: 6,
+        pin_core: None,
+        allow_dirty: false,
+    })
+    .expect("init pareto session");
+    let expected_out = init.baseline.output_snapshot.stdout_sha256.clone();
+
+    // Candidate 1: much faster wall time, but inflates Peak RSS by ~45 MiB (> +10% guardrail).
+    repo.write(
+        "workload.py",
+        "bloat = bytearray(45 * 1024 * 1024)\nbloat[0] = 1\nbloat[-1] = 1\nprint(267386880)\n",
+    );
+    let bloated = evaluate_session(EvaluateParams {
+        path: Some(repo.path_str()),
+        pairs: Some(6),
+        warmup: Some(1),
+        ..Default::default()
+    })
+    .expect("evaluate bloated candidate");
+    assert_eq!(
+        bloated.verdict,
+        EvalVerdict::RegressionReject,
+        "expected Pareto guardrail to reject RSS inflation, got {:?}: {}",
+        bloated.verdict,
+        bloated.reason
+    );
+    assert!(
+        bloated.reason.contains("Pareto guardrail rejected") && bloated.reason.contains("peak RSS"),
+        "unexpected reason: {}",
+        bloated.reason
+    );
+    assert!(bloated.secondary_stats.is_some());
+
+    // Candidate 2: same fast O(1) output WITHOUT inflating RSS -> must pass Pareto!
+    repo.write("workload.py", "print(267386880)\n");
+    let clean = evaluate_session(EvaluateParams {
+        path: Some(repo.path_str()),
+        pairs: Some(6),
+        warmup: Some(1),
+        ..Default::default()
+    })
+    .expect("evaluate clean pareto candidate");
+    assert_eq!(
+        clean.verdict,
+        EvalVerdict::KeepRecommended,
+        "expected clean Pareto win, got {:?}: {}",
+        clean.verdict,
+        clean.reason
+    );
+    assert_eq!(
+        clean
+            .equivalence
+            .as_ref()
+            .expect("equivalence")
+            .candidate_stdout_sha256,
+        expected_out
+    );
+    assert!(clean.secondary_stats.is_some());
+}
+
+#[test]
+fn cross_language_heap_and_struct_padding_parsers() {
+    use oa::profiler::{
+        parse_go_pprof_mem_top, parse_pahole_packable, parse_perf_page_faults, parse_v8_heapprofile,
+    };
+    use std::path::Path;
+
+    let cwd = Path::new("/repo");
+
+    let v8_heap = r#"{
+        "head": {
+            "id": 1,
+            "callFrame": {"functionName": "(root)", "url": "", "lineNumber": -1},
+            "selfSize": 0,
+            "children": [
+                {
+                    "id": 2,
+                    "callFrame": {"functionName": "buildAst", "url": "file:///repo/src/parser.js", "lineNumber": 41},
+                    "selfSize": 524288,
+                    "children": []
+                }
+            ]
+        },
+        "samples": [{"size": 262144, "nodeId": 2}, {"size": 262144, "nodeId": 2}]
+    }"#;
+    let (v8_kb, v8_sites) = parse_v8_heapprofile(v8_heap, cwd, 5).expect("v8 heap parse");
+    assert!((v8_kb - 512.0).abs() < 0.1);
+    assert_eq!(v8_sites.len(), 1);
+    assert_eq!(v8_sites[0].function.as_deref(), Some("buildAst"));
+    assert_eq!(v8_sites[0].line, 42);
+    assert_eq!(v8_sites[0].count, 2);
+
+    let go_mem = "\
+Showing nodes accounting for 12800kB, 100% of 12800kB total
+      flat  flat%   sum%        cum   cum%
+   10240kB 80.00% 80.00%    10240kB 80.00%  pkg/parser.ParseTokens pkg/parser/lex.go:88
+    2560kB 20.00%   100%     2560kB 20.00%  pkg/parser.Intern pkg/parser/intern.go:19
+";
+    let (go_kb, go_sites) = parse_go_pprof_mem_top(go_mem, cwd, 5).expect("go mem parse");
+    assert!((go_kb - 12800.0).abs() < 0.1);
+    assert_eq!(go_sites.len(), 2);
+    assert_eq!(go_sites[0].file, "pkg/parser/lex.go");
+    assert_eq!(go_sites[0].line, 88);
+
+    let perf_pf = "\
+# Overhead\tSamples\tPeriod\tShared Object\tSymbol\tSource:Line
+ 60.00% \t 4 \t 64 \tapp\t[.] alloc_tiles\t/repo/src/mem.cpp:112
+ 20.00% \t 1 \t 16 \tld-linux-x86-64.so.2\t[.] _dl_start\tld-linux[123]
+";
+    let (pf_kb, pf_sites) = parse_perf_page_faults(perf_pf, cwd, 5);
+    assert_eq!(pf_kb, Some(256.0));
+    assert_eq!(pf_sites.len(), 1);
+    assert_eq!(pf_sites[0].function.as_deref(), Some("alloc_tiles"));
+    assert_eq!(pf_sites[0].line, 112);
+
+    let pahole_out = "\
+_InternalIgnore\t64\t32\t32
+std::vector_node\t48\t32\t16
+ShaderRecord\t40\t24\t16
+SmallStruct\t16\t12\t4
+";
+    let structs = parse_pahole_packable(pahole_out, 5);
+    assert_eq!(structs.len(), 1);
+    assert_eq!(structs[0].name, "ShaderRecord");
+    assert_eq!(structs[0].saved_bytes, 16);
+    assert!((structs[0].savings_pct - 40.0).abs() < 0.1);
+}
+
+#[test]
+fn discover_and_autonomous_run_loop_revert_then_keep() {
+    use oa::autorun::{run_autonomous_loop, AutoRunParams};
+    use oa::discover::discover_repo;
+    use oa::session::MetricTarget;
+
+    let py = python_bin();
+    let repo = TempRepo::new("discover_autorun");
+    repo.git(&["init"]);
+    repo.git(&["config", "user.name", "Test"]);
+    repo.git(&["config", "user.email", "test@example.com"]);
+
+    repo.write("pyproject.toml", "[project]\nname = \"sample\"\n");
+    repo.write("bench_sum.py", "import work\nprint(work.run())\n");
+    repo.write(
+        "work.py",
+        "def run():\n    acc = 0\n    for i in range(2_097_152):\n        acc += i & 0xff\n    return acc\n",
+    );
+    repo.git(&["add", "."]);
+    repo.git(&["commit", "-m", "init"]);
+
+    // 1. Zero-config discovery finds Python and bench_sum.py.
+    let disc = discover_repo(Some(&repo.path_str())).expect("discover_repo");
+    assert!(disc.languages.contains(&"python".to_string()));
+    assert!(
+        disc.bench_candidates
+            .iter()
+            .any(|c| c.source == "bench_sum.py" && c.confidence == "high"),
+        "expected bench_sum.py candidate, got {:?}",
+        disc.bench_candidates
+    );
+
+    // 2. Write an external mock agent script (outside the repo) that:
+    //    - Iter 1: breaks equivalence (auto-reverted and logged as dead end)
+    //    - Iter 2: optimizes work.py to O(1) exact answer (auto-kept!)
+    //    - Iter 3+: makes no change (noise -> stale stop)
+    let agent_script =
+        std::env::temp_dir().join(format!("oa_mock_agent_{}.py", std::process::id()));
+    std::fs::write(
+        &agent_script,
+        r#"import os, pathlib, sys
+it = int(os.environ["OA_ITER"])
+prompt = pathlib.Path(os.environ["OA_PROMPT_FILE"]).read_text()
+assert "Top CPU Hotspots" in prompt
+if it == 1:
+    pathlib.Path("work.py").write_text("def run():\n    return 999\n")
+    print("HYPOTHESIS: broken shortcut returning wrong sum")
+elif it == 2:
+    assert "Ruled-Out Dead Ends" in prompt
+    pathlib.Path("work.py").write_text("def run():\n    return 267386880\n")
+    print("HYPOTHESIS: closed-form O(1) byte sum")
+else:
+    print("HYPOTHESIS: no further improvement")
+"#,
+    )
+    .expect("write mock agent");
+
+    let report = run_autonomous_loop(AutoRunParams {
+        path: Some(repo.path_str()),
+        agent: "cmd".to_string(),
+        agent_cmd: Some(format!("{py} {}", agent_script.display())),
+        bench_cmd: None, // auto-discovered!
+        test_cmd: None,
+        build_cmd: None,
+        profile_cmd: None,
+        metric: MetricTarget::Pareto,
+        max_rss_regression: Some(1.15),
+        max_wall_regression: Some(1.15),
+        max_iters: 4,
+        max_stale: 2,
+        pairs: 5,
+        warmup: 1,
+        min_speedup: 1.15,
+        alpha: 0.05,
+        pin_core: None,
+        allow_dirty: false,
+        dry_run: false,
+    })
+    .expect("run_autonomous_loop");
+    let _ = std::fs::remove_file(&agent_script);
+
+    assert_eq!(report.kept_count, 1, "iterations: {:?}", report.iterations);
+    assert!(report.reverted_count >= 1);
+    assert_eq!(report.iterations[0].action, "REVERTED");
+    assert_eq!(report.iterations[0].verdict, "EquivalenceFail");
+    assert_eq!(report.iterations[1].action, "KEPT");
+    assert_eq!(report.iterations[1].verdict, "KeepRecommended");
+    assert!(report.cumulative_gain > 1.5);
+    let art = std::path::PathBuf::from(report.artifacts_dir.expect("artifacts dir"));
+    assert!(art.join("REPORT.md").is_file());
+    assert!(art.join("bench.svg").is_file());
+    assert!(art.join("optimization.patch").is_file());
 }

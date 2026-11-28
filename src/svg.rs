@@ -71,7 +71,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 
 fn format_metric_value(val: f64, metric: MetricTarget) -> String {
     match metric {
-        MetricTarget::Wall => format!("{val:.2} ms"),
+        MetricTarget::Wall | MetricTarget::Pareto => format!("{val:.2} ms"),
         MetricTarget::Rss => {
             if val >= 1024.0 {
                 format!("{:.1} MiB", val / 1024.0)
@@ -189,6 +189,7 @@ pub fn render_session_svg(data: &SvgChartData, theme: SvgTheme) -> String {
     let metric_label = match data.metric {
         MetricTarget::Wall => "wall latency",
         MetricTarget::Rss => "peak RSS",
+        MetricTarget::Pareto => "pareto (wall + RSS)",
     };
 
     let headline = format!("{} ({metric_label})", truncate_chars(&data.repo_name, 36));

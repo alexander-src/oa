@@ -38,7 +38,7 @@ inputs:
     required: false
     default: "."
   metric:
-    description: "Metric to compare: 'wall' (median ms) or 'rss' (peak KiB)."
+    description: "Metric to compare: 'wall' (median ms), 'rss' (peak KiB), or 'pareto' (joint wall+RSS)."
     required: false
     default: "wall"
   pairs:

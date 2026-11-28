@@ -7,13 +7,14 @@ description: Profile-guided, equivalence-gated, statistically verified performan
 
 Use `oa` whenever a user asks to optimize latency, throughput, CPU usage, or memory footprint (Peak RSS) in any repository. Never guess at bottlenecks, never trust single un-interleaved timings, and never edit locked tests or benchmark harnesses.
 
-## MCP Tools (10 total)
+## MCP Tools (11 total)
 
 | Tool | Purpose |
 | --- | --- |
+| `oa_discover` | Zero-config repo scanner: infer languages, build/test commands, and benchmark candidates |
 | `oa_init` | Lock test/bench files, snapshot `refs/oa/baseline` and `refs/oa/best`, capture output SHA-256, run initial profile |
-| `oa_profile` | Profile active session or standalone `cmd` (`auto`, `python`, `node`, `go`, `perf`, `sample`, `native`) with source snippets, allocations, and `--diff-from` deltas |
-| `oa_evaluate` | Run Cheat Guard -> build -> locked tests -> SHA-256 equivalence -> balanced interleaved A/B pairs (`wall` or `rss`) |
+| `oa_profile` | Profile active session or standalone `cmd` (`auto`, `python`, `node`, `go`, `perf`, `sample`, `native`) with source snippets, heap/page-fault allocations, `pahole` struct padding, and `--diff-from` deltas |
+| `oa_evaluate` | Run Cheat Guard -> build -> locked tests -> SHA-256 equivalence -> balanced interleaved A/B pairs (`wall`, `rss`, or `pareto` with `--max-rss-regression` / `--max-wall-regression`) |
 | `oa_checkpoint` | Keep a verified win (`refs/oa/best` advances) or revert to best and log a dead end in `.oa/ledger.jsonl` |
 | `oa_verify` | Fresh end-to-end verification of `HEAD` vs `refs/oa/baseline` (15 interleaved pairs, Cheat Guard, tests, SHA-256 badge) |
 | `oa_status` | Live session metric, commits, cumulative gain, lock health, dirty files, and `git diff --stat` vs baseline |
@@ -24,8 +25,8 @@ Use `oa` whenever a user asks to optimize latency, throughput, CPU usage, or mem
 
 ## Standard Optimization Loop
 
-1. Initialize once (`oa_init`). Pass a deterministic `bench_cmd` (prefer workloads >= 30 ms so process startup noise does not dilute gains) and `test_cmd` (upstream unit tests). For compiled projects (Rust, C, C++, Go, TypeScript bundles), pass `build_cmd` with debug symbols (`-g` or `CARGO_PROFILE_RELEASE_DEBUG=true`) so both candidate and shadow worktrees rebuild cleanly and `linux:perf` resolves ELF `file:line` source snippets. For memory optimization on Linux, macOS, or Windows, set `metric: "rss"`. Never edit any file listed in `locked_files`.
-2. Read the bottleneck class before editing. Check `profile.bottleneck_class`, `profile.hotspots`, `profile.alloc_sites`, and `profile.counters` (IPC, branch-miss %, cache-miss %). Pick one focused hypothesis targeting the top hotspot by self time or allocation volume.
+1. Discover and initialize (`oa_discover` -> `oa_init`, or run the autonomous CLI loop via `oa run --agent claude --metric pareto`). Pass a deterministic `bench_cmd` (prefer workloads >= 30 ms so process startup noise does not dilute gains) and `test_cmd` (upstream unit tests). For compiled projects (Rust, C, C++, Go, TypeScript bundles), pass `build_cmd` with debug symbols (`-g`, `-DCMAKE_BUILD_TYPE=RelWithDebInfo`, or `CARGO_PROFILE_RELEASE_DEBUG=true`) so both candidate and shadow worktrees rebuild cleanly and `linux:perf` resolves ELF `file:line` source snippets and `pahole` reports packable structs. Use `metric: "pareto"` by default when optimizing both CPU and memory so wall speedups cannot hide RSS bloat and RSS cuts cannot hide slowdowns. Never edit any file listed in `locked_files`.
+2. Read the bottleneck class before editing. Check `profile.bottleneck_class`, `profile.hotspots`, `profile.alloc_sites`, `profile.struct_padding`, and `profile.counters` (IPC, branch-miss %, cache-miss %). Pick one focused structural hypothesis targeting the top hotspot by self time, allocation volume, or struct padding waste.
 3. Apply the matching tactic for the bottleneck class:
    - `CPU_ALGORITHMIC` / `COMPUTE_BOUND`: eliminate O(N^2) scans (sets, dicts, index maps), replace per-token `strncmp`/regex cascades with `switch` or lookup tables, cache loop-invariant lookups, fast-path common ASCII/integer cases, use SIMD or stack batching on hot byte loops, and split cold metadata out of hot structs (SoA).
    - `SERIALIZATION_BOUND`: precompile combined regexes, hoist character-class checks with 256-byte LUTs, avoid intermediate AST/event object allocations by using flat typed arrays or single-pass streaming, advance output buffer offsets directly instead of calling `strlen`.
