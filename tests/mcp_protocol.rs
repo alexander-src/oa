@@ -128,7 +128,8 @@ fn mcp_ndjson_roundtrip_and_tools() {
             "oa_status",
             "oa_compare",
             "oa_verify",
-            "oa_diff"
+            "oa_diff",
+            "oa_discover"
         ]
     );
 

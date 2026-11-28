@@ -2,6 +2,7 @@ use std::io::{self, BufRead, BufReader, Write};
 
 use serde_json::{json, Value};
 
+use crate::discover::discover_repo;
 use crate::guard::EquivalencePolicy;
 use crate::session::{
     checkpoint_session, compare_commands, compare_git_revs, evaluate_session, export_diff,
@@ -95,7 +96,9 @@ fn tool_schemas() -> Value {
                     "test_cmd": { "type": "string", "description": "Optional test suite command required to pass before accepting changes." },
                     "build_cmd": { "type": "string", "description": "Optional build command executed before benchmarking or profiling." },
                     "profile_cmd": { "type": "string", "description": "Optional profiler command (defaults to bench_cmd)." },
-                    "metric": { "type": "string", "enum": ["wall", "rss"], "description": "Primary optimization target: wall (median latency ms, default) or rss (peak memory KiB)." },
+                    "metric": { "type": "string", "enum": ["wall", "rss", "pareto"], "description": "Primary optimization target: wall (median latency ms, default), rss (peak memory KiB), or pareto (joint wall+RSS without regressions)." },
+                    "max_rss_regression": { "type": "number", "description": "Optional guardrail ratio rejecting candidate if peak RSS exceeds ratio x reference (e.g. 1.05 allows +5%). Defaults to 1.05 under pareto." },
+                    "max_wall_regression": { "type": "number", "description": "Optional guardrail ratio rejecting candidate if wall time exceeds ratio x reference (e.g. 1.05 allows +5%). Defaults to 1.05 under pareto." },
                     "output_files": { "type": "array", "items": { "type": "string" }, "description": "Relative output file paths whose SHA-256 must match baseline." },
                     "lock_files": { "type": "array", "items": { "type": "string" }, "description": "Extra file paths locked by Cheat Guard against edits." },
                     "auto_lock_tests": { "type": "boolean", "description": "Automatically lock tracked test/bench files (default true)." },
@@ -134,7 +137,9 @@ fn tool_schemas() -> Value {
                 "properties": {
                     "path": { "type": "string" },
                     "compare_against": { "type": "string", "enum": ["best", "baseline"], "description": "Reference worktree to interleave against (default best)." },
-                    "metric": { "type": "string", "enum": ["wall", "rss"], "description": "Optional metric override for this evaluation (wall or rss)." },
+                    "metric": { "type": "string", "enum": ["wall", "rss", "pareto"], "description": "Optional metric override for this evaluation (wall, rss, or pareto)." },
+                    "max_rss_regression": { "type": "number" },
+                    "max_wall_regression": { "type": "number" },
                     "pairs": { "type": "integer" },
                     "warmup": { "type": "integer" },
                     "min_speedup": { "type": "number" },
@@ -204,7 +209,9 @@ fn tool_schemas() -> Value {
                     "build_cmd": { "type": "string", "description": "Optional build command executed once per worktree when git_a is set." },
                     "copy_files": { "type": "array", "items": { "type": "string" }, "description": "Optional untracked relative files to copy into detached worktrees." },
                     "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Optional environment variables (KEY -> VALUE) applied to build and benchmark runs." },
-                    "metric": { "type": "string", "enum": ["wall", "rss"] },
+                    "metric": { "type": "string", "enum": ["wall", "rss", "pareto"] },
+                    "max_rss_regression": { "type": "number" },
+                    "max_wall_regression": { "type": "number" },
                     "pairs": { "type": "integer", "description": "Interleaved A/B pairs (default 10)." },
                     "warmup": { "type": "integer", "description": "Warmup pairs (default 2)." },
                     "min_speedup": { "type": "number" },
@@ -221,7 +228,9 @@ fn tool_schemas() -> Value {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "metric": { "type": "string", "enum": ["wall", "rss"] },
+                    "metric": { "type": "string", "enum": ["wall", "rss", "pareto"] },
+                    "max_rss_regression": { "type": "number" },
+                    "max_wall_regression": { "type": "number" },
                     "pairs": { "type": "integer", "description": "Interleaved A/B pairs (default 15)." },
                     "warmup": { "type": "integer" },
                     "min_speedup": { "type": "number" },
@@ -237,6 +246,16 @@ fn tool_schemas() -> Value {
                 "properties": {
                     "path": { "type": "string" },
                     "format": { "type": "string", "enum": ["json", "patch"], "description": "Output format: json (default, includes changed_files, diff_stat, patch) or raw unified patch." }
+                }
+            }
+        },
+        {
+            "name": "oa_discover",
+            "description": "Zero-config repository scanner: detects languages, build system, test suite, and benchmark candidates, returning ready-to-run oa init and oa run commands.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Repository path (defaults to current working directory)." }
                 }
             }
         }
@@ -284,6 +303,8 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                 build_cmd: str_arg(args, "build_cmd"),
                 profile_cmd: str_arg(args, "profile_cmd"),
                 metric,
+                max_rss_regression: args.get("max_rss_regression").and_then(|v| v.as_f64()),
+                max_wall_regression: args.get("max_wall_regression").and_then(|v| v.as_f64()),
                 output_files: str_vec_arg(args, "output_files"),
                 lock_files: str_vec_arg(args, "lock_files"),
                 auto_lock_tests: args
@@ -345,6 +366,8 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                 path: str_arg(args, "path"),
                 compare_against: str_arg(args, "compare_against"),
                 metric,
+                max_rss_regression: args.get("max_rss_regression").and_then(|v| v.as_f64()),
+                max_wall_regression: args.get("max_wall_regression").and_then(|v| v.as_f64()),
                 pairs: args
                     .get("pairs")
                     .and_then(|v| v.as_u64())
@@ -447,6 +470,8 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                 })
                 .unwrap_or_default();
 
+            let max_rss_regression = args.get("max_rss_regression").and_then(|v| v.as_f64());
+            let max_wall_regression = args.get("max_wall_regression").and_then(|v| v.as_f64());
             let res = if let Some(git_a) = str_arg(args, "git_a") {
                 let bench_cmd = str_arg(args, "bench_cmd").ok_or_else(|| {
                     "missing required argument 'bench_cmd' when 'git_a' is provided".to_string()
@@ -460,6 +485,8 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                     copy_files: str_vec_arg(args, "copy_files"),
                     env_vars,
                     metric,
+                    max_rss_regression,
+                    max_wall_regression,
                     pairs,
                     warmup,
                     min_speedup,
@@ -478,6 +505,8 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
                     cmd_b,
                     env_vars,
                     metric,
+                    max_rss_regression,
+                    max_wall_regression,
                     pairs,
                     warmup,
                     min_speedup,
@@ -496,6 +525,8 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
             let params = VerifyParams {
                 path: str_arg(args, "path"),
                 metric,
+                max_rss_regression: args.get("max_rss_regression").and_then(|v| v.as_f64()),
+                max_wall_regression: args.get("max_wall_regression").and_then(|v| v.as_f64()),
                 pairs: args
                     .get("pairs")
                     .and_then(|v| v.as_u64())
@@ -519,6 +550,11 @@ fn handle_tool_call(name: &str, args: &Value) -> Result<String, String> {
             } else {
                 serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
             }
+        }
+        "oa_discover" => {
+            let path = str_arg(args, "path");
+            let res = discover_repo(path.as_deref())?;
+            serde_json::to_string_pretty(&res).map_err(|e| e.to_string())
         }
         other => Err(format!("unknown tool '{other}'")),
     }

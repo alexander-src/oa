@@ -118,6 +118,8 @@ print('ok')
         build_cmd: None,
         profile_cmd: None,
         metric: MetricTarget::Wall,
+        max_rss_regression: None,
+        max_wall_regression: None,
         output_files: Vec::new(),
         lock_files: Vec::new(),
         auto_lock_tests: true,

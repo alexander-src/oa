@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
+pub mod autorun;
 pub mod demo;
+pub mod discover;
 pub mod doctor;
 pub mod git;
 pub mod guard;

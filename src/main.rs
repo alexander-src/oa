@@ -4,7 +4,9 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
+use oa::autorun::{run_autonomous_loop, AutoRunParams};
 use oa::demo;
+use oa::discover::discover_repo;
 use oa::doctor;
 use oa::guard::EquivalencePolicy;
 use oa::mcp;
@@ -27,6 +29,8 @@ USAGE:
 
 COMMANDS:
   init        Initialize an optimization session (locks tests, snapshots baseline, runs initial profile)
+  discover    Zero-config repo scanner: infer languages, build/test commands, and benchmark candidates
+  run         Autonomous optimization loop: discover -> profile -> invoke agent -> evaluate -> keep/revert
   profile     Profile current code, classify bottleneck, and optionally diff hotspots
   evaluate    Run Cheat Guard, tests, equivalence check, and interleaved A/B benchmark (alias: bench)
   checkpoint  Keep a verified optimization or revert to best and log a dead end
@@ -48,13 +52,13 @@ Run 'oa <COMMAND> --help' for command-specific options.
 fn print_subcommand_help(cmd: &str) {
     match cmd {
         "init" => println!(
-            "USAGE:\n  oa init --bench <CMD> [OPTIONS]\n\nOPTIONS:\n  --bench <CMD>          Benchmark command to optimize (required)\n  --test <CMD>           Test suite command required before keeping changes\n  --build <CMD>          Build command run before profiling/evaluating\n  --profile-cmd <CMD>    Optional command for profiling (defaults to --bench)\n  --metric <wall|rss>    Primary metric: wall (latency ms, default) or rss (peak memory KiB)\n  --output-file <PATH>   Output file path whose SHA-256 must match baseline (repeatable)\n  --lock <PATH>          Extra file locked by Cheat Guard (repeatable)\n  --no-auto-lock         Disable automatic locking of tracked test/bench files\n  --ignore-line <SUBSTR> Ignore lines containing substring during equivalence check (repeatable)\n  --oracle <CMD>         External oracle command used instead of SHA-256 equivalence\n  --min-speedup <RATIO>  Minimum 95% CI lower bound to accept (default 1.03)\n  --alpha <P>            Mann-Whitney U alpha threshold (default 0.01)\n  --warmup <N>           Warmup runs/pairs (default 2)\n  --pairs <N>            Interleaved A/B pairs (default 10)\n  --pin-core <ID>        Pin benchmark runs to Linux CPU core via taskset\n  --allow-dirty          Allow starting on a dirty working tree\n  --path <DIR>           Target repository directory\n  --json                 Emit raw JSON output"
+            "USAGE:\n  oa init --bench <CMD> [OPTIONS]\n\nOPTIONS:\n  --bench <CMD>                  Benchmark command to optimize (required)\n  --test <CMD>                   Test suite command required before keeping changes\n  --build <CMD>                  Build command run before profiling/evaluating\n  --profile-cmd <CMD>            Optional command for profiling (defaults to --bench)\n  --metric <wall|rss|pareto>     Primary metric: wall (ms, default), rss (KiB), or pareto (joint wall+RSS)\n  --max-rss-regression <RATIO>   Reject if peak RSS exceeds RATIO x reference (e.g. 1.05 = +5%)\n  --max-wall-regression <RATIO>  Reject if wall time exceeds RATIO x reference (e.g. 1.05 = +5%)\n  --output-file <PATH>           Output file path whose SHA-256 must match baseline (repeatable)\n  --lock <PATH>                  Extra file locked by Cheat Guard (repeatable)\n  --no-auto-lock                 Disable automatic locking of tracked test/bench files\n  --ignore-line <SUBSTR>         Ignore lines containing substring during equivalence check (repeatable)\n  --oracle <CMD>                 External oracle command used instead of SHA-256 equivalence\n  --min-speedup <RATIO>          Minimum 95% CI lower bound to accept (default 1.03)\n  --alpha <P>                    Mann-Whitney U alpha threshold (default 0.01)\n  --warmup <N>                   Warmup runs/pairs (default 2)\n  --pairs <N>                    Interleaved A/B pairs (default 10)\n  --pin-core <ID>                Pin benchmark runs to Linux CPU core via taskset\n  --allow-dirty                  Allow starting on a dirty working tree\n  --path <DIR>                   Target repository directory\n  --json                         Emit raw JSON output"
         ),
         "profile" => println!(
             "USAGE:\n  oa profile [OPTIONS]\n\nOPTIONS:\n  --cmd <CMD>                                      Standalone command to profile (no oa init needed)\n  --mode <auto|python|node|go|perf|sample|native>  Profiler backend (default auto)\n  --top <N>                                        Max hotspots (default 10)\n  --diff-from <baseline|best>                      Compare hotspot self-time against baseline or best\n  --skip-build                                     Skip build_cmd before profiling\n  --path <DIR>                                     Target repository directory\n  --json                                           Emit raw JSON output"
         ),
         "evaluate" | "bench" => println!(
-            "USAGE:\n  oa evaluate [OPTIONS]\n\nOPTIONS:\n  --against <best|baseline>  Reference worktree to interleave against (default best)\n  --metric <wall|rss>        Override metric (wall latency ms or rss peak KiB)\n  --pairs <N>                Override interleaved A/B pairs\n  --warmup <N>               Override warmup pairs\n  --min-speedup <RATIO>      Override min speedup threshold\n  --alpha <P>                Override Mann-Whitney alpha\n  --path <DIR>               Target repository directory\n  --json                     Emit raw JSON output"
+            "USAGE:\n  oa evaluate [OPTIONS]\n\nOPTIONS:\n  --against <best|baseline>      Reference worktree to interleave against (default best)\n  --metric <wall|rss|pareto>     Override metric (wall, rss, or pareto)\n  --max-rss-regression <RATIO>   Reject if peak RSS exceeds RATIO x reference (e.g. 1.05)\n  --max-wall-regression <RATIO>  Reject if wall time exceeds RATIO x reference (e.g. 1.05)\n  --pairs <N>                    Override interleaved A/B pairs\n  --warmup <N>                   Override warmup pairs\n  --min-speedup <RATIO>          Override min speedup threshold\n  --alpha <P>                    Override Mann-Whitney alpha\n  --path <DIR>                   Target repository directory\n  --json                         Emit raw JSON output"
         ),
         "checkpoint" => println!(
             "USAGE:\n  oa checkpoint (--keep | --revert) --hypothesis <TEXT> [OPTIONS]\n\nOPTIONS:\n  --keep                 Keep verified working tree as refs/oa/best\n  --revert               Revert working tree to refs/oa/best and record dead end\n  --hypothesis <TEXT>    Short description of the change (required)\n  --dead-end <TEXT>      Reason a reverted experiment failed\n  --force                Override a non-KEEP_RECOMMENDED verdict (never overrides Cheat Guard)\n  --path <DIR>           Target repository directory\n  --json                 Emit raw JSON output"
@@ -71,8 +75,14 @@ fn print_subcommand_help(cmd: &str) {
         "clean" => println!(
             "USAGE:\n  oa clean [--refs] [--path <DIR>] [--json]\n\nRemoves .oa/ shadow worktrees and session files without modifying working tree edits.\nPass --refs to also delete refs/oa/* git references."
         ),
+        "discover" => println!(
+            "USAGE:\n  oa discover [--path <DIR>] [--json]\n\nScans a repository to detect languages, build/test commands, and benchmark candidates."
+        ),
+        "run" => println!(
+            "USAGE:\n  oa run [OPTIONS]\n\nOPTIONS:\n  --agent <claude|codex|gemini|opencode|cmd>  Agent CLI adapter (default claude)\n  --agent-cmd <CMD>                           Custom command invoked each iteration (receives OA_PROMPT_FILE, OA_ITER)\n  --bench <CMD>                               Benchmark command (auto-discovered via oa discover if omitted)\n  --test <CMD>                                Test suite command (auto-discovered if omitted)\n  --build <CMD>                               Build command (auto-discovered if omitted)\n  --profile-cmd <CMD>                         Optional profiler command\n  --metric <wall|rss|pareto>                  Objective metric (default pareto)\n  --max-rss-regression <RATIO>                Max allowed peak RSS ratio vs reference (default 1.05 under pareto)\n  --max-wall-regression <RATIO>               Max allowed wall ratio vs reference (default 1.05 under pareto)\n  --max-iters <N>                             Maximum optimization iterations (default 6)\n  --max-stale <N>                             Stop early after N consecutive non-kept iterations (default 2)\n  --pairs <N>                                 Interleaved A/B pairs per evaluation (default 10)\n  --warmup <N>                                Warmup pairs (default 2)\n  --min-speedup <RATIO>                       Minimum 95% CI lower bound to keep (default 1.03)\n  --alpha <P>                                 Mann-Whitney U alpha (default 0.01)\n  --pin-core <ID>                             Pin benchmark runs to Linux CPU core\n  --allow-dirty                               Allow starting on a dirty working tree\n  --dry-run                                   Initialize, profile, and write iteration 1 prompt without invoking the agent\n  --path <DIR>                                Target repository directory\n  --json                                      Emit raw JSON output"
+        ),
         "verify" => println!(
-            "USAGE:\n  oa verify [OPTIONS]\n\nOPTIONS:\n  --metric <wall|rss>    Override metric (wall latency ms or rss peak KiB)\n  --pairs <N>            Interleaved A/B pairs vs baseline (default 15)\n  --warmup <N>           Warmup pairs\n  --min-speedup <RATIO>  Override minimum 95% CI lower bound\n  --alpha <P>            Override Mann-Whitney alpha\n  --path <DIR>           Target repository directory\n  --json                 Emit raw JSON output"
+            "USAGE:\n  oa verify [OPTIONS]\n\nOPTIONS:\n  --metric <wall|rss|pareto>     Override metric (wall, rss, or pareto)\n  --max-rss-regression <RATIO>   Reject if peak RSS exceeds RATIO x reference\n  --max-wall-regression <RATIO>  Reject if wall time exceeds RATIO x reference\n  --pairs <N>                    Interleaved A/B pairs vs baseline (default 15)\n  --warmup <N>                   Warmup pairs\n  --min-speedup <RATIO>          Override minimum 95% CI lower bound\n  --alpha <P>                    Override Mann-Whitney alpha\n  --path <DIR>                   Target repository directory\n  --json                         Emit raw JSON output"
         ),
         "status" => println!(
             "USAGE:\n  oa status [--path <DIR>] [--json]"
@@ -136,6 +146,8 @@ fn run_cli() -> Result<ExitCode, String> {
             let mut build_cmd = None;
             let mut profile_cmd = None;
             let mut metric = MetricTarget::Wall;
+            let mut max_rss_regression = None;
+            let mut max_wall_regression = None;
             let mut output_files = Vec::new();
             let mut lock_files = Vec::new();
             let mut auto_lock_tests = true;
@@ -160,6 +172,20 @@ fn run_cli() -> Result<ExitCode, String> {
                     "--metric" => {
                         let v = next_val(rest, &mut i, "--metric")?;
                         metric = MetricTarget::parse_str(&v)?;
+                    }
+                    "--max-rss-regression" => {
+                        let v = next_val(rest, &mut i, "--max-rss-regression")?;
+                        max_rss_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-rss-regression value '{v}'")
+                            })?);
+                    }
+                    "--max-wall-regression" => {
+                        let v = next_val(rest, &mut i, "--max-wall-regression")?;
+                        max_wall_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-wall-regression value '{v}'")
+                            })?);
                     }
                     "--output-file" => output_files.push(next_val(rest, &mut i, "--output-file")?),
                     "--lock" => lock_files.push(next_val(rest, &mut i, "--lock")?),
@@ -223,6 +249,8 @@ fn run_cli() -> Result<ExitCode, String> {
                 build_cmd,
                 profile_cmd,
                 metric,
+                max_rss_regression,
+                max_wall_regression,
                 output_files,
                 lock_files,
                 auto_lock_tests,
@@ -339,6 +367,9 @@ fn run_cli() -> Result<ExitCode, String> {
                         c.cache_miss_pct.map(|v| format!("{v:.2}"))
                     );
                 }
+                if let Some(rss) = p.peak_rss_kb {
+                    println!("Peak RSS : {rss} KiB");
+                }
                 if let Some(alloc) = p.peak_alloc_kb {
                     println!("Peak traced allocations: {:.1} KiB", alloc);
                 }
@@ -348,6 +379,29 @@ fn run_cli() -> Result<ExitCode, String> {
                         println!(
                             "  {:>5.1}% self | {:>7.2} ms self | {:>7.2} ms cum | {:>7} calls | {} ({}:{})",
                             h.self_pct, h.self_ms, h.cum_ms, h.calls, h.function, h.file, h.line
+                        );
+                    }
+                }
+                if !p.alloc_sites.is_empty() {
+                    println!("Top allocation / RSS-growth sites:");
+                    for a in p.alloc_sites.iter().take(8) {
+                        let fn_label = a
+                            .function
+                            .as_deref()
+                            .map(|f| format!("{f} @ "))
+                            .unwrap_or_default();
+                        println!(
+                            "  {:>8.1} KiB ({:>6} samples)  {}{}:{}",
+                            a.size_kb, a.count, fn_label, a.file, a.line
+                        );
+                    }
+                }
+                if !p.struct_padding.is_empty() {
+                    println!("Packable structs (pahole -P):");
+                    for s in &p.struct_padding {
+                        println!(
+                            "  {}  {}B -> {}B (save {}B, {:.1}%)",
+                            s.name, s.current_bytes, s.packed_bytes, s.saved_bytes, s.savings_pct
                         );
                     }
                 }
@@ -369,6 +423,8 @@ fn run_cli() -> Result<ExitCode, String> {
         "evaluate" | "bench" => {
             let mut compare_against = None;
             let mut metric = None;
+            let mut max_rss_regression = None;
+            let mut max_wall_regression = None;
             let mut pairs = None;
             let mut warmup = None;
             let mut min_speedup = None;
@@ -383,6 +439,20 @@ fn run_cli() -> Result<ExitCode, String> {
                     "--metric" => {
                         let v = next_val(rest, &mut i, "--metric")?;
                         metric = Some(MetricTarget::parse_str(&v)?);
+                    }
+                    "--max-rss-regression" => {
+                        let v = next_val(rest, &mut i, "--max-rss-regression")?;
+                        max_rss_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-rss-regression value '{v}'")
+                            })?);
+                    }
+                    "--max-wall-regression" => {
+                        let v = next_val(rest, &mut i, "--max-wall-regression")?;
+                        max_wall_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-wall-regression value '{v}'")
+                            })?);
                     }
                     "--pairs" => {
                         let v = next_val(rest, &mut i, "--pairs")?;
@@ -423,6 +493,8 @@ fn run_cli() -> Result<ExitCode, String> {
                 path,
                 compare_against,
                 metric,
+                max_rss_regression,
+                max_wall_regression,
                 pairs,
                 warmup,
                 min_speedup,
@@ -700,6 +772,8 @@ fn run_cli() -> Result<ExitCode, String> {
         }
         "verify" => {
             let mut metric = None;
+            let mut max_rss_regression = None;
+            let mut max_wall_regression = None;
             let mut pairs = None;
             let mut warmup = None;
             let mut min_speedup = None;
@@ -713,6 +787,20 @@ fn run_cli() -> Result<ExitCode, String> {
                     "--metric" => {
                         let v = next_val(rest, &mut i, "--metric")?;
                         metric = Some(MetricTarget::parse_str(&v)?);
+                    }
+                    "--max-rss-regression" => {
+                        let v = next_val(rest, &mut i, "--max-rss-regression")?;
+                        max_rss_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-rss-regression value '{v}'")
+                            })?);
+                    }
+                    "--max-wall-regression" => {
+                        let v = next_val(rest, &mut i, "--max-wall-regression")?;
+                        max_wall_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-wall-regression value '{v}'")
+                            })?);
                     }
                     "--pairs" => {
                         let v = next_val(rest, &mut i, "--pairs")?;
@@ -752,6 +840,8 @@ fn run_cli() -> Result<ExitCode, String> {
             let rep = verify_session(VerifyParams {
                 path,
                 metric,
+                max_rss_regression,
+                max_wall_regression,
                 pairs,
                 warmup,
                 min_speedup,
@@ -847,6 +937,8 @@ fn run_cli() -> Result<ExitCode, String> {
             let mut copy_files = Vec::new();
             let mut env_vars = Vec::new();
             let mut metric = MetricTarget::Wall;
+            let mut max_rss_regression = None;
+            let mut max_wall_regression = None;
             let mut pairs = 10usize;
             let mut warmup = 2usize;
             let mut min_speedup = 1.03;
@@ -875,6 +967,20 @@ fn run_cli() -> Result<ExitCode, String> {
                     "--metric" => {
                         let v = next_val(rest, &mut i, "--metric")?;
                         metric = MetricTarget::parse_str(&v)?;
+                    }
+                    "--max-rss-regression" => {
+                        let v = next_val(rest, &mut i, "--max-rss-regression")?;
+                        max_rss_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-rss-regression value '{v}'")
+                            })?);
+                    }
+                    "--max-wall-regression" => {
+                        let v = next_val(rest, &mut i, "--max-wall-regression")?;
+                        max_wall_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-wall-regression value '{v}'")
+                            })?);
                     }
                     "--pairs" => {
                         let v = next_val(rest, &mut i, "--pairs")?;
@@ -957,6 +1063,8 @@ fn run_cli() -> Result<ExitCode, String> {
                     copy_files,
                     env_vars,
                     metric,
+                    max_rss_regression,
+                    max_wall_regression,
                     pairs,
                     warmup,
                     min_speedup,
@@ -977,6 +1085,8 @@ fn run_cli() -> Result<ExitCode, String> {
                     cmd_b: positional[1].clone(),
                     env_vars,
                     metric,
+                    max_rss_regression,
+                    max_wall_regression,
                     pairs,
                     warmup,
                     min_speedup,
@@ -1006,10 +1116,13 @@ fn run_cli() -> Result<ExitCode, String> {
                 print!("{}", render_compare_markdown(&res));
             } else {
                 let unit = match res.metric {
-                    MetricTarget::Wall => "ms",
+                    MetricTarget::Wall | MetricTarget::Pareto => "ms",
                     MetricTarget::Rss => "KiB",
                 };
                 println!("Verdict : {:?} (metric {:?})", res.verdict, res.metric);
+                if let Some(ref reason) = res.reason {
+                    println!("Reason  : {reason}");
+                }
                 if let Some(ref bcmd) = res.bench_cmd {
                     println!("Bench   : {bcmd}");
                 }
@@ -1069,6 +1182,203 @@ fn run_cli() -> Result<ExitCode, String> {
             } else {
                 Ok(ExitCode::SUCCESS)
             }
+        }
+        "discover" => {
+            let mut path = None;
+            let mut as_json = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--path" => path = Some(next_val(rest, &mut i, "--path")?),
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown option '{other}' for discover")),
+                }
+                i += 1;
+            }
+            let rep = discover_repo(path.as_deref())?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("Discovered repository: {}", rep.repo_root);
+                println!("  Languages   : {}", rep.languages.join(", "));
+                if let Some(ref bs) = rep.build_system {
+                    println!("  Build system: {bs}");
+                }
+                if let Some(ref b) = rep.suggested_build_cmd {
+                    println!("  Build cmd   : {b}");
+                }
+                if let Some(ref t) = rep.suggested_test_cmd {
+                    println!("  Test cmd    : {t}");
+                }
+                if !rep.bench_candidates.is_empty() {
+                    println!("  Bench candidates:");
+                    for c in &rep.bench_candidates {
+                        println!(
+                            "    - [{}] {}  ({} from {})",
+                            c.confidence, c.cmd, c.kind, c.source
+                        );
+                    }
+                }
+                println!("  Init cmd    : {}", rep.recommended_init_cmd);
+                println!("  Auto run    : {}", rep.recommended_run_cmd);
+                for n in &rep.notes {
+                    println!("  Note: {n}");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        "run" => {
+            let mut agent = "claude".to_string();
+            let mut agent_cmd = None;
+            let mut bench_cmd = None;
+            let mut test_cmd = None;
+            let mut build_cmd = None;
+            let mut profile_cmd = None;
+            let mut metric = MetricTarget::Pareto;
+            let mut max_rss_regression = None;
+            let mut max_wall_regression = None;
+            let mut max_iters = 6usize;
+            let mut max_stale = 2usize;
+            let mut pairs = 10usize;
+            let mut warmup = 2usize;
+            let mut min_speedup = 1.03;
+            let mut alpha = 0.01;
+            let mut pin_core = None;
+            let mut allow_dirty = false;
+            let mut dry_run = false;
+            let mut path = None;
+            let mut as_json = false;
+
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--agent" => agent = next_val(rest, &mut i, "--agent")?,
+                    "--agent-cmd" => agent_cmd = Some(next_val(rest, &mut i, "--agent-cmd")?),
+                    "--bench" => bench_cmd = Some(next_val(rest, &mut i, "--bench")?),
+                    "--test" => test_cmd = Some(next_val(rest, &mut i, "--test")?),
+                    "--build" => build_cmd = Some(next_val(rest, &mut i, "--build")?),
+                    "--profile-cmd" => profile_cmd = Some(next_val(rest, &mut i, "--profile-cmd")?),
+                    "--metric" => {
+                        let v = next_val(rest, &mut i, "--metric")?;
+                        metric = MetricTarget::parse_str(&v)?;
+                    }
+                    "--max-rss-regression" => {
+                        let v = next_val(rest, &mut i, "--max-rss-regression")?;
+                        max_rss_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-rss-regression value '{v}'")
+                            })?);
+                    }
+                    "--max-wall-regression" => {
+                        let v = next_val(rest, &mut i, "--max-wall-regression")?;
+                        max_wall_regression =
+                            Some(v.parse().map_err(|_| {
+                                format!("invalid --max-wall-regression value '{v}'")
+                            })?);
+                    }
+                    "--max-iters" => {
+                        let v = next_val(rest, &mut i, "--max-iters")?;
+                        max_iters = v
+                            .parse()
+                            .map_err(|_| format!("invalid --max-iters value '{v}'"))?;
+                    }
+                    "--max-stale" => {
+                        let v = next_val(rest, &mut i, "--max-stale")?;
+                        max_stale = v
+                            .parse()
+                            .map_err(|_| format!("invalid --max-stale value '{v}'"))?;
+                    }
+                    "--pairs" => {
+                        let v = next_val(rest, &mut i, "--pairs")?;
+                        pairs = v
+                            .parse()
+                            .map_err(|_| format!("invalid --pairs value '{v}'"))?;
+                    }
+                    "--warmup" => {
+                        let v = next_val(rest, &mut i, "--warmup")?;
+                        warmup = v
+                            .parse()
+                            .map_err(|_| format!("invalid --warmup value '{v}'"))?;
+                    }
+                    "--min-speedup" => {
+                        let v = next_val(rest, &mut i, "--min-speedup")?;
+                        min_speedup = v
+                            .parse()
+                            .map_err(|_| format!("invalid --min-speedup value '{v}'"))?;
+                    }
+                    "--alpha" => {
+                        let v = next_val(rest, &mut i, "--alpha")?;
+                        alpha = v
+                            .parse()
+                            .map_err(|_| format!("invalid --alpha value '{v}'"))?;
+                    }
+                    "--pin-core" => {
+                        let v = next_val(rest, &mut i, "--pin-core")?;
+                        pin_core = Some(
+                            v.parse()
+                                .map_err(|_| format!("invalid --pin-core value '{v}'"))?,
+                        );
+                    }
+                    "--allow-dirty" => allow_dirty = true,
+                    "--dry-run" => dry_run = true,
+                    "--path" => path = Some(next_val(rest, &mut i, "--path")?),
+                    "--json" => as_json = true,
+                    other => return Err(format!("unknown option '{other}' for run")),
+                }
+                i += 1;
+            }
+
+            let rep = run_autonomous_loop(AutoRunParams {
+                path,
+                agent,
+                agent_cmd,
+                bench_cmd,
+                test_cmd,
+                build_cmd,
+                profile_cmd,
+                metric,
+                max_rss_regression,
+                max_wall_regression,
+                max_iters,
+                max_stale,
+                pairs,
+                warmup,
+                min_speedup,
+                alpha,
+                pin_core,
+                allow_dirty,
+                dry_run,
+            })?;
+
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&rep).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "oa run ({}, metric {:?}): {} kept, {} reverted, {:.2}x cumulative ({})",
+                    rep.agent,
+                    rep.metric,
+                    rep.kept_count,
+                    rep.reverted_count,
+                    rep.cumulative_gain,
+                    rep.stopped_reason
+                );
+                for it in &rep.iterations {
+                    println!(
+                        "  iter #{}: [{}] {} ({})",
+                        it.iteration, it.action, it.hypothesis, it.verdict
+                    );
+                }
+                if let Some(ref art) = rep.artifacts_dir {
+                    println!("Artifacts: {art} (REPORT.md, bench.svg, optimization.patch)");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
         }
         "demo" => {
             let mut as_json = false;

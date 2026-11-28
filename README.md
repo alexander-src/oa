@@ -212,18 +212,18 @@ Running `oa report --format svg --theme dark` on the `Keats/tera` session produc
 
 | Language / Runtime | Backend | Extracted signals |
 | --- | --- | --- |
-| Python | `python:cProfile+tracemalloc` | Function self/cum ms, call counts, source snippets, top allocation sites |
-| Node.js / TS | `node:v8-cpu-prof` | V8 `.cpuprofile` sample tree, GC overhead, source file/line hotspots |
-| Go (`go test`) | `go:pprof` | `go test -cpuprofile` + `go tool pprof -top` flat/cum ms, GC/lock class, snippets |
-| Linux native (Rust, C, C++) | `linux:perf` | `perf stat` (IPC, branch-miss %, cache-miss %) + `perf report` ELF `file:line` source snippets, rootless `:u` fallback |
+| Python | `python:cProfile+tracemalloc` | Function self/cum ms, call counts, source snippets, `tracemalloc` top allocation sites, peak RSS |
+| Node.js / TS | `node:v8-cpu+heap-prof` | V8 `.cpuprofile` sample tree, V8 `--heap-prof` allocation sites, GC overhead, source file/line hotspots |
+| Go (`go test`) | `go:pprof+mem` | `go test -cpuprofile` + `-memprofile` (`pprof -alloc_space`), GC/lock class, source snippets |
+| Linux native (Rust, C, C++) | `linux:perf` | `perf stat` (IPC, branch-miss %, cache-miss %), `perf report` ELF `file:line` hotspots, `perf page-faults` RSS-growth sites, `pahole -P` packable DWARF structs, rootless `:u` fallback |
 | macOS native (Rust, C, C++) | `macos:sample` | `/usr/bin/sample` top-of-stack symbol frames with automatic `macos:rusage` fallback |
 
 ## GitHub Action
 
-Drop `uses: alexander-src/oa@v0.6.0` into any workflow to gate pull requests against their base branch on statistically verified speedups, peak RSS, and output SHA-256 equivalence (posts results to `$GITHUB_STEP_SUMMARY` and fails on regression or output mismatch):
+Drop `uses: alexander-src/oa@v0.7.0` into any workflow to gate pull requests against their base branch on statistically verified speedups, peak RSS, and output SHA-256 equivalence (posts results to `$GITHUB_STEP_SUMMARY` and fails on regression or output mismatch):
 
 ```yaml
-- uses: alexander-src/oa@v0.6.0
+- uses: alexander-src/oa@v0.7.0
   with:
     mode: git-compare
     base-ref: ${{ github.event.pull_request.base.sha }}
@@ -238,22 +238,23 @@ Also supports `mode: compare` (any two commands via `cmd-a` and `cmd-b`) and `mo
 
 ## MCP & CLI
 
-`oa mcp` speaks JSON-RPC 2.0 over stdio (both NDJSON and `Content-Length` framing) and exposes 10 tools:
+`oa mcp` speaks JSON-RPC 2.0 over stdio (both NDJSON and `Content-Length` framing) and exposes 11 tools:
 
 | MCP Tool | CLI Equivalent | Purpose |
 | --- | --- | --- |
+| `oa_discover` | `oa discover` | Zero-config repo scanner inferring languages, build/test commands, and benchmark candidates |
 | `oa_init` | `oa init` | Lock test/bench files, snapshot `refs/oa/baseline`, capture output SHA-256 and baseline profile |
-| `oa_profile` | `oa profile` | Profile current tree (or standalone `--cmd`), classify bottleneck, diff hotspots vs `baseline` or `best` |
-| `oa_evaluate` | `oa evaluate` (`bench`) | Enforce Cheat Guard, build, run tests, check SHA-256 equivalence, run interleaved A/B pairs |
+| `oa_profile` | `oa profile` | Profile current tree (or standalone `--cmd`), classify bottleneck, list heap sites and `pahole` struct padding, diff vs `baseline` or `best` |
+| `oa_evaluate` | `oa evaluate` (`bench`) | Enforce Cheat Guard, build, run tests, check SHA-256 equivalence, run interleaved A/B pairs (`wall`, `rss`, or `pareto` with regression guardrails) |
 | `oa_checkpoint` | `oa checkpoint` | Advance `refs/oa/best` on verified wins or revert working tree and log dead ends |
 | `oa_verify` | `oa verify` | Fresh end-to-end verification of `HEAD` vs `refs/oa/baseline` with CI exit code and badge |
 | `oa_status` | `oa status` | Live session metric, cumulative gain, Cheat Guard lock health, dirty files, diff stat |
 | `oa_ledger` | `oa ledger` | Inspect experiment history, Pareto frontier IDs, and ruled-out dead ends |
 | `oa_report` | `oa report` | Export a PR-ready Markdown report, raw JSON ledger, or dark/light SVG chart (`--format svg`) |
 | `oa_diff` | `oa diff` | Export the clean unified patch and diff stat between `refs/oa/baseline` and `refs/oa/best` |
-| `oa_compare` | `oa compare` | Standalone interleaved A/B comparison of two commands or `--git <rev>[..<rev2>]` (`--markdown`, `--svg`, `--csv`, `--env`, `--check-output`) |
+| `oa_compare` | `oa compare` | Standalone interleaved A/B comparison of two commands or `--git <rev>[..<rev2>]` (`--metric wall\|rss\|pareto`, `--max-rss-regression`, `--markdown`, `--svg`, `--csv`, `--env`, `--check-output`) |
 
-Utility commands (CLI): `oa demo` (1-second self-contained walkthrough), `oa doctor` (local profiler & agent check), `oa setup` (auto-configure MCP + `SKILL.md`), `oa clean [--refs]` (remove `.oa/` shadow worktrees and session state while keeping working tree edits).
+Autonomous loop and utility commands (CLI): `oa run` (autonomous `discover -> profile -> agent -> evaluate -> keep/revert` loop with `--agent claude|codex|gemini|opencode|cmd` and `--metric pareto`), `oa demo` (self-contained walkthrough), `oa doctor` (local profiler & agent check), `oa setup` (auto-configure MCP + `SKILL.md`), `oa clean [--refs]` (remove `.oa/` shadow worktrees and session state while keeping working tree edits).
 
 ## FAQ
 
